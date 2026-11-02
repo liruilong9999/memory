@@ -439,7 +439,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 5,
+  configVersion: 6,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -570,7 +570,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 5
+export const MEMORY_CONFIG_VERSION = 6
 
 /** 配置校验结果。 */
 export interface ConfigValidation {

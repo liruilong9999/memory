@@ -45,6 +45,126 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
   )
 }
 
+/** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
+const EXPECTED_CONFIG_LEAVES: readonly string[] = [
+  'configVersion=6',
+  'consolidation.dailyAt=03:30',
+  'consolidation.dailySummaryMaxChars=180',
+  'consolidation.distillEdgeWeight=0.6',
+  'consolidation.distillEnabled=true',
+  'consolidation.distillExampleChars=30',
+  'consolidation.distillMaxChars=120',
+  'consolidation.distillMaxPerRun=3',
+  'consolidation.distillMinEmotional=0.28',
+  'consolidation.distillMinRecurrence=2',
+  'consolidation.distillThemeMinChars=2',
+  'consolidation.enabled=true',
+  'consolidation.maxArchiveRatio=0.05',
+  'consolidation.maxCardsPerRun=5000',
+  'consolidation.maxSummariesPerRun=8',
+  'consolidation.monthlySummaryMaxChars=110',
+  'consolidation.summaryBriefChars=40',
+  'consolidation.summaryEnabled=true',
+  'consolidation.summaryMaxEntities=6',
+  'consolidation.summaryMaxTags=6',
+  'consolidation.summaryMinChildren=2',
+  'consolidation.summaryMinSourceChars=120',
+  'consolidation.summaryTargetRatio=0.5',
+  'consolidation.weeklySummaryMaxChars=140',
+  'debugExplain=true',
+  'dedup.duplicateSimilarity=0.86',
+  'dedup.mergeTextChars=200',
+  'dedup.relatedSimilarity=0.45',
+  'extraction.domains[0]=work',
+  'extraction.dueKeywords[0]=提醒',
+  'extraction.dueKeywords[10]=通知我',
+  'extraction.dueKeywords[11]=明天',
+  'extraction.dueKeywords[12]=后天',
+  'extraction.dueKeywords[13]=下周',
+  'extraction.dueKeywords[14]=每天',
+  'extraction.dueKeywords[15]=每周',
+  'extraction.dueKeywords[1]=记得',
+  'extraction.dueKeywords[2]=别忘',
+  'extraction.dueKeywords[3]=不要忘',
+  'extraction.dueKeywords[4]=到点',
+  'extraction.dueKeywords[5]=到期',
+  'extraction.dueKeywords[6]=截止',
+  'extraction.dueKeywords[7]=deadline',
+  'extraction.dueKeywords[8]=闹钟',
+  'extraction.dueKeywords[9]=叫我',
+  'extraction.includeAssistant=true',
+  'extraction.maxCardsPerTurn=4',
+  'extraction.minAssistantChars=40',
+  'extraction.minTextChars=6',
+  'extraction.signalKeywords[0]=决定',
+  'extraction.signalKeywords[10]=务必',
+  'extraction.signalKeywords[11]=注意',
+  'extraction.signalKeywords[12]=踩坑',
+  'extraction.signalKeywords[13]=坑',
+  'extraction.signalKeywords[14]=报错',
+  'extraction.signalKeywords[15]=失败',
+  'extraction.signalKeywords[16]=原因',
+  'extraction.signalKeywords[17]=方案',
+  'extraction.signalKeywords[18]=选择',
+  'extraction.signalKeywords[19]=替代',
+  'extraction.signalKeywords[1]=结论',
+  'extraction.signalKeywords[20]=部署',
+  'extraction.signalKeywords[21]=架构',
+  'extraction.signalKeywords[22]=约定',
+  'extraction.signalKeywords[2]=记住',
+  'extraction.signalKeywords[3]=以后',
+  'extraction.signalKeywords[4]=下次',
+  'extraction.signalKeywords[5]=不要再',
+  'extraction.signalKeywords[6]=偏好',
+  'extraction.signalKeywords[7]=习惯',
+  'extraction.signalKeywords[8]=承诺',
+  'extraction.signalKeywords[9]=答应',
+  'forgetting.accessBoost=0.18',
+  'forgetting.archiveThreshold=0.08',
+  'forgetting.autoArchive=true',
+  'forgetting.emotionalHalfLifeBoost=2',
+  'forgetting.halfLifeMs=1209600000',
+  'forgetting.neverArchiveKinds[0]=feeling',
+  'forgetting.neverArchiveKinds[1]=promise',
+  'forgetting.neverArchiveKinds[2]=concept',
+  'forgetting.neverArchiveKinds[3]=experience',
+  'recall.absoluteThreshold=0.18',
+  'recall.candidateLimit=400',
+  'recall.maxCardChars=160',
+  'recall.maxCards=7',
+  'recall.minCards=1',
+  'recall.overheadTokens=100',
+  'recall.relativeThreshold=0.55',
+  'recall.tokenBudget=900',
+  'reminder.enabled=true',
+  'reminder.pollMs=60000',
+  'spread.decayFactor=0.98',
+  'spread.distillBidirectional=true',
+  'spread.explainSourceChars=24',
+  'spread.hopDecay=0.5',
+  'spread.maxAffected=5',
+  'spread.maxBoost=0.12',
+  'spread.maxEdgeWeight=1',
+  'spread.maxHops=2',
+  'spread.maxPrunePerRun=200',
+  'spread.minSelfScoreRatio=1',
+  'spread.mode=shadow',
+  'spread.plasticityEnabled=false',
+  'spread.pruneThreshold=0.1',
+  'spread.reinforceDelta=0.05',
+  'spread.seedRatio=0.85',
+  'storage.dataDir=.dsh-memory',
+  'storage.fsyncOnWrite=true',
+  'storage.journalSegmentBytes=4194304',
+  'storage.reindexEveryRecords=2000',
+  'weights.confidence=0.1',
+  'weights.conflict=0.25',
+  'weights.goal=0.1',
+  'weights.importance=0.18',
+  'weights.recency=0.2',
+  'weights.semantic=0.42',
+]
+
 describe('摘要配置的默认值与版本', () => {
   it('默认配置通过校验', () => {
     const result = validateConfig(base())
@@ -63,7 +183,38 @@ describe('摘要配置的默认值与版本', () => {
     //   3 → 摘要与蒸馏参数
     //   4 → 图谱扩散与突触可塑性参数（FR-G1）
     //   5 → 扩散从布尔开关改成三态 mode（off / shadow / on），默认 shadow
-    assert.equal(MEMORY_CONFIG_VERSION, 5, '扩散改成三态 mode 后版本应为 5')
+    //   6 → spread.explainSourceChars（「因为想起了谁」的来源文本长度）
+    assert.equal(MEMORY_CONFIG_VERSION, 6, '新增 explainSourceChars 后版本应为 6')
+  })
+
+  it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
+    // 与上一条的区别：上一条只比「两个数字相不相等」，抓不到
+    // 「数字都没动、但默认配置改了」。846865c 加 spread.explainSourceChars
+    // 时就是这样漏掉的——原绊线全绿，P7（参数可版本化可回滚）被静默破坏。
+    //
+    // 这里把默认配置摊平成「路径=值」的排序列表。任何叶子新增、删除、
+    // 改值都会让这条变红。**红了不要直接改期望值**：先问「这个改动
+    // 该不该递增 MEMORY_CONFIG_VERSION」，该递增就递增并同步上面的
+    // 版本历史，不该递增（纯注释、纯内部重构）就不该动这里。
+    //
+    // 用稳定序列化而不是哈希：哈希红了只说「变了」，看不出是哪一项。
+    const flat = (value: unknown, prefix: string): string[] => {
+      if (value === null || typeof value !== 'object') return [`${prefix}=${String(value)}`]
+      if (Array.isArray(value)) {
+        return value.length === 0
+          ? [`${prefix}=[]`]
+          : value.flatMap((item, index) => flat(item, `${prefix}[${index}]`))
+      }
+      const entries = Object.entries(value as Record<string, unknown>)
+      return entries.length === 0
+        ? [`${prefix}={}`]
+        : entries.flatMap(([key, item]) => flat(item, prefix === '' ? key : `${prefix}.${key}`))
+    }
+    const leaves = flat(DEFAULT_CONFIG, '').sort()
+    // 前提：叶子数必须与配置的真实规模相当，否则摊平函数写坏了
+    // （比如只摊平了一层）这条也会绿——那就是装饰。
+    assert.ok(leaves.length >= 100, `前提：默认配置应有上百个叶子，实际 ${leaves.length}`)
+    assert.deepEqual(leaves, EXPECTED_CONFIG_LEAVES)
   })
 
   it('层级上限默认递增：日 > 周 > 月', () => {
