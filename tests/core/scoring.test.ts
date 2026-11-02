@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import {
   applyThresholds, buildFocusPack, clamp01, effectiveHalfLife, filterByDomain, formatDuration,
-  formatTime, goalScore, importanceScore, makeQuery, recencyScore, renderFocusPack, scoreCard,
+  describeConflictPeers, formatTime, goalScore, importanceScore, makeQuery, recencyScore, renderEmptyNote, renderFocusPack, scoreCard,
   scoreCards, semanticScore,
 } from '../../src/core/scoring.ts'
 import { tokenSet } from '../../src/core/text.ts'
@@ -264,6 +264,79 @@ test('renderFocusPack 按 pack.maxCardChars 截断，不硬编码', () => {
     [...body].length <= config.recall.maxCardChars,
     `正文 ${[...body].length} 字超过 ${config.recall.maxCardChars}`,
   )
+})
+
+test('空包时 renderEmptyNote 给出明确说明（FR-B6 不编造）', () => {
+  // 回归：pack.note 此前是纯死字段——写进去了、测了，但没有任何地方读它。
+  // FR-B6 这条 P0 验收靠的正是这句提示，模型却永远收不到。
+  const query = makeQuery('完全不相干的查询', config, 1_700_000_000_000)
+  const pack = buildFocusPack([], query, config)
+  assert.equal(pack.empty, true)
+  assert.match(renderEmptyNote(pack), /没有相关记忆/u)
+})
+
+test('非空包时 renderEmptyNote 返回空串', () => {
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5', config, now)
+  const cards = [makeCard({ id: 'c0', text: '这个项目用 Qt5 开发', createdAt: now })]
+  const pack = buildFocusPack(scoreCards(cards, query, config), query, config)
+  assert.equal(pack.empty, false)
+  assert.equal(renderEmptyNote(pack), '')
+})
+
+test('空包时注入文本为空串，不写「没有相关记忆」进上下文', () => {
+  // 语义区分：不注入 ≠ 不给信号。空包注入内容会诱导模型主动声明「我查过了」，
+  // 那本身就是一种编造；明确信号走 renderEmptyNote，供命令输出与诊断使用。
+  const query = makeQuery('完全不相干的查询', config, 1_700_000_000_000)
+  const pack = buildFocusPack([], query, config)
+  const time = {
+    now: 1_700_000_000_000, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+    sinceLastSession: null, sinceLastTurn: null,
+    sessionStartedAt: null, due: [],
+  }
+  assert.equal(renderFocusPack(pack, time), '')
+})
+
+test('冲突渲染标出 CONFLICT 并暴露对方是谁（FR-B5）', () => {
+  const now = 1_700_000_000_000
+  const query = makeQuery('数据库选型', config, now)
+  const a = makeCard({
+    id: 'c-a', text: '数据库用 PostgreSQL，JSONB 支持最好', createdAt: now,
+    conflictOf: ['c-b'],
+  })
+  const b = makeCard({
+    id: 'c-b', text: '数据库改用 MySQL，PostgreSQL 太慢', createdAt: now,
+    conflictOf: ['c-a'],
+  })
+  const scored = scoreCards([a, b], query, config)
+  const pack = buildFocusPack(scored, query, config)
+  const time = {
+    now, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+    sinceLastSession: null, sinceLastTurn: null,
+    sessionStartedAt: null, due: [],
+  }
+  const rendered = renderFocusPack(pack, time)
+  assert.match(rendered, /CONFLICT/u, 'FR-B5 要求标 CONFLICT')
+  // 只说「有冲突」等于让模型知道有矛盾却看不到另一半，它只能忽略或编造。
+  const hasPeerText =
+    rendered.includes('MySQL') || rendered.includes('PostgreSQL 太慢') || rendered.includes('不在本次焦点包内')
+  assert.ok(hasPeerText, `冲突行必须暴露对方是谁，实际渲染：${rendered}`)
+})
+
+test('describeConflictPeers 在对方不在包内时给出明确说明', () => {
+  const now = 1_700_000_000_000
+  const query = makeQuery('数据库', config, now)
+  const a = makeCard({
+    id: 'c-a', text: '数据库用 PostgreSQL', createdAt: now,
+    conflictOf: ['c-gone'],
+  })
+  const scored = scoreCards([a], query, config)
+  const pack = buildFocusPack(scored, query, config)
+  const item = pack.cards[0]
+  assert.ok(item !== undefined)
+  const described = describeConflictPeers(item, pack)
+  assert.ok(described.length > 0)
+  assert.match(described, /不在本次焦点包内|不在活跃记忆中/u)
 })
 
 test('clamp01 边界', () => {

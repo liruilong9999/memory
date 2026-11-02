@@ -10,16 +10,20 @@
   },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "icon": "./icon.svg",
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./locale/*.json": "./locale/*.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "icon.svg",
+    "locale/*.json",
     "cordis.patch.yml",
     "README.md"
   ],

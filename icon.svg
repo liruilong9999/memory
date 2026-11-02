@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="记忆系统">
+  <title>记忆系统</title>
+  <!-- 外圈：记忆的边界（有限上下文） -->
+  <circle cx="32" cy="32" r="28" fill="none" stroke="#4A6FA5" stroke-width="3"/>
+  <!-- 内层同心圆：记忆随时间层层压缩（日 → 周 → 月） -->
+  <circle cx="32" cy="32" r="19" fill="none" stroke="#6B8FC4" stroke-width="2" opacity="0.75"/>
+  <circle cx="32" cy="32" r="11" fill="none" stroke="#8FAFD4" stroke-width="2" opacity="0.6"/>
+  <!-- 核心：只留下感受 -->
+  <circle cx="32" cy="32" r="4.5" fill="#4A6FA5"/>
+  <!-- 轨道上的刻度：时间的流逝 -->
+  <g stroke="#4A6FA5" stroke-width="2.5" stroke-linecap="round">
+    <line x1="32" y1="6" x2="32" y2="13"/>
+    <line x1="32" y1="51" x2="32" y2="58"/>
+    <line x1="6" y1="32" x2="13" y2="32"/>
+    <line x1="51" y1="32" x2="58" y2="32"/>
+  </g>
+</svg>

@@ -415,7 +415,9 @@ export function kindLabel(kind: MemoryCard['kind']): string {
  *
  * @param pack - 焦点包。
  * @param time - 时间状态，用于渲染时间读数。
- * @returns 注入文本；空包时返回空串（由适配面决定是否注入空提示）。
+ * @returns 注入文本。空包时返回空串——**这是刻意的**：
+ *   空包应当什么都不注入，让模型自己去问，而不是塞一句「没有相关记忆」诱导它
+ *   说「我查过了，没有」。要拿提示语请用 `renderEmptyNote`。
  */
 export function renderFocusPack(pack: FocusPack, time: TimeState): string {
   if (pack.empty) return ''
@@ -428,7 +430,11 @@ export function renderFocusPack(pack: FocusPack, time: TimeState): string {
     const text = truncate(item.card.text, pack.maxCardChars)
     lines.push(formatCardLine(item.card, text))
     if (item.conflict) {
-      lines.push('  ⚠ 这条记忆与另一条存在冲突，使用时请说明不确定。')
+      // FR-B5 / SC-4：冲突必须**同时暴露双方**，只说「有冲突」等于让模型知道
+      // 有矛盾却看不到矛盾的另一半，它要么忽略要么编造。
+      // 标记词用 CONFLICT：FR-B5 原文就要求「标 CONFLICT」，规格与实现用同一个词，
+      // 才能被 grep 验证，也方便模型把这个词当成确定信号。
+      lines.push(`  ⚠ CONFLICT 与其他记忆冲突，冲突对象：${describeConflictPeers(item, pack)}`)
     }
   }
   lines.push('')
@@ -508,4 +514,47 @@ export function clamp01(value: number): number {
  */
 function fmt(value: number): string {
   return value.toFixed(3)
+}
+
+/**
+ * 渲染空焦点包的说明文本（FR-B6 / ST-5）。
+ *
+ * 为什么要单独一个函数：\`pack.note\` 此前是**纯死字段**——写进去了、测了、
+ * 然后没有任何地方读它（\`grep -rn "\.note" src/\` 零命中）。FR-B6「不编造」
+ * 这条 P0 验收靠的正是这句提示，结果模型永远收不到。
+ *
+ * 语义上仍要区分两件事：
+ * - \`renderFocusPack\` 空包时返回空串：**不注入**记忆块，不污染上下文；
+ * - \`renderEmptyNote\` 供需要明确告知的场合（如命令输出、诊断）使用。
+ *
+ * @param pack - 焦点包。
+ * @returns 空包时的说明；非空包返回空串。
+ */
+export function renderEmptyNote(pack: FocusPack): string {
+  return pack.empty ? pack.note : ''
+}
+
+/**
+ * 描述一张冲突卡的「对方是谁」。
+ *
+ * FR-B5 要求冲突**双方同时暴露**。只写「有冲突」等于让模型知道有矛盾却
+ * 看不到另一半，它只能忽略或编造——两种都违反 FR-B6。
+ *
+ * @param item - 当前被打分的卡片。
+ * @param pack - 焦点包，用于查找对方是否也在包内。
+ * @returns 形如 `「另一张卡的文本」` 的描述；找不到时退回 id。
+ */
+export function describeConflictPeers(item: ScoredCard, pack: FocusPack): string {
+  const ids = item.card.conflictOf
+  if (ids.length === 0) return '（对方已不在活跃记忆中）'
+  const described: string[] = []
+  for (const id of ids) {
+    const peer = pack.cards.find((other) => other.card.id === id)
+    if (peer === undefined) {
+      described.push(`（另一条记忆 ${id.slice(0, 8)}，不在本次焦点包内）`)
+      continue
+    }
+    described.push(`「${truncate(peer.card.text, pack.maxCardChars)}」`)
+  }
+  return described.join('；')
 }
