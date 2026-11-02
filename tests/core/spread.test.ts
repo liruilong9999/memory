@@ -16,12 +16,12 @@ import { makeCard, makeConfig } from '../consolidate/fixtures.ts'
 import { makeEdge } from '../../src/core/graph.ts'
 import {
   applySpread, buildAdjacency, canTraverse, decayEdges, isDiffusible,
-  prunableEdges, reinforceEdges, spreadActivation,
+  isSymmetricRelation, prunableEdges, reinforceEdges, spreadActivation,
 } from '../../src/core/spread.ts'
 import type { SpreadSeed } from '../../src/core/spread.ts'
 import { scoreCards } from '../../src/core/scoring.ts'
 import { makeQuery } from '../../src/core/scoring.ts'
-import type { MemoryEdge } from '../../src/core/types.ts'
+import { EDGE_RELATIONS, type MemoryEdge } from '../../src/core/types.ts'
 
 /**
  * 开启扩散的配置。
@@ -268,6 +268,58 @@ describe('边关系是否参与扩散（FR-G1）', () => {
     const supersedes = edge('old', 'new', 'supersedes')
     assert.equal(canTraverse(supersedes, false, config), false, 'supersedes 根本不参与扩散')
     assert.equal(canTraverse(supersedes, true, config), false)
+  })
+
+  it('对称关系（same-entity / same-topic）两个方向都必须可走', () => {
+    // 这条守的是一个真实缺陷：`same-entity` 语义上对称（A 与 B 共享实体
+    // ⇔ B 与 A 共享实体），但 `graph.ts` 建边时必须写一个具体方向，那个方向
+    // 来自 `pool` 排序，与「谁是本轮种子」无关。原先只允许沿出边走，
+    // 于是激活有一半概率传不出去。
+    //
+    // 实测（20 轮语料 / 21 张卡 / 10 条 same-entity 边）：查询「PostgreSQL」
+    // 唯一种子是日摘要卡，而 4 条相关边全是「普通卡 → 摘要卡」，摘要卡无出边
+    // ⇒ 扩散 0 条；把同样这些边反向立刻变成 4 条。21 个查询只有 4 个生效。
+    const config = spreadConfig({ distillBidirectional: false })
+    for (const relation of ['same-entity', 'same-topic'] as const) {
+      const e = edge('a', 'b', relation)
+      assert.equal(canTraverse(e, false, config), true, `${relation} 正向必须可走`)
+      assert.equal(
+        canTraverse(e, true, config), true,
+        `${relation} 反向也必须可走——它是对称关系，方向由建边顺序随机决定，` +
+        `只走正向会让扩散效果变成运气`,
+      )
+    }
+  })
+
+  it('isSymmetricRelation 的分类覆盖全部关系类型，不留漏判', () => {
+    // 断言「哪些关系对称」这条知识没有漏项：新增关系时必须显式决定它算不算
+    // 对称，而不是让它默认落进「单向」里静默出错。
+    const symmetric = EDGE_RELATIONS.filter((r) => isSymmetricRelation(r))
+    assert.deepEqual([...symmetric].sort(), ['same-entity', 'same-topic'])
+    // 非对称的那几个必须明确不是对称——尤其 supersedes / distills，
+    // 它们的反向语义是错的（「旧取代新」「事件提炼出感受」都说不通）。
+    for (const relation of ['supersedes', 'distills', 'causes', 'part-of', 'contrasts'] as const) {
+      assert.equal(isSymmetricRelation(relation), false, `${relation} 不是对称关系`)
+    }
+  })
+
+  it('same-entity 两个方向的传播都成立（种子是哪一端都走得通）', () => {
+    // 端到端语义：无论种子是普通卡还是摘要卡，激活都要能走过去。
+    // 这条同时覆盖两个方向，所以「边方向写反」也不会让它变绿。
+    const config = spreadConfig({ maxBoost: 1, maxHops: 1, distillBidirectional: false })
+    const adjacency = buildAdjacency([edge('summary', 'detail', 'same-entity', 1)])
+    // 种子是 detail，边方向是 summary → detail：必须反向才能到 summary。
+    const fromDetail = spreadActivation(
+      [{ id: 'detail', score: 1 }], adjacency, new Map([['summary', 0.5]]), config,
+    )
+    assert.equal(fromDetail.length, 1, '种子是普通卡时，摘要卡应被唤起')
+    assert.equal(fromDetail[0]?.id, 'summary')
+    // 反过来：种子是 summary，正向直达 detail。
+    const fromSummary = spreadActivation(
+      [{ id: 'summary', score: 1 }], adjacency, new Map([['detail', 0.5]]), config,
+    )
+    assert.equal(fromSummary.length, 1, '种子是摘要卡时，普通卡也应被唤起')
+    assert.equal(fromSummary[0]?.id, 'detail')
   })
 
   it('反向传播让「命中事件卡」能唤起它的感受卡（起源 L11）', () => {

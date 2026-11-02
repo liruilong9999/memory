@@ -81,13 +81,25 @@ function clamp01(value: number): number {
 /**
  * 一条边在扩散时是否允许从 `from` 走到 `to`。
  *
- * `distills` 边的方向是「感受卡 → 来源事件卡」。起源 L11（无编号·细节会忘）
- * 说「大多数细节都会忘记，只会留下感受」——那么想起细节时，感受**应该**
- * 更容易浮现。严格按有向边传播会让这件事永远不发生，所以在
- * `spread.distillBidirectional` 打开时，只有 `distills` 允许反向。
+ * ## 对称关系必须双向可走（这条曾是真实缺陷）
  *
- * 其余边保持严格单向：`supersedes` 反向传播会让「新版本」把激活传回
- * 「已被取代的旧版本」，那是把废弃内容重新推上台面，与 FR-A5 相反。
+ * `same-entity` / `same-topic` 在语义上是**对称**的：A 与 B 共享实体，
+ * 等价于 B 与 A 共享实体。但 `graph.ts` 建边时必须写一个具体方向，那个方向
+ * 来自 `pool` 的排序（「创建时间 + id」），**与「谁是本轮种子」毫无关系**。
+ *
+ * 后果是激活有一半概率传不出去。实测（20 轮真实感语料、21 张卡、10 条
+ * `same-entity` 边）：查询「PostgreSQL」时唯一种子是日摘要卡，而 4 条相关边
+ * 全都是 `普通卡 → 摘要卡`，摘要卡没有出边 ⇒ 扩散 0 条。
+ * 把同样这些边**反向**后立刻变成 4 条。21 个查询里只有 4 个能生效。
+ *
+ * 也就是说：**机制是对的，方向是随机的，于是效果有一半是运气。**
+ * 这类缺陷不会报错、不会崩溃，只会让「突触效果」在真实数据上时有时无，
+ * 而且看日志只能看到「本次无扩散」，无从判断是不是 bug。
+ *
+ * 现在按**关系语义**决定方向，而不是按建边时恰好写下的方向：
+ * - 对称关系（`same-entity` / `same-topic`）：两个方向都走；
+ * - `distills`：正向必走，反向由 `spread.distillBidirectional` 决定；
+ * - `supersedes` 及三类预留边：`isDiffusible` 已挡掉，两个方向都不走。
  *
  * @param edge - 待判断的边。
  * @param reversed - 是否为反向遍历（true 表示正在问「能否从 to 走到 from」）。
@@ -101,7 +113,27 @@ export function canTraverse(
   // 一律不传播——理由见 {@link isDiffusible}。
   if (!isDiffusible(edge.relation)) return false
   if (!reversed) return true
+  // 对称关系：反向与正向等价，不存在「方向」这个概念。
+  if (isSymmetricRelation(edge.relation)) return true
   return edge.relation === 'distills' && config.spread.distillBidirectional
+}
+
+/**
+ * 判断边关系是否**对称**（无方向）。
+ *
+ * 判据是语义，不是实现：`same-entity` 说「A 与 B 共享实体」，
+ * `same-topic` 说「A 与 B 话题相近」，两句交换主宾后意思完全不变。
+ * 而 `supersedes`（B 取代 A）与 `distills`（感受提炼自事件）交换后语义就错了。
+ *
+ * 这个函数存在的理由：把「哪些关系对称」这条**知识**收在一处。
+ * 若把它写进 `canTraverse` 的条件里，将来新增对称关系时很容易漏改；
+ * 单独成函数则可以让测试直接遍历 `EDGE_RELATIONS` 校验分类完整性。
+ *
+ * @param relation - 边关系。
+ * @returns 是否对称。
+ */
+export function isSymmetricRelation(relation: EdgeRelation): boolean {
+  return relation === 'same-entity' || relation === 'same-topic'
 }
 
 /** 邻接表：卡 id → 出边列表。 */
