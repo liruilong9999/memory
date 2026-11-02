@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=8',
+  'configVersion=9',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -154,6 +154,7 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'spread.pruneThreshold=0.1',
   'spread.reinforceDelta=0.05',
   'spread.seedRatio=0.85',
+  'storage.configSnapshotMaxEntries=200',
   'storage.dataDir=.dsh-memory',
   'storage.fsyncOnWrite=true',
   'storage.journalSegmentBytes=4194304',
@@ -189,7 +190,8 @@ describe('摘要配置的默认值与版本', () => {
     //   6 → spread.explainSourceChars（「因为想起了谁」的来源文本长度）
     //   7 → storage.logFile / storage.logMaxEntries（FR-F1 诊断日志落盘）
     //   8 → reminder.cronSearchDays（FR-D3 cron 分支的搜索上界）
-    assert.equal(MEMORY_CONFIG_VERSION, 8, '新增 cron 搜索上界后版本应为 8')
+    //   9 → storage.configSnapshotMaxEntries（FR-F4 配置快照台账上限）
+    assert.equal(MEMORY_CONFIG_VERSION, 9, '新增配置快照上限后版本应为 9')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

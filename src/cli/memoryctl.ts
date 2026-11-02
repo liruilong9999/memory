@@ -10,8 +10,14 @@
  * - FR-F1 结构化日志：`--verbose` 把引擎的写入/召回/整理日志打到 stderr。
  * - FR-F2 查询命令：`query` 不需要开数据库就能按关键词查记忆。
  * - FR-F3 指标：`health` / `rebuild` 输出活跃、归档、图谱边、索引一致性。
- * - FR-F4 参数版本化与回滚：启动时用 `validateConfig` 校验配置版本自洽；
- *   `rebuild` 是「索引怀疑坏了就重来」的那条回滚路径。
+ * - FR-F4 参数版本化与回滚：`config list` 列出每一份生效过的配置快照，
+ *   `config diff` 报叶子级变化（P7「改动可追溯」），`config rollback <id>`
+ *   把配置拉回某一份快照（验收「改坏能一键回滚」）。
+ *
+ *   **这里曾经是错的**：原注释写「`rebuild` 是那条回滚路径」。
+ *   `rebuild` 重放的是**记忆数据**，一个字都不碰配置——
+ *   用户按文档去「回滚」，配置原封不动，而他不会收到任何提示。
+ *   **能力存在但用户拿不到，比完全没实现更危险。**
  * - FR-F5 健康检查：`health` 一条命令报「健康/异常」，异常时退出码为 1。
  * - NFR-8 可测试：核心逻辑全部收敛在 {@link runCli} 这个纯函数里，
  *   返回 `{ code, stdout, stderr }` 而不是直接写终端，单测无需捕获标准流。
@@ -39,12 +45,17 @@ import { pathToFileURL, fileURLToPath } from 'node:url'
 
 import { DEFAULT_CONFIG, mergeConfig, validateConfig } from '../core/config.ts'
 import type { DeepPartial, MemoryConfig } from '../core/config.ts'
+import {
+  ROLLBACK_EXCLUDED_TOP_KEYS, describeConfigChange, describeConfigChanges, diffConfig, snapshotToConfig,
+} from '../core/configSnapshot.ts'
 import { buildWeeklyReport } from '../core/metrics.ts'
 import { renderFocusPackExplain } from '../core/render.ts'
 import { formatTime } from '../core/scoring.ts'
 import type { MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
 import { MemoryEngine } from '../host/engine.ts'
+import { applyRollbackToDisk, clearRollback } from '../host/configRollback.ts'
 import { loadPatchConfig } from '../host/patchConfig.ts'
+import { readConfigSnapshots, readRollbackRecord, recordConfigSnapshot } from '../store/configLedger.ts'
 import { EXPORT_FORMAT_VERSION } from '../store/export.ts'
 import { openStore } from '../store/store.ts'
 import type { MemoryStore } from '../store/store.ts'
@@ -86,7 +97,7 @@ export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
 const COMMANDS = [
-  'query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'report', 'help',
+  'query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'report', 'config', 'help',
 ] as const
 
 /** 子命令名。 */
@@ -124,6 +135,9 @@ export interface CliOptions {
 
   /** `report` 的统计窗口天数（FR-F3）。 */
   readonly days: number
+
+  /** `config rollback --clear`：清除回滚覆盖层而不是建立它（FR-F4）。 */
+  readonly clear: boolean
 }
 
 /** 参数解析结果。失败时只带一条人可读信息，不带异常。 */
@@ -204,10 +218,30 @@ function isCommand(value: string): value is Command {
  * 更危险，因为人会信它。**
  */
 export interface ResolvedCliConfig {
-  /** 实际生效的配置。 */
+  /** 实际生效的配置（已校验；校验失败时退回 `DEFAULT_CONFIG`）。 */
   readonly config: MemoryConfig
+  /**
+   * 回滚基准：「默认值 + patch」的合并结果，**未校验、不含回滚层**。
+   *
+   * 为什么不能用 `config` 当基准（这是一个真实缺陷的根因）：
+   * patch 被改坏时 `config` 退回了 `DEFAULT_CONFIG`，于是「当前值」
+   * 看起来是合法的 0.18，与目标快照无差异 ⇒ 回滚什么也不写，
+   * 而 patch 里的 `-5` 原封不动 ⇒ 下次启动**仍然崩溃**。
+   * 用户看到「已回滚」，实际上什么都没被修。
+   *
+   * 正确的基准是「假如没有覆盖层，宿主会拿到什么」——
+   * 回滚就是把它修成目标快照，差异里自然包含那个坏掉的叶子。
+   */
+  readonly baseline: MemoryConfig
   /** 配置来自哪里，供 `health` 与人读输出显示。 */
   readonly source: string
+  /**
+   * 本次配置是否**降级**过（读不到 patch 或校验失败退回默认值）。
+   *
+   * 降级的配置不能记进快照台账：它不是用户意图，
+   * 记下去会在需要回滚的那一刻成为最新的「回滚点」。
+   */
+  readonly degraded: boolean
   /** 解析过程中的提醒（例如 patch 缺失后退回默认值）。 */
   readonly notes: readonly string[]
 }
@@ -220,26 +254,71 @@ export interface ResolvedCliConfig {
  * 实际跑的是影子模式，而且没有任何东西告诉他）。
  *
  * @param io - 注入点（`configPath` 可覆盖 patch 路径）。
+ * @param dataDirOverride - 命令行给出的数据目录；省略时用配置里的。
+ *   必须传：回滚台账与存储目录必须是同一个，否则
+ *   `--data-dir X config rollback` 会去改另一个库的覆盖层。
  * @returns 解析结果；`config` 一定可用。
  */
-function resolveCliConfig(io: CliIo): ResolvedCliConfig {
+function resolveCliConfig(io: CliIo, dataDirOverride: string | undefined): ResolvedCliConfig {
   const notes: string[] = []
   const path = io.configPath ?? fileURLToPath(new URL('../../cordis.patch.yml', import.meta.url))
   const loaded = loadPatchConfig(path)
   if (!loaded.ok) {
     notes.push(`未能从 ${path} 读取配置（${loaded.reason}），本次使用库默认配置`)
-    return { config: DEFAULT_CONFIG, source: 'DEFAULT_CONFIG（未读到 patch）', notes }
+    return {
+      config: DEFAULT_CONFIG,
+      baseline: DEFAULT_CONFIG,
+      source: 'DEFAULT_CONFIG（未读到 patch）',
+      degraded: true,
+      notes,
+    }
   }
   const merged = mergeConfig(DEFAULT_CONFIG, loaded.config as DeepPartial<MemoryConfig>)
-  const validation = validateConfig(merged)
+
+  // FR-F4：回滚覆盖层必须与宿主同步叠加，否则又会出现「同一个库、
+  // 终端与会话报两套配置」——那正是真缺陷九的形状，只是这次分歧点
+  // 从「读不读 patch」变成了「叠不叠回滚层」。
+  //
+  // 叠加顺序与宿主一致：默认值 + patch → 叠加覆盖层 → 校验。
+  // 宿主路径在 `src/host/adapter.ts` 的 `resolveConfig`，两处必须同序。
+  const ledgerDir = dataDirOverride ?? merged.storage.dataDir
+  const rollback = readRollbackRecord(ledgerDir)
+  const effective = rollback === null ? merged : mergeConfig(merged, rollback.override)
+  if (rollback !== null) {
+    notes.push(
+      `已叠加回滚覆盖层（目标快照 ${rollback.targetId}）：`
+      + `patch 里与快照不同的参数被回滚值覆盖`,
+    )
+  }
+
+  const validation = validateConfig(effective)
   if (!validation.ok) {
     notes.push(
       `patch 里的配置不合法，本次使用库默认配置：\n`
-      + validation.errors.map((line) => `- ${line}`).join('\n'),
+      + validation.errors.map((line) => `- ${line}`).join('\n')
+      // 报错时必须把救自己的那条命令给出来。
+      // 只报「配置非法」而不说怎么回滚，用户只能去手改
+      // patch——而他很可能不知道自己刚改坏了哪一行。
+      + '\n如果是刚刚改坏的，可以用 memoryctl config rollback <id> 一键回滚'
+      + '（用 config list 查看可用快照）。',
     )
-    return { config: DEFAULT_CONFIG, source: 'DEFAULT_CONFIG（patch 非法）', notes }
+    // 注意这里返回的 `baseline` 是 `merged`（含坏掉的 `-5`），
+    // 不是 `DEFAULT_CONFIG`。回滚靠它才能算出「要把 -5 改回 0.18」。
+    return {
+      config: DEFAULT_CONFIG,
+      baseline: merged,
+      source: 'DEFAULT_CONFIG（patch 非法）',
+      degraded: true,
+      notes,
+    }
   }
-  return { config: merged, source: path, notes }
+  return {
+    config: effective,
+    baseline: merged,
+    source: rollback === null ? path : `${path} + 回滚层`,
+    degraded: false,
+    notes,
+  }
 }
 
 /**
@@ -265,6 +344,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let limit = 50
   let days = 7
   let reason = ''
+  let clear = false
   let helpRequested = false
   let onlyPositionals = false
   let index = 0
@@ -314,6 +394,10 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       includeArchived = true
       continue
     }
+    if (arg === '--clear') {
+      clear = true
+      continue
+    }
     if (!arg.startsWith('-')) {
       positionals.push(arg)
       continue
@@ -358,7 +442,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     return {
       ok: true,
       options: {
-        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days,
+        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days, clear,
       },
     }
   }
@@ -370,7 +454,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     options: {
       command: first,
       positionals: positionals.slice(1),
-      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days,
+      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days, clear,
     },
   }
 }
@@ -509,6 +593,9 @@ export function helpText(): string {
     '  revise <id> <新正文>      修正卡片正文并保留旧版本（FR-A5：可查改过什么）',
     '  logs                      读回落盘的诊断日志（FR-F1：最近 N 次操作可回溯）',
     '  report                    最小周报（FR-F3：召回次数/命中率/冲突数/库大小/注入 token）',
+    '  config list               列出配置快照台账（FR-F4：哪些配置生效过）',
+    '  config diff               报当前配置与上一条快照的叶子级差异（P7：改动可追溯）',
+    '  config rollback <id>      把配置拉回某一份快照（FR-F4：改坏能一键回滚）',
     '  help                      显示本帮助（等同 -h / --help / 无参数）',
     '',
     '全局选项：',
@@ -528,6 +615,9 @@ export function helpText(): string {
     'logs 专用选项：',
     '  --limit <条数>            只读最后 N 条，默认 50，0 表示全部',
     '  --days <天数>             report 的统计窗口，默认 7',
+    '',
+    'config 专用选项：',
+    '  --clear                   清除回滚覆盖层，让 patch 重新生效',
     '',
     '退出码：',
     '  0  正常',
@@ -983,6 +1073,228 @@ function renderLog(entry: MemoryLogEntry, timeZone: string): string {
 }
 
 /* ------------------------------------------------------------------ *
+ * 五之二、配置快照与回滚（FR-F4）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 打印配置快照台账（`config list`）。
+ *
+ * @param options - 命令行参数（用 `--limit` 限制条数）。
+ * @param dataDir - 数据目录。
+ * @param timeZone - 用于渲染时刻的时区。
+ * @returns 命令行结果。
+ */
+function runConfigList(options: CliOptions, dataDir: string, timeZone: string): CliResult {
+  const snapshots = readConfigSnapshots(dataDir)
+  if (snapshots.length === 0) {
+    // 「没有快照」与「快照都一样」是两件事，不能都输出一个空表。
+    // 前者的原因是「还没启动过」，后者的原因是「配置一直没变」。
+    return {
+      code: EXIT_OK,
+      stdout: '还没有配置快照（启动一次宿主或执行任意子命令后会自动记下第一条）。\n',
+      stderr: '',
+    }
+  }
+  const limit = options.limit === 0 ? snapshots.length : Math.min(options.limit, snapshots.length)
+  const shown = snapshots.slice(-limit)
+  const rollback = readRollbackRecord(dataDir)
+  if (options.json) {
+    return {
+      code: EXIT_OK,
+      stdout: `${JSON.stringify({
+        dataDir: resolve(dataDir),
+        total: snapshots.length,
+        rollbackActive: rollback !== null,
+        snapshots: shown.map((item) => ({
+          id: item.id,
+          at: item.at,
+          atText: formatTime(item.at, timeZone),
+          configVersion: item.configVersion,
+        })),
+      }, null, 2)}\n`,
+      stderr: '',
+    }
+  }
+  const lines: string[] = [
+    `配置快照台账（共 ${snapshots.length} 条，显示最近 ${shown.length} 条）：`,
+    '',
+  ]
+  for (const item of shown) {
+    lines.push(`  ${item.id}  ${formatTime(item.at, timeZone)}  版本 ${item.configVersion}`)
+  }
+  lines.push('')
+  lines.push(rollback === null
+    ? '当前没有生效中的回滚覆盖层。'
+    : `当前存在回滚覆盖层（目标快照 ${rollback.targetId}，${formatTime(rollback.at, timeZone)}），想让 patch 重新生效请执行 config rollback --clear。`)
+  lines.push('')
+  return { code: EXIT_OK, stdout: `${lines.join('\n')}\n`, stderr: '' }
+}
+
+/**
+ * 打印「当前生效配置 vs 上一份快照」的差异（`config diff`）。
+ *
+ * 这就是 P7「改动可追溯」的可见形态：只报叶子级差异，
+ * 而不是把两份配置全部打印出来让人自己找。
+ *
+ * @param options - 命令行参数。
+ * @param current - 当前生效配置。
+ * @param dataDir - 数据目录。
+ * @returns 命令行结果。
+ */
+function runConfigDiff(options: CliOptions, current: MemoryConfig, dataDir: string): CliResult {
+  const snapshots = readConfigSnapshots(dataDir)
+  const last = snapshots[snapshots.length - 1]
+  if (last === undefined) {
+    return {
+      code: EXIT_OK,
+      stdout: '还没有配置快照，无法对比。\n',
+      stderr: '',
+    }
+  }
+  const base = snapshotToConfig(last.canonical)
+  if (base === null) {
+    // 快照本身读不出来时必须明说，不能报「没有差异」——
+    // 那会让人以为配置没改，而实际上是无法判断。
+    return {
+      code: EXIT_UNHEALTHY,
+      stdout: '',
+      stderr: `最新一条快照（${last.id}）无法还原成配置，无法对比。\n`,
+    }
+  }
+  const changes = diffConfig(base, current)
+  if (options.json) {
+    return {
+      code: EXIT_OK,
+      stdout: `${JSON.stringify({ baseId: last.id, baseAt: last.at, changes }, null, 2)}\n`,
+      stderr: '',
+    }
+  }
+  if (changes.length === 0) {
+    return { code: EXIT_OK, stdout: `与上一条快照（${last.id}）相比，配置没有变化。\n`, stderr: '' }
+  }
+  const lines = [
+    `与上一条快照（${last.id}）相比，共 ${changes.length} 项变化：`,
+    '',
+    ...describeConfigChanges(changes, options.limit === 0 ? 0 : options.limit).map((line) => `  ${line}`),
+    '',
+  ]
+  return { code: EXIT_OK, stdout: `${lines.join('\n')}\n`, stderr: '' }
+}
+
+/**
+ * 执行回滚（`config rollback <id>` 或 `config rollback --clear`）。
+ *
+ * ## 为什么这个函数不能走「先校验配置」那条路
+ *
+ * FR-F4 的验收是「改坏能一键回滚」。配置被改坏时，`validateConfig`
+ * 会报错，而回滚正是为了修复那个错误——**先校验等于拒绝救自己**。
+ * 所以回滚路径只需要：数据目录 + 快照台账 + 「当前生效配置」。
+ * 而「当前生效配置」在配置已坏时用 `DEFAULT_CONFIG` 代替（见 `runCli` 的接线）。
+ *
+ * @param options - 命令行参数；位置参数 1 为目标快照 id。
+ * @param current - 当前生效配置。
+ * @param dataDir - 数据目录。
+ * @param now - 当前时刻。
+ * @param timeZone - 时区。
+ * @returns 命令行结果。
+ */
+function runConfigRollback(
+  options: CliOptions, current: MemoryConfig, dataDir: string, now: number, timeZone: string,
+): CliResult {
+  if (options.clear) {
+    const existed = clearRollback(dataDir)
+    // 「清除了」与「本来就没有」必须分开报。报同一句话会让人以为
+    // 自己刚刚撤销了一个生效中的回滚，而实际上可能根本没有回滚过。
+    return {
+      code: EXIT_OK,
+      stdout: existed
+        ? '已清除回滚覆盖层，patch 里的配置将从下次启动开始生效。\n'
+        : '当前本来就没有回滚覆盖层，无需清除。\n',
+      stderr: '',
+    }
+  }
+
+  const target = options.positionals[1]
+  if (target === undefined || target.length === 0) {
+    return usageFailure('需要指定要回到哪一条快照（用 config list 查看），或用 --clear 清除回滚。')
+  }
+  const snapshots = readConfigSnapshots(dataDir)
+  if (snapshots.length === 0) {
+    return storeFailure('还没有配置快照，无法回滚。')
+  }
+  // 按 id 精确匹配，不按下标：下标会随台账截断变化，
+  // 今天的 2 号明天可能是另一份配置。快照 id 是内容指纹，才能指向确切的一份。
+  const snapshot = snapshots.find((item) => item.id === target)
+  if (snapshot === undefined) {
+    const known = [...new Set(snapshots.map((item) => item.id))].join('、')
+    return usageFailure(`没有 id 为「${target}」的快照。已知：${known}`)
+  }
+  const config = snapshotToConfig(snapshot.canonical)
+  if (config === null) {
+    return storeFailure(`快照 ${snapshot.id} 无法还原成合法配置（可能由更旧版本写下），不能用于回滚。`)
+  }
+
+  const result = applyRollbackToDisk(dataDir, current, config, snapshot.id, now)
+  if (result.outcome === 'noop') {
+    return {
+      code: EXIT_OK,
+      stdout: `当前配置与快照 ${snapshot.id} 已经完全相同，无需回滚。\n`,
+      stderr: '',
+    }
+  }
+  if (result.outcome === 'excludedOnly') {
+    // 只有被排除的段不同（`storage` / `configVersion`）。
+    // 这时必须报失败而不是报成功：用户要求的回滚**一项也没做成**。
+    return storeFailure(
+      `快照 ${snapshot.id} 与当前配置的差异全部落在不可回滚的段上`
+      + `（${ROLLBACK_EXCLUDED_TOP_KEYS.join('、')}），回滚无法执行。`,
+    )
+  }
+  if (options.json) {
+    return {
+      code: EXIT_OK,
+      stdout: `${JSON.stringify({
+        rolledBackTo: snapshot.id, at: now, changed: result.changed, excluded: result.excluded,
+      }, null, 2)}\n`,
+      stderr: '',
+    }
+  }
+  const lines = [
+    `已回滚到快照 ${snapshot.id}（${formatTime(snapshot.at, timeZone)}），共固定 ${result.changed} 项参数。`,
+    '',
+  ]
+  for (const change of diffConfig(current, config).slice(0, 20)) lines.push(`  ${describeConfigChange(change)}`)
+  if (result.excluded > 0) {
+    lines.push('')
+    lines.push(`注意：还有 ${result.excluded} 项差异落在不可回滚的段上（${ROLLBACK_EXCLUDED_TOP_KEYS.join('、')}），本次未处理。`)
+  }
+  lines.push('')
+  lines.push('下次启动宿主时生效。想让 patch 重新生效：memoryctl config rollback --clear')
+  lines.push('')
+  return { code: EXIT_OK, stdout: `${lines.join('\n')}\n`, stderr: '' }
+}
+
+/**
+ * `config` 子命令分派（FR-F4）。
+ *
+ * @param options - 命令行参数；位置参数 0 为动作名。
+ * @param current - 当前生效配置。
+ * @param dataDir - 数据目录。
+ * @param now - 当前时刻。
+ * @param timeZone - 时区。
+ * @returns 命令行结果。
+ */
+function runConfig(
+  options: CliOptions, current: MemoryConfig, dataDir: string, now: number, timeZone: string,
+): CliResult {
+  const action = options.positionals[0]
+  if (action === undefined || action === 'list') return runConfigList(options, dataDir, timeZone)
+  if (action === 'diff') return runConfigDiff(options, current, dataDir)
+  if (action === 'rollback') return runConfigRollback(options, current, dataDir, now, timeZone)
+  return usageFailure(`未知的 config 动作「${action}」，可用：list / diff / rollback`)
+}
+
+/* ------------------------------------------------------------------ *
  * 六、入口
  * ------------------------------------------------------------------ */
 
@@ -1015,8 +1327,23 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
   // 而宿主读 patch，两者在 `spread.mode` 上分别是 shadow / on ⇒ 同一个库、
   // 同一个查询，终端与会话报出不同分数（实测 3/3 查询不一致）。
   // 退回默认值时 `resolveCliConfig` 会在 `notes` 里说明，不静默降级。
-  const resolved = resolveCliConfig(io)
+  const resolved = resolveCliConfig(io, options.dataDir)
   const cliConfig = resolved.config
+
+  // `config` 子命令必须在「校验」与「开库」**之前**处理。
+  //
+  // FR-F4 的验收是「改坏能一键回滚」。配置被改坏时，下面那两步都会失败
+  // （校验报错 / 开库报错），而回滚正是为了修复那个错误——
+  // **先校验等于拒绝救自己**。它也不需要开库：台账是目录里的独立文件，
+  // 不经事件日志（见 `src/store/configLedger.ts` 的模块注释）。
+  const configDataDir = options.dataDir ?? cliConfig.storage.dataDir
+  if (options.command === 'config') {
+    // 传 `baseline` 而不是 `cliConfig`：patch 已坏时 `cliConfig` 已退回默认值，
+    // 拿它当「当前值」会让回滚误以为「已经就是目标值」而什么都不写。
+    // 参见 `ResolvedCliConfig.baseline` 的注释。
+    return runConfig(options, resolved.baseline, configDataDir, (io.now ?? ((): number => Date.now()))(), timeZone)
+  }
+
   const validation = validateConfig(cliConfig)
   if (!validation.ok) {
     return storeFailure(`配置校验失败：\n${validation.errors.map((line) => `- ${line}`).join('\n')}`)
@@ -1032,6 +1359,32 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
 
   const logEntries: MemoryLogEntry[] = []
   const clock = io.now ?? ((): number => Date.now())
+
+  // FR-F4：执行任意子命令也记一条快照。
+  //
+  // 不记的话，`config list` 的空表文案「执行任意子命令后会自动记下
+  // 第一条」就是假的——而**错误文案是承诺，不是装饰**。
+  // 另一层理由：只有宿主启动才记快照的话，一个只用 CLI 维护
+  // 的库永远没有回滚点，而恰恰是 CLI 会员手改配置。
+  //
+  // 降级态（patch 读不到或校验失败、已退回默认值）**不记**快照。
+  // 它不是用户意图：记下去会在需要回滚的那一刻成为最新的「回滚点」，
+  // 而那个点里没有任何用户真正想要的值——回滚到它等于回滚到「一个错误」。
+  try {
+    if (!resolved.degraded) {
+      recordConfigSnapshot(store.dir, cliConfig, clock(), cliConfig.storage.configSnapshotMaxEntries)
+    }
+  } catch (error) {
+    // 不阻断命令：快照是旁路可观测能力。但要报出来，
+    // 否则「没有回滚点」会在需要回滚的那一天才被发现。
+    logEntries.push({
+      kind: 'error',
+      at: clock(),
+      summary: `记录配置快照失败（回滚点将不完整）：${describeError(error)}`,
+      detail: {},
+    })
+  }
+
   let result: CliResult
   let closeError: string | undefined
   try {

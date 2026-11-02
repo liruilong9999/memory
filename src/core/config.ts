@@ -145,6 +145,14 @@ export interface StoragePolicy {
    * 无限增长会让一个长期运行的记忆库攒出几百 MB 的旁路文件。
    */
   logMaxEntries: number
+  /**
+   * 配置快照最多保留多少条（FR-F4）。
+   *
+   * 设 0 表示不限制——同样**不建议**：正常使用一年也就几十条（配置变了才追加），
+   * 但「不限制」意味着一个反复改配置又反复重启的环境能把它撑成上万条。
+   * 留个上限是廉价保险。
+   */
+  configSnapshotMaxEntries: number
 }
 
 /** 巩固（夜整理）参数。 */
@@ -475,7 +483,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 8,
+  configVersion: 9,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -534,6 +542,9 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     reindexEveryRecords: 2000,
     logFile: 'logs/diagnostics.jsonl',
     logMaxEntries: 500,
+    // 配置快照（FR-F4）：每次启动时配置若与上一条不同就追加一条。
+    // 200 条足够回溯一年多的改动，同时把旁路文件压在一百多 KB。
+    configSnapshotMaxEntries: 200,
   },
   consolidation: {
     enabled: true,
@@ -609,7 +620,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 8
+export const MEMORY_CONFIG_VERSION = 9
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -665,6 +676,12 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
 
   if (!Number.isInteger(config.storage.journalSegmentBytes) || config.storage.journalSegmentBytes < 4096) {
     errors.push('storage.journalSegmentBytes 必须是不小于 4096 的整数')
+  }
+  // 配置快照上限：负数会让「保留最后 N 条」变成「保留倒数 -N 条」，
+  // `slice(-(-5))` 等于 `slice(5)`，于是台账被**截掉最新几条只留更早的**——
+  // 与「改动可追溯」正好相反，而且不报错。
+  if (!Number.isInteger(config.storage.configSnapshotMaxEntries) || config.storage.configSnapshotMaxEntries < 0) {
+    errors.push('storage.configSnapshotMaxEntries 必须是非负整数')
   }
 
   if (config.consolidation.maxArchiveRatio > 1) errors.push('consolidation.maxArchiveRatio 必须 ≤ 1')

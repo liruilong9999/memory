@@ -28,6 +28,8 @@ import {
 } from './host/adapter.ts'
 import type { HostContext, Logger } from './host/adapter.ts'
 import { MemoryEngine } from './host/engine.ts'
+import { readRollbackState, resolveDataDirLoose } from './host/configRollback.ts'
+import { recordConfigSnapshot } from './store/configLedger.ts'
 import { openStore } from './store/store.ts'
 import type { MemoryStore } from './store/store.ts'
 import { shouldRunDaily } from './time/clock.ts'
@@ -302,8 +304,27 @@ function makeFocusPackRenderer(engine: MemoryEngine, sources: FocusPackSources):
  * @param rawConfig - 宿主传入的原始配置。
  */
 export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void> {
-  const config = resolveConfig(rawConfig ?? {})
   const logger = createLogger(ctx)
+  // FR-F4：回滚覆盖层必须在校验**之前**叠加。
+  //
+  // 为什么要在这里先算一次 `dataDir`：读覆盖层需要知道它在哪个库里，
+  // 而那时配置**还没通过校验**（可能就是坏的）。
+  // `resolveDataDirLoose` 只取 `storage.dataDir` 不校验，恰好能在这个时点算出路径。
+  //
+  // 不会自指：`storage` 段被 `ROLLBACK_EXCLUDED_TOP_KEYS` 排除在回滚之外，
+  // 所以 `dataDir` 永远只由「默认值 + patch」决定，与覆盖层无关。
+  const dataDir = resolveDataDirLoose(rawConfig ?? {})
+  const rollback = readRollbackState(dataDir)
+  const config = resolveConfig(rawConfig ?? {}, rollback === null ? undefined : rollback.override)
+  if (rollback !== null) {
+    // 回滚生效时必须报出来。不报的后果是“我改了 patch 为什么没生效”——
+    // 而用户会去改 patch、发现怎么改都不变，最后得出「配置系统坏了」的错结论。
+    logger.warn(
+      `已生效配置回滚覆盖层（目标快照 ${rollback.targetId}）：`
+      + `patch 里与快照不同的参数被回滚值覆盖，`
+      + `想让 patch 重新生效请执行 memoryctl config rollback --clear`,
+    )
+  }
   const capabilities = probeCapabilities(ctx)
   if (capabilities.missing.length > 0) {
     // 缺能力不是错误：降级运行并明确告知（C8）。
@@ -315,6 +336,19 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   // 生产环境不传，退回 `Date.now()`；测试靠它把时钟推到「明天下午三点」。
   const rawClock = (rawConfig as { _clock?: unknown } | undefined)?._clock
   const clock = typeof rawClock === 'function' ? (rawClock as () => number) : undefined
+  // FR-F4：每次启动记一条配置快照（与上一条相同时不追加）。
+  //
+  // 为什么要在启动时记而不是在改配置时记：改配置的动作发生在本插件之外
+  // （用户编辑 `cordis.patch.yml`），插件看不到那一幕。能看到的只有「下一次启动时配置长啥样」。
+  // 启动时记账恰好把每一份**真正生效过**的配置都留下，而且不会记下从未生效的中间态。
+  try {
+    recordConfigSnapshot(store.dir, config, clock?.() ?? Date.now(), config.storage.configSnapshotMaxEntries)
+  } catch (error) {
+    // 快照失败不能阻断启动：它是旁路可观测能力，不是记忆库本身。
+    // 但也不能静默——否则「没有回滚点」会在需要回滚的那一天才被发现。
+    logger.warn(`记录配置快照失败（回滚点将不完整）：${error instanceof Error ? error.message : String(error)}`)
+  }
+
   const engine = new MemoryEngine({
     store,
     config,

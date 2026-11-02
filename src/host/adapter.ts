@@ -131,12 +131,27 @@ export function createLogger(ctx: HostContext, prefix = '[memory]'): Logger {
  * 宿主的 patch 行是**整块替换 config**，所以这里必须做深合并，
  * 否则用户只写一个字段就会把其余默认值清空。
  *
+ * ## `override` 为什么在**校验之前**叠加（FR-F4）
+ *
+ * 回滚覆盖层（`config/rollback.json`）的唯一用途，就是把「被改坏的 patch」
+ * 修回可用状态。若先校验再叠加，patch 一坏这里就抛错了，覆盖层永远没机会
+ * 生效——用户执行了回滚命令、命令报告成功，宿主下次启动仍然崩溃。
+ * 那比没有回滚更糟，因为它消耗掉用户唯一一次信任。
+ *
+ * 所以顺序固定为：合并默认值与 patch → 叠加覆盖层 → 校验。
+ *
  * @param raw - 宿主传入的原始配置。
+ * @param override - 回滚覆盖层（最小覆盖）；没有回滚时省略。
  * @returns 合并并校验后的配置；校验失败时抛错（启动期就该失败，而不是运行期出错）。
  */
-export function resolveConfig(raw: unknown): MemoryConfig {
+export function resolveConfig(raw: unknown, override?: DeepPartial<MemoryConfig>): MemoryConfig {
   const partial = (typeof raw === 'object' && raw !== null ? raw : {}) as DeepPartial<MemoryConfig>
-  const merged = mergeConfig(DEFAULT_CONFIG, partial)
+  // 两次 `mergeConfig` 而不是 `{...merged, ...override}`：覆盖层可能只写了
+  // `recall.absoluteThreshold`，浅合并会把整个 `recall` 段替换成一个只剩
+  // 一个字段的对象，其余字段变成 `undefined`，然后在校验处炸出一堆
+  // 「必须 ≥ 0」的假错误。深合并才是覆盖层的正确语义。
+  const withPatch = mergeConfig(DEFAULT_CONFIG, partial)
+  const merged = override === undefined ? withPatch : mergeConfig(withPatch, override)
   const validation = validateConfig(merged)
   if (!validation.ok) {
     throw new Error(`dsh-memory 配置非法：\n${validation.errors.join('\n')}`)
