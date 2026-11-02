@@ -407,3 +407,40 @@ if (mutated === original) {
   判断——模板说不表态，引用却替它表了态。现删除原文引用，只报主题与次数。
   有一条测试**故意断言这个局限存在**（极性相反、强度相同的两件事会被蒸馏成
   同一条感受），将来若引入极性它会变红，提醒同步更新文档。
+- [x] **两个连续的 `/** */` 文档块会让第一块静默失效**：TypeScript 只把**紧邻
+  声明**的那一块当文档注释，前一块既不属于任何声明、也不会报错，`tsc` 生成的
+  `.d.ts` 里它还**原样保留**——所以「文件里能搜到」不等于「工具链会呈现它」。
+
+  实测方式（`getQuickInfoAtPosition` 比读文件可靠）：
+
+  ```js
+  const ls = ts.createLanguageService(host, ts.createDocumentRegistry())
+  ls.getQuickInfoAtPosition(file, src.indexOf('SpreadMode = '))
+  // 只返回第二段；第一段的 FR-G1 归属说明、起源 L15 双锚定全部不可见
+  ```
+
+  危害与 `coerceKind` 同源：**文档写了但没人看得到，等于没写**，而且没有任何
+  机制会提醒你。IDE 悬浮提示、`hover`、文档生成器全都只认最后一块。
+
+  自查命令（数每个声明的前置文档块个数，**且两块之间没有空行**才算孤儿）：
+
+  ```js
+  const ranges = ts.getLeadingCommentRanges(src, node.getFullStart()) ?? []
+  const docs = ranges.filter(r => r.kind === ts.SyntaxKind.MultiLineCommentTrivia
+                                && src.startsWith('/**', r.pos))
+  for (let i = 0; i + 1 < docs.length; i++) {
+    const gap = src.slice(docs[i].end, docs[i + 1].pos)
+    // 隔了空行 = 模块注释 + 声明注释，合法；紧邻才是孤儿
+    if (!/\n[ \t]*\r?\n/.test(gap)) console.log('孤儿文档块', node.name?.text)
+  }
+  ```
+
+  **判据必须区分「紧邻」和「隔空行」**：`/** @module ... */` 后面空一行再写
+  声明的文档注释，是完全合法的写法（`src/core/text.ts` 与 `src/core/types.ts`
+  开头都是这样）。若只数「前置文档块 > 1」就报警，这两个文件会被误报——
+  我第一次跑自查就是这么误报的，差点去改两个本来正确的文件。
+  **误报会让人去修不存在的问题，比漏报更浪费。**
+
+  预防：写完一段新注释后，**往上看一行**——若紧邻的是 `*/`（中间没有空行），
+  先合并或调整位置再走。这个错误在 diff 里极不显眼（两个块都是 `/**` 开头，
+  绿字一片），但在 IDE 里是整段消失。
