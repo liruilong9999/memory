@@ -26,11 +26,16 @@ describe('isNeverArchiveKind 永不归档类别（FR-C3）', () => {
     }
   })
 
-  it('事件、事实、感受不受类别保护', () => {
+  it('事件、事实不受类别保护', () => {
     const config = makeConfig()
-    for (const kind of ['event', 'fact', 'feeling'] as const) {
+    for (const kind of ['event', 'fact'] as const) {
       assert.equal(isNeverArchiveKind(makeCard({ id: kind, kind }), config), false, kind)
     }
+  })
+
+  it('感受受类别保护（起源 L11：只会留下感受，不该被自动归档）', () => {
+    const config = makeConfig()
+    assert.equal(isNeverArchiveKind(makeCard({ id: 'feeling', kind: 'feeling' }), config), true)
   })
 
   it('类别列表可配', () => {

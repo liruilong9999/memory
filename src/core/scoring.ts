@@ -250,6 +250,27 @@ export function buildExplain(score: ScoreBreakdown, config: MemoryConfig): strin
 }
 
 /**
+ * 按记忆域过滤候选卡。
+ *
+ * 起源 L13（无编号）：「可以把生活、学习、工作 3 个记忆模块，可插拔
+ * （同时存在或者只有一个）」。可插拔的含义是**没启用的域不该出现在结果里**，
+ * 否则「只开工作域」与「三个域全开」召回结果一样，可插拔就是假的。
+ *
+ * 空域列表表示不限域（兼容「域还没配置」的场景）。
+ *
+ * @param cards - 候选卡。
+ * @param domains - 允许的记忆域；为空表示不限。
+ * @returns 过滤后的卡片。
+ */
+export function filterByDomain(
+  cards: readonly MemoryCard[], domains: readonly string[],
+): MemoryCard[] {
+  if (domains.length === 0) return [...cards]
+  const allowed = new Set(domains)
+  return cards.filter((card) => allowed.has(card.domain))
+}
+
+/**
  * 批量打分并按总分降序排序。
  *
  * 排序必须稳定：总分相同的情况下用 id 升序兜底，
@@ -263,7 +284,9 @@ export function buildExplain(score: ScoreBreakdown, config: MemoryConfig): strin
 export function scoreCards(
   cards: readonly MemoryCard[], query: RecallQuery, config: MemoryConfig,
 ): ScoredCard[] {
-  const scored = cards.map((card) => scoreCard(card, query, config))
+  // 先按域过滤再打分：域外的卡连候选都不该算，否则白花 CPU 且会污染相对阈值。
+  const inDomain = filterByDomain(cards, query.domains)
+  const scored = inDomain.map((card) => scoreCard(card, query, config))
   scored.sort((a, b) => {
     if (b.score.total !== a.score.total) return b.score.total - a.score.total
     return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0

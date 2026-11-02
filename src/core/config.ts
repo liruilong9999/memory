@@ -56,7 +56,13 @@ export interface ForgettingPolicy {
   archiveRetention: number
   /** 情绪强度对半衰期的放大系数上限：强烈的感受忘得更慢（起源 L3·激素是关键）。 */
   emotionalHalfLifeBoost: number
-  /** 永不归档的类型（FR-C3）。 */
+  /**
+   * 永不归档的类型（FR-C3）。
+   *
+   * `feeling` 必须在列：起源 L11（无编号）说「我们大多数细节都会忘记，只会留下感受」，
+   * 感受正是该系统**唯一该长期留下的东西**。把感受卡按强度归档，
+   * 等于把起源最核心的那句话实现反了。
+   */
   neverArchiveKinds: string[]
   /** 是否启用自动归档。 */
   autoArchive: boolean
@@ -160,7 +166,9 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     archiveThreshold: 0.08,
     archiveRetention: 0.6,
     emotionalHalfLifeBoost: 2.0,
-    neverArchiveKinds: ['promise', 'concept', 'experience'],
+    // `feeling` 在列的依据见 ForgettingPolicy.neverArchiveKinds 注释：
+    // 起源 L11 要求「只留下感受」，感受不该被自动归档。
+    neverArchiveKinds: ['feeling', 'promise', 'concept', 'experience'],
     autoArchive: true,
   },
   dedup: {

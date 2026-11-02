@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import {
-  applyThresholds, buildFocusPack, clamp01, effectiveHalfLife, formatDuration,
+  applyThresholds, buildFocusPack, clamp01, effectiveHalfLife, filterByDomain, formatDuration,
   formatTime, goalScore, importanceScore, makeQuery, recencyScore, scoreCard,
   scoreCards, semanticScore,
 } from '../../src/core/scoring.ts'
@@ -145,6 +145,48 @@ test('scoreCards 确定性：两次调用结果一致', () => {
   const first = scoreCards(cards, query, config).map((s) => s.card.id)
   const second = scoreCards(cards, query, config).map((s) => s.card.id)
   assert.deepEqual(first, second)
+})
+
+test('filterByDomain 空域列表表示不限域', () => {
+  const cards = [makeCard({ id: 'a', domain: 'work' }), makeCard({ id: 'b', domain: 'life' })]
+  assert.equal(filterByDomain(cards, []).length, 2)
+})
+
+test('filterByDomain 只保留启用域（起源 L13 三模块可插拔）', () => {
+  const cards = [
+    makeCard({ id: 'w', domain: 'work' }),
+    makeCard({ id: 'l', domain: 'life' }),
+    makeCard({ id: 's', domain: 'study' }),
+  ]
+  assert.deepEqual(filterByDomain(cards, ['work']).map((c) => c.id), ['w'])
+  assert.deepEqual(filterByDomain(cards, ['life', 'study']).map((c) => c.id), ['l', 's'])
+})
+
+test('filterByDomain 不修改输入数组', () => {
+  const cards = [makeCard({ id: 'a', domain: 'work' }), makeCard({ id: 'b', domain: 'life' })]
+  filterByDomain(cards, ['work'])
+  assert.equal(cards.length, 2)
+})
+
+test('scoreCards 按 query.domains 过滤，域外卡不进结果', () => {
+  const now = 1_700_000_000_000
+  const base = makeQuery('Qt5 项目', config, now)
+  // 只启用工作域。
+  const query = { ...base, domains: ['work'] }
+  const cards = [
+    makeCard({ id: 'work-card', domain: 'work', text: '这个项目用 Qt5', createdAt: now }),
+    makeCard({ id: 'life-card', domain: 'life', text: '这个项目用 Qt5', createdAt: now }),
+  ]
+  const scored = scoreCards(cards, query, config)
+  assert.deepEqual(scored.map((s) => s.card.id), ['work-card'])
+})
+
+test('scoreCards 域全关时返回空（可插拔的另一半语义）', () => {
+  const now = 1_700_000_000_000
+  const query = { ...makeQuery('Qt5', config, now), domains: [] as string[] }
+  const cards = [makeCard({ id: 'a', domain: 'work' })]
+  // 空列表表示不限域，不是「全关」。
+  assert.equal(scoreCards(cards, query, config).length, 1)
 })
 
 test('applyThresholds 低于绝对阈值被丢弃', () => {
