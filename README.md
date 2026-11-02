@@ -94,6 +94,27 @@ pnpm cli --help    # 离线命令行
 
 作为 DSH 插件安装时，`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，宿主会自动加载。
 
+### 离线 CLI 用的是哪份配置
+
+**CLI 和宿主读同一份 `cordis.patch.yml`**，不是库里的默认值。
+这一点必须显式说，因为两者曾经不一致：CLI 写死了 `DEFAULT_CONFIG`
+（`spread.mode = 'shadow'`），而宿主从 patch 读到 `'on'`，于是
+**同一个库、同一个查询，终端与会话报出两套分数**，且终端里永远看不到
+「扩散加分」。一个报错的观测点比没有观测点更危险，因为人会信它。
+
+```bash
+# 自证用的是哪份配置：health 会同时报「配置来源」和「扩散模式」
+pnpm cli health
+
+# 查配置读到了什么（--verbose 把来源打到 stderr）
+pnpm cli query "Redis 缓存" --verbose
+```
+
+读不到 patch 或配置非法时，CLI **退回默认值但会在 stderr 报「配置提醒」**，
+不静默降级。裸写 `mode: on` 这种 YAML 1.1 布尔陷阱会被明确报错
+（`spread.mode 必须是 'off' / 'shadow' / 'on' 之一，实际为 true`），
+而不是悄悄当成 `shadow` 跑。
+
 ## 设计信条
 
 1. **每行代码都要能回答两个问题**：它对应起源的哪一条？它满足需求规格的哪个编号？两者都答不上来的代码不写。

@@ -35,14 +35,15 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import process from 'node:process'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 
-import { DEFAULT_CONFIG, validateConfig } from '../core/config.ts'
-import type { MemoryConfig } from '../core/config.ts'
+import { DEFAULT_CONFIG, mergeConfig, validateConfig } from '../core/config.ts'
+import type { DeepPartial, MemoryConfig } from '../core/config.ts'
 import { renderFocusPackExplain } from '../core/render.ts'
 import { formatTime } from '../core/scoring.ts'
 import type { MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
 import { MemoryEngine } from '../host/engine.ts'
+import { loadPatchConfig } from '../host/patchConfig.ts'
 import { EXPORT_FORMAT_VERSION } from '../store/export.ts'
 import { openStore } from '../store/store.ts'
 import type { MemoryStore } from '../store/store.ts'
@@ -88,9 +89,6 @@ const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'help']
 /** 子命令名。 */
 type Command = (typeof COMMANDS)[number]
 
-/** CLI 实际使用的配置：默认配置即全部阈值的唯一来源（硬性约定 6）。 */
-const CLI_CONFIG: MemoryConfig = DEFAULT_CONFIG
-
 /**
  * 解析后的命令行参数。
  *
@@ -135,6 +133,13 @@ export interface CliResult {
 export interface CliIo {
   /** 当前时刻（毫秒）；省略时取 `Date.now`。 */
   now?: () => number
+  /**
+   * patch 文件路径；省略时取本包自带的 `cordis.patch.yml`。
+   *
+   * 之所以要能注入：单测必须能验证「配置来源不同 ⇒ 结果不同」这个事实，
+   * 而不是依赖仓库里那个文件的当前内容（那会把测试绑在别人的编辑上）。
+   */
+  configPath?: string
 }
 
 /** 导出文档：`export` 子命令的 JSON 结构。 */
@@ -174,6 +179,55 @@ interface ExportDocument {
  */
 function isCommand(value: string): value is Command {
   return (COMMANDS as readonly string[]).includes(value)
+}
+
+/**
+ * CLI 实际使用的配置**解析结果**。
+ *
+ * 关键点：这个类型存在的理由是「让配置来源成为可报告的事实」。
+ * 曾经 CLI 写死 `DEFAULT_CONFIG`，而宿主读 patch，两者在 `spread.mode` 上
+ * 分别是 `shadow` / `on`——同一个库、同一个查询，终端与会话报出不同分数
+ * （实测 3/3 查询不一致）。CLI 的存在意义就是「让我看看记忆库现在是什么样」，
+ * 它报的却不是模型看到的，那它比没有更糟：**一个说错的观测点比没有观测点
+ * 更危险，因为人会信它。**
+ */
+export interface ResolvedCliConfig {
+  /** 实际生效的配置。 */
+  readonly config: MemoryConfig
+  /** 配置来自哪里，供 `health` 与人读输出显示。 */
+  readonly source: string
+  /** 解析过程中的提醒（例如 patch 缺失后退回默认值）。 */
+  readonly notes: readonly string[]
+}
+
+/**
+ * 解析 CLI 用的配置：**与宿主同源**——读同一个 `cordis.patch.yml`。
+ *
+ * 退回 `DEFAULT_CONFIG` 时必须在 `notes` 里说出来，绝不静默降级：
+ * 静默降级正是本仓库反复吃亏的那一类问题（用户以为打开了突触效果，
+ * 实际跑的是影子模式，而且没有任何东西告诉他）。
+ *
+ * @param io - 注入点（`configPath` 可覆盖 patch 路径）。
+ * @returns 解析结果；`config` 一定可用。
+ */
+function resolveCliConfig(io: CliIo): ResolvedCliConfig {
+  const notes: string[] = []
+  const path = io.configPath ?? fileURLToPath(new URL('../../cordis.patch.yml', import.meta.url))
+  const loaded = loadPatchConfig(path)
+  if (!loaded.ok) {
+    notes.push(`未能从 ${path} 读取配置（${loaded.reason}），本次使用库默认配置`)
+    return { config: DEFAULT_CONFIG, source: 'DEFAULT_CONFIG（未读到 patch）', notes }
+  }
+  const merged = mergeConfig(DEFAULT_CONFIG, loaded.config as DeepPartial<MemoryConfig>)
+  const validation = validateConfig(merged)
+  if (!validation.ok) {
+    notes.push(
+      `patch 里的配置不合法，本次使用库默认配置：\n`
+      + validation.errors.map((line) => `- ${line}`).join('\n'),
+    )
+    return { config: DEFAULT_CONFIG, source: 'DEFAULT_CONFIG（patch 非法）', notes }
+  }
+  return { config: merged, source: path, notes }
 }
 
 /**
@@ -608,13 +662,20 @@ export function healthExitCode(health: { indexOk: boolean }): number {
  * @param engine - 记忆引擎。
  * @returns 命令结果。
  */
-function runHealth(options: CliOptions, store: MemoryStore, engine: MemoryEngine): CliResult {
+function runHealth(
+  options: CliOptions, store: MemoryStore, engine: MemoryEngine, resolved: ResolvedCliConfig,
+): CliResult {
   const health = engine.health()
   const code = healthExitCode(health)
   if (options.json) {
     return {
       code,
-      stdout: jsonText({ ...health, dataDir: store.dir }),
+      stdout: jsonText({
+        ...health,
+        dataDir: store.dir,
+        configSource: resolved.source,
+        spreadMode: resolved.config.spread.mode,
+      }),
       stderr: '',
     }
   }
@@ -625,6 +686,11 @@ function runHealth(options: CliOptions, store: MemoryStore, engine: MemoryEngine
     `图谱边：${health.edges} 条`,
     `索引：${health.indexOk ? '一致' : '不一致'}`,
     `数据目录：${store.dir}`,
+    // 配置来源与扩散模式必须报出来：健康检查是运维判断「这个库现在是什么样」
+    // 的唯一入口，而 CLI 曾经用库默认值（shadow）而宿主用 patch（on），
+    // 同一个库报出两套分数。报出来才能让人发现两边不一致。
+    `配置来源：${resolved.source}`,
+    `扩散模式：${resolved.config.spread.mode}`,
   ]
   return { code, stdout: `${lines.join('\n')}\n`, stderr: '' }
 }
@@ -691,17 +757,24 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
   const timeZone = resolveTimeZone(options.timeZone)
   if (!isValidTimeZone(timeZone)) return usageFailure(`无效时区「${timeZone}」`)
 
-  // FR-F4：配置版本自洽是「参数可版本化」的前提。默认配置被改坏时，
+  // FR-F4：配置版本自洽是「参数可版本化」的前提。配置被改坏时，
   // 宁可明确报错，也不要带着错误阈值跑出一堆诡异结果。
-  const validation = validateConfig(CLI_CONFIG)
+  //
+  // 配置**必须与宿主同源**（读同一个 patch）：曾经这里写死 `DEFAULT_CONFIG`，
+  // 而宿主读 patch，两者在 `spread.mode` 上分别是 shadow / on ⇒ 同一个库、
+  // 同一个查询，终端与会话报出不同分数（实测 3/3 查询不一致）。
+  // 退回默认值时 `resolveCliConfig` 会在 `notes` 里说明，不静默降级。
+  const resolved = resolveCliConfig(io)
+  const cliConfig = resolved.config
+  const validation = validateConfig(cliConfig)
   if (!validation.ok) {
     return storeFailure(`配置校验失败：\n${validation.errors.map((line) => `- ${line}`).join('\n')}`)
   }
 
-  const dataDir = options.dataDir ?? CLI_CONFIG.storage.dataDir
+  const dataDir = options.dataDir ?? cliConfig.storage.dataDir
   let store: MemoryStore
   try {
-    store = openStore({ config: CLI_CONFIG, dataDir })
+    store = openStore({ config: cliConfig, dataDir })
   } catch (error) {
     return storeFailure(`打开记忆库失败（${resolve(dataDir)}）：${describeError(error)}`)
   }
@@ -713,7 +786,7 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
   try {
     const engine = new MemoryEngine({
       store,
-      config: CLI_CONFIG,
+      config: cliConfig,
       timeZone,
       clock,
       onLog: (entry: MemoryLogEntry) => {
@@ -731,7 +804,7 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
         result = runRebuild(options, engine)
         break
       case 'health':
-        result = runHealth(options, store, engine)
+        result = runHealth(options, store, engine, resolved)
         break
       case 'consolidate':
         result = runConsolidate(options, engine)
@@ -751,8 +824,15 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
   }
 
   const stderrParts: string[] = []
+  // 配置退回默认值必须让人看见。静默降级会让运维以为「我改的 patch 生效了」，
+  // 而他看到的其实是默认行为——这与「用户以为打开了突触效果，实际跑的是
+  // 影子模式」是同一类问题，只是发生在 CLI 侧。
+  for (const note of resolved.notes) stderrParts.push(`配置提醒：${note}\n`)
   if (result.stderr.length > 0) stderrParts.push(result.stderr)
   if (closeError !== undefined) stderrParts.push(closeError)
+  if (options.verbose) {
+    stderrParts.push(`配置来源：${resolved.source}（spread.mode = ${cliConfig.spread.mode}）\n`)
+  }
   if (options.verbose && logEntries.length > 0) {
     for (const entry of logEntries) stderrParts.push(`${renderLog(entry, timeZone)}\n`)
   }

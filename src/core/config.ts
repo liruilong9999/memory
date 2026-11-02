@@ -763,19 +763,34 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
  * **显式写了 `mode` 时以 `mode` 为准**：新字段是新事实，旧字段只用来补空缺。
  * 两个都写是用户自己矛盾，不替他猜，`mode` 是更具体的那个。
  *
+ * **写了 `mode` 但不合法时必须原样透传，不能退回 fallback。**
+ * 这条是被实测逼出来的：YAML 1.1 里无引号的 `on` 是**布尔值**，用户在 patch
+ * 里写 `mode: on`（极自然的写法）时，宿主拿到的是 `true`。若这里退回
+ * fallback，结果是 `mode` 变成 `'shadow'`——**不报错、不崩溃、测试全绿**，
+ * 用户以为打开了扩散，实际跑的是影子模式。静默降级比加载期崩溃更坏：
+ * 崩溃会让人立刻改，降级会让人一直以为自己开了。
+ *
+ * 所以非法值一律透传成 `mode` 的值本身，交给 `validateConfig` 报错。
+ * 类型上要 `as SpreadMode`——这是**故意的**：这一层的职责是把用户的输入
+ * 原样送到校验层，而不是替校验层做决定。`validateConfig` 会因此给出
+ * 「spread.mode 必须是 'off' / 'shadow' / 'on' 之一，实际为 true」。
+ *
  * 迁移后**不把 `enabled` 带进结果**：留着一个已无读者的字段，下一个人会以为
  * 它还在起作用。配置对象的形状必须与代码实际读的字段一致。
  *
  * @param override - 用户提供的 spread 段（可能含旧字段）。
  * @param fallback - 合并前的 `mode`（默认值或 base 里的值）。
- * @returns 迁移后的 `mode`。
+ * @returns 迁移后的 `mode`；用户写了非法值时原样返回该值，交给校验层拒绝。
  */
 function migrateSpreadMode(override: unknown, fallback: SpreadMode): SpreadMode {
   if (typeof override !== 'object' || override === null) return fallback
   const partial = override as { mode?: unknown; enabled?: unknown }
   // 显式写了合法 mode 时，新字段优先。
   if (partial.mode === 'off' || partial.mode === 'shadow' || partial.mode === 'on') return partial.mode
-  // 否则退回旧布尔字段。
+  // 写了 mode 但不合法：原样透传给校验层，绝不静默退回 fallback。
+  // 典型来源是 YAML 1.1 把裸 `on` 解析成布尔 `true`。
+  if (partial.mode !== undefined) return partial.mode as SpreadMode
+  // 没写 mode 时才退回旧布尔字段。
   if (partial.enabled === true) return 'on'
   if (partial.enabled === false) return 'off'
   return fallback

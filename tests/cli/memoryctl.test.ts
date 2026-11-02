@@ -14,15 +14,18 @@ import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   CLI_NAME, EXIT_OK, EXIT_UNHEALTHY, EXIT_USAGE, FALLBACK_TIME_ZONE,
   healthExitCode, helpText, isValidTimeZone, parseArgs, resolveTimeZone, runCli,
 } from '../../src/cli/memoryctl.ts'
-import { DEFAULT_CONFIG } from '../../src/core/config.ts'
+import { DEFAULT_CONFIG, mergeConfig } from '../../src/core/config.ts'
+import type { DeepPartial, MemoryConfig } from '../../src/core/config.ts'
 import { buildCardId } from '../../src/core/types.ts'
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
+import { loadPatchConfig } from '../../src/host/patchConfig.ts'
 import { openStore } from '../../src/store/store.ts'
 import { makeTempDir, removeDirContents } from '../store/helpers.ts'
 
@@ -82,6 +85,45 @@ function seedStore(dir: string): void {
   store.putCard(makeCard('fact', '生产环境部署必须先跑数据库迁移'))
   store.putCard(makeCard('event', '昨天部署失败了，原因是数据库迁移没跑'))
   store.putCard(makeCard('fact', '部署脚本已废弃', { status: 'archived' }))
+  store.close()
+}
+
+/**
+ * 种一个**有图谱边**的库，供扩散相关用例使用。
+ *
+ * 为什么不能用 {@link seedStore}：它直接 `putCard`，而图谱边只在夜整理里
+ * 产出。库里一条边都没有时，扩散**在数学上无从发生**——于是
+ * 「on 模式下必须看见扩散加分」这条断言会永远失败，而失败原因不是
+ * 代码错了，是测试数据里没有可扩散的东西。
+ * **把「机制没跑」和「输入为空的机制当然不跑」混为一谈，会让人去修一个
+ * 不存在的问题。**
+ *
+ * @param dir - 数据目录。
+ */
+function seedSynapseStore(dir: string): void {
+  const store = openStore({ config: DEFAULT_CONFIG, dataDir: dir })
+  const engine = new MemoryEngine({
+    store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock,
+  })
+  const sentences = [
+    '决定把 Cordis 版本升到 4，插件按新 API 改写',
+    '结论是 Cordis 的 bundle patch 语法要重新适配',
+    '方案是用 Redis 做缓存，结论已定',
+    '约定 Redis 的过期时间设成 300 秒',
+    '约定 Redis 和 PostgreSQL 的数据一致性方案',
+    '决定数据库选 PostgreSQL，这条和框架无关',
+    '架构上 Cordis 插件加载顺序会影响启动时间',
+    '约定 Cordis 插件命名用中划线，注意统一',
+  ]
+  sentences.forEach((text, i) => {
+    engine.writeTurn({
+      sessionId: 'sess-synapse', turn: i + 1, step: 1, seq: i + 1,
+      userText: text, assistantText: '好的，我记下了。',
+      domain: 'work', at: T0 + (i + 1) * 1000,
+    })
+  })
+  // 边只在夜整理里产出（FR-G1 / 起源 L15 图谱）。
+  engine.consolidate(T0 + 200_000)
   store.close()
 }
 
@@ -291,7 +333,17 @@ describe('query（FR-F2）', () => {
     // 只读查询不写库 ⇒ 引擎不产生 recall 日志。这不是缺陷：
     // 本项目里「召回」指宿主真的把记忆注入上下文、即将被使用；
     // 运维敲一眼看看库里有什么，不算使用，也就不该记成一次召回。
-    assert.equal(result.stderr, '')
+    //
+    // 断言**不能**写成 `stderr === ''`：那会把「没有 recall 日志」和
+    // 「stderr 一个字都不许有」混成同一件事。`--verbose` 下本来就该报
+    // 「配置来源」——运维要能确认自己改的 patch 真的生效了。
+    // 之前写 `=== ''` 时，加一行配置来源就让它红了，而它本该守的东西
+    // （不产生 recall 日志）其实一直没变。**断言宽过头，会替不相干的行为背书。**
+    assert.doesNotMatch(result.stderr, /^\[recall\]/mu)
+    // 配对断言：`--verbose` 必须真的说了点什么，否则上面那条可能只是因为
+    // 整个 verbose 通道坏了而空过。
+    assert.match(result.stderr, /配置来源/u, '--verbose 必须报出配置来源')
+    assert.match(result.stderr, /spread\.mode = on/u, '配置来源里必须带上扩散模式')
   })
 
   it('不加 --verbose 时 stderr 保持干净', () => {
@@ -543,5 +595,115 @@ describe('输出不串味', () => {
       runCli(['不存在']).stderr,
     ]
     for (const text of outputs) assert.ok(text.endsWith('\n'), `输出未以换行结尾：${text.slice(-20)}`)
+  })
+})
+
+describe('CLI 与宿主必须用同一份配置（真缺陷九）', () => {
+  /**
+   * 这个 describe 守的是一类**沉默**的错误：同一个库、同一个查询，
+   * 终端报一个总分、会话报另一个总分，而两边都不报错。
+   *
+   * 曾经 `src/cli/memoryctl.ts` 写死 `CLI_CONFIG = DEFAULT_CONFIG`
+   * （`spread.mode = 'shadow'`），宿主走 `resolveConfig` 读 patch（`'on'`）。
+   * 实测 3/3 查询分数不一致，且 CLI 输出里从来没有「扩散加分」——
+   * 运维在终端看到的内存库，不是模型实际看到的那个。
+   */
+
+  /** 按宿主的方式（读 patch → mergeConfig）算出配置，与 adapter.ts 同路。 */
+  function hostConfigFromPatch(): MemoryConfig {
+    const patch = loadPatchConfig(fileURLToPath(new URL('../../cordis.patch.yml', import.meta.url)))
+    assert.equal(patch.ok, true, '出厂 patch 必须能解析')
+    if (!patch.ok) return DEFAULT_CONFIG
+    return mergeConfig(DEFAULT_CONFIG, patch.config as DeepPartial<MemoryConfig>)
+  }
+
+  it('health 报出的扩散模式与宿主读 patch 得到的模式一致', () => {
+    const hostConfig = hostConfigFromPatch()
+    const dir = tempDir()
+    seedStore(dir)
+    const result = runCli(['health', '--data-dir', dir, '--json'], { now: fixedClock })
+    const payload = JSON.parse(result.stdout) as { spreadMode: string }
+
+    assert.equal(
+      payload.spreadMode, hostConfig.spread.mode,
+      'CLI 报出的扩散模式必须等于宿主读 patch 得到的模式——否则同一个库有两套分数',
+    )
+    // 前提断言：出厂 patch 必须是 'on'。否则上面那条在「两边都是 shadow」时也绿，
+    // 而「CLI 根本没用 patch、只是恰好和默认值一样」正是缺陷本身。
+    assert.equal(hostConfig.spread.mode, 'on', '出厂 patch 必须显式开扩散，见 tests/host/patch.test.ts')
+  })
+
+  it('on 模式下 CLI 的分数与宿主引擎逐位相同，且含「扩散加分」', () => {
+    const hostConfig = hostConfigFromPatch()
+    // 这个库必须**有图谱边**，否则扩散无从发生——「没有扩散加分」会变成
+    // 「输入为空的机制当然不跑」，而那条断言就成了在测空气。
+    // `seedStore` 直接 `putCard`，不产边；这里必须走 writeTurn + consolidate
+    // 这条真实链路（边只在夜整理里产出）。
+    const dir = tempDir()
+    seedSynapseStore(dir)
+
+    // 宿主：真实引擎
+    const store = openStore({ config: hostConfig, dataDir: dir })
+    let hostTotals: number[]
+    let hostHasBoost = false
+    try {
+      const engine = new MemoryEngine({ store, config: hostConfig, timeZone: TZ, clock: fixedClock })
+      const peek = engine.peek('Redis')
+      hostTotals = peek.pack.cards.map((scored) => scored.score.total)
+      hostHasBoost = peek.pack.cards.some((c) => c.explain.some((l) => l.includes('扩散加分')))
+    } finally {
+      store.close()
+    }
+    assert.ok(hostTotals.length > 0, '前提：得先召回到卡，否则「分数相同」可能只是两边都空')
+    // 前提断言：宿主自己都没加分的话，下面「CLI 必须看得见」就无从谈起，
+    // 而那条会变成一个永远测不到东西的断言。
+    assert.equal(hostHasBoost, true, '前提：这个库里扩散必须真的发生过，否则本条测试没测到东西')
+
+    // CLI：真实入口
+    const result = runCli(['query', 'Redis', '--data-dir', dir, '--json'], { now: fixedClock })
+    const payload = JSON.parse(result.stdout) as {
+      cards: { score: { total: number }; explain: string[] }[]
+    }
+    assert.deepEqual(
+      payload.cards.map((c) => c.score.total), hostTotals,
+      'CLI 与宿主的分数必须逐位相同（ST-1：同一状态同一查询结果一致）',
+    )
+    assert.ok(
+      payload.cards.some((c) => c.explain.some((line) => line.includes('扩散加分'))),
+      'on 模式下 CLI 必须看得见扩散加分，否则运维不知道突触效果到底生效没有',
+    )
+  })
+
+  it('patch 缺失时退回默认值，但必须在 stderr 里说出来（不静默降级）', () => {
+    const dir = tempDir()
+    seedStore(dir)
+    const result = runCli(
+      ['health', '--data-dir', dir],
+      { now: fixedClock, configPath: 'D:/不存在的目录/cordis.patch.yml' },
+    )
+    assert.equal(result.code, EXIT_OK, '配置读不到不该让健康检查失败')
+    assert.match(result.stderr, /配置提醒/u, '退回默认值必须报出来')
+    assert.match(result.stderr, /默认配置/u)
+  })
+
+  it('patch 里写成裸 on 时，CLI 报配置非法而不是当字符串放过去', () => {
+    // 裸 `on` 在 YAML 1.1 里是布尔 true，宿主 validateConfig 会拒绝并加载期失败。
+    // 若 CLI 把它当字符串 'on' 接受，CLI 就替一个「照抄就崩」的写法背书。
+    const dir = tempDir()
+    seedStore(dir)
+    const patchDir = tempDir('dsh-memory-patch-')
+    const patchPath = join(patchDir, 'cordis.patch.yml')
+    writeFileSync(patchPath, [
+      '- insert:',
+      '    - id: memory',
+      '      config:',
+      '        spread:',
+      '          mode: on',
+      '',
+    ].join('\n'), 'utf8')
+
+    const result = runCli(['health', '--data-dir', dir], { now: fixedClock, configPath: patchPath })
+    assert.match(result.stderr, /配置提醒/u)
+    assert.match(result.stderr, /不合法/u, '必须说清是配置不合法，而不是含糊地退回默认值')
   })
 })

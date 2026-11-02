@@ -508,6 +508,46 @@ if (mutated === original) {
         我填成 `assert` 的 message，脚本匹配的是 `✖ <用例名>`，
         于是两个都命中的变异被报成「未命中」。**期望值选错层次时，
         反向验证会给出与事实相反的报告。**
+  - [x] CLI 写死默认配置，终端与会话报出两套分数 → 真缺陷九。
+        `src/cli/memoryctl.ts` 曾写死 `const CLI_CONFIG = DEFAULT_CONFIG`
+        （`spread.mode = 'shadow'`），宿主走 `resolveConfig` 读
+        `cordis.patch.yml`（`'on'`）。**同一个库、同一个查询，实测 3/3 查询
+        分数全部不一致**，且 CLI 输出里从来没有「扩散加分」——
+        运维在终端看到的不是模型看到的。CLI 的全部意义就是「让我看看记忆库
+        现在是什么样」，**一个报错的观测点比没有观测点更危险，因为人会信它**。
+        修法三层：① 新增 `src/host/patchConfig.ts`，零依赖手写 YAML 子集
+        解析（放 host 层是因为「读宿主配置」属于适配面，`core/` 必须无 IO；
+        CLI 已 import `host/engine.ts`，依赖方向不变）；② CLI 走同一份配置，
+        并把**配置来源作为可报告的事实**——`health` 增加「配置来源」与
+        「扩散模式」两行，`--verbose` 报 `spread.mode = on`；③ 读不到 patch
+        或配置非法时退回默认值，但**必须在 stderr 报「配置提醒」**，
+        不静默降级。
+        **修的过程中查出第二个真缺陷**：`migrateSpreadMode` 在「写了 `mode`
+        但不合法」时退回 fallback，而 YAML 1.1 里无引号的 `on` 是布尔值 ⇒
+        用户写 `mode: on` 时宿主拿到 `true`，`mergeConfig` 后变成 `'shadow'`，
+        `validateConfig.ok === true`——**不报错、不崩溃、测试全绿**，
+        用户以为开了扩散而实际跑的是影子模式。**静默降级比加载期崩溃更坏：
+        崩溃会让人立刻改，降级会让人一直以为自己开了。** 改为非法值原样
+        透传，交给校验层报错。
+        **又一次注释撒谎**：我一开始在 `patchConfig.ts` 注释里写「宿主拿到
+        `true` 会 validateConfig 拒绝、加载期失败」——**这句没验过**，
+        `.tmp/probe-bare-on.ts` 一跑就推翻。**没验过的话写进注释，
+        就是给下一个人留一个错误的锚点**，而注释比代码更容易被信任。
+        顺带纠一个我自己的归因错误：`.tmp/probe-cfg-divergence.ts` 第一版
+        用子进程跑 CLI，宿主注入 `T0` 而 CLI 用真实 `Date.now()`，
+        recency 衰减到底 ⇒ 每张卡恰好低 **0.2000**，我差点把这个差值写成
+        「配置分歧仍在」。**归因错误会把基础打分的问题算到配置头上。**
+        测试 9 条（`tests/host/patchConfig.test.ts` 12 条 +
+        `tests/cli/memoryctl.test.ts` 4 条 + `tests/core/config.test.ts` 2 条）。
+        其中一条断言 `--verbose` 的 stderr **不含 `[recall]`** 而不是
+        `stderr === ''`——原写法把「不产生 recall 日志」和「stderr 一个字都
+        不许有」混成一件事，加一行配置来源就让它红了，而它本该守的东西
+        其实一直没变。**断言宽过头，会替不相干的行为背书。**
+        另一条测试的库必须走 `writeTurn` + `consolidate`（`seedStore` 直接
+        `putCard` 不产边）——**把「机制没跑」和「输入为空的机制当然不跑」
+        混为一谈，会让人去修一个不存在的问题**。
+        反向验证 5 个变异全部精确命中（CLI 退回写死 / 迁移静默退回 /
+        不报配置提醒 / 裸 on 当字符串放过 / health 不报 spreadMode）。
   - [ ] `src/store/store.ts` 并发 `append` 无保护，多 agent 会损坏 `maxSeq`（D-08）
   - [x] ST-4 来源指针可定位（抽 100 张卡定位回原始事件）→
         `tests/store/traceability.test.ts` 4 条。**要点不是「字段非空」而是

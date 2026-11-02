@@ -170,6 +170,34 @@ describe('mergeConfig 的 spread.enabled 迁移', () => {
       assert.equal(validation.ok, true, `enabled=${enabled} 迁移后必须仍是合法配置：${validation.errors.join('; ')}`)
     }
   })
+
+  it('写了非法 mode 时必须原样透传，绝不静默退回默认值', () => {
+    // 真实来路：YAML 1.1 把无引号的 `mode: on` 解析成布尔 `true`。
+    // 用户写的是「打开扩散」，意图明确。
+    //
+    // 曾经这里退回 fallback ⇒ mode 变成 'shadow'：**不报错、不崩溃、
+    // 测试全绿**，用户以为开了扩散，实际跑的是影子模式。
+    // 实测确认过这条路径：mergeConfig 后 mode === 'shadow'，validateConfig.ok === true。
+    // 静默降级比加载期崩溃更坏——崩溃会让人立刻改，降级会让人一直以为自己开了。
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { mode: true } } as never)
+    assert.notEqual(
+      merged.spread.mode, 'shadow',
+      '非法 mode 退回默认值 = 静默降级，用户以为开了扩散而实际没有',
+    )
+    assert.equal(merged.spread.mode as unknown, true, '非法值必须原样透传，交给校验层拒绝')
+  })
+
+  it('透传的非法 mode 会被 validateConfig 抓住（透传必须配一条能报错的闸）', () => {
+    // 上一条只保证「不静默降级」。若校验层也放过它，那就成了「不降级但也不报错」，
+    // 等于把非法值带进打分逻辑。这条与上一条配对，两头堵死。
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { mode: true } } as never)
+    const validation = validateConfig(merged)
+    assert.equal(validation.ok, false, '非法 mode 必须让校验失败')
+    assert.ok(
+      validation.errors.some((line) => line.includes('spread.mode')),
+      `报错必须指向 spread.mode，实际：${validation.errors.join('; ')}`,
+    )
+  })
 })
 
 describe('validateConfig', () => {
