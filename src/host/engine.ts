@@ -374,7 +374,9 @@ export class MemoryEngine {
    */
   consolidate(now = this.clock()): ConsolidationReport {
     const state = this.store.snapshot()
-    const { report, ops } = runConsolidation(state, this.config, now)
+    // `timeZone` 必须显式传入：自然日边界由时区定义（FR-D4），东八区的「今天」
+    // 与 UTC 的「今天」差 8 小时。给个 `'UTC'` 默认值就是给静默错误发通行证。
+    const { report, ops } = runConsolidation(state, this.config, now, this.timeZone)
     for (const op of ops) {
       this.store.append(op, undefined, now)
     }
