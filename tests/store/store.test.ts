@@ -13,6 +13,7 @@ import { after, describe, it } from 'node:test'
 
 import { buildEdgeId } from '../../src/core/types.ts'
 import type { MemoryEdge } from '../../src/core/types.ts'
+import { ConcurrentWriterError, ReadOnlyModeError } from '../../src/store/journal.ts'
 import { MemoryStore, deriveIdempotencyKey, openStore } from '../../src/store/store.ts'
 import { makeCard, makeConfig, makeSource, makeTempDir, removeDirContents } from './helpers.ts'
 
@@ -362,5 +363,99 @@ describe('来源指针（FR-A4 / ST-4）', () => {
       assert.ok(card.source.eventType.length > 0)
     }
     store.close()
+  })
+})
+
+/**
+ * 多写者保护在门面层的生效情况（D-08）。
+ *
+ * `journal.test.ts` 测的是底层原语；这里补门面层，因为真实事故形态是
+ * 「插件与 CLI 各持一个 `MemoryStore`」，而不是各持一个裸 `Journal`。
+ *
+ * ## 一个必须写下来的坑：危险序列是「两个都先 open，再各自写」
+ *
+ * 我第一版探针把场景写成「插件先写 → CLI 后开 → CLI 写」，断言 CLI 应被拒绝，
+ * 结果红了。查下去是**探针错了**：CLI 打开时水位已与磁盘一致，它写的下一个
+ * `seq` 是**合法**的，日志仍自洽（1, 2）。B 不该拦，也不该为拦它而拦。
+ *
+ * 真正危险的是「两个都先 open」：两边水位都是 0，各写一条就得到 `1, 1`。
+ * 所以下面把两种情形**成对**测出来——只有「该拦的拦住了」而没有
+ * 「不该拦的没拦」，B 就可能退化成「一律拒绝第二个实例」，把正常用法也废掉。
+ */
+describe('多写者保护（D-08）', () => {
+  it('两个实例都先打开时，后写的一方应被拒绝且不落盘', () => {
+    const dir = tempDir()
+    const plugin = openStore({ config: makeConfig(), dataDir: dir })
+    const cli = openStore({ config: makeConfig(), dataDir: dir })
+    // 前提：两者打开时都还是空库，水位都是 0——这才是「会撞 seq」的起点。
+    assert.equal(plugin.count(), 0, '前提：plugin 打开时库为空')
+    assert.equal(cli.count(), 0, '前提：cli 打开时库也为空')
+
+    plugin.putCard(makeCard({ id: 'a' }))
+    assert.equal(plugin.count(), 1, '前提：plugin 确实写成功了')
+
+    assert.throws(
+      () => cli.putCard(makeCard({ id: 'b' })),
+      (error: unknown) => error instanceof ConcurrentWriterError && error.code === 'MEMORY_CONCURRENT_WRITER',
+      '落后的一方写入应被拒绝',
+    )
+    // 只断言「抛错了」不足以证明「没写坏」，必须查磁盘。
+    const reader = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(reader.count(), 1, '被拒绝的写入不能在磁盘上留下痕迹')
+    reader.close()
+    cli.close()
+    plugin.close()
+  })
+
+  it('后打开的实例首写是合法的，但会让先开的一方下次写入被拒绝', () => {
+    const dir = tempDir()
+    const plugin = openStore({ config: makeConfig(), dataDir: dir })
+    plugin.putCard(makeCard({ id: 'a' }))          // seq 1
+    const cli = openStore({ config: makeConfig(), dataDir: dir })  // 打开时读到 seq 1
+    assert.equal(cli.count(), 1, '前提：cli 打开时读到了 plugin 写的那条')
+
+    // cli 的水位与磁盘一致，seq 2 是合法的下一个序号，不该拦。
+    cli.putCard(makeCard({ id: 'b' }))
+    assert.equal(cli.count(), 2, '后开者首写应被允许，否则正常用法会被废掉')
+
+    // 但 plugin 的内存水位已过期（以为 maxSeq=1，磁盘是 2），它的下一次写必须被拒。
+    assert.throws(
+      () => plugin.putCard(makeCard({ id: 'c' })),
+      (error: unknown) => error instanceof ConcurrentWriterError,
+      '水位过期的一方写入应被拒绝，否则会写出重复的 seq 2',
+    )
+
+    const reader = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(reader.count(), 2, '磁盘上应仍只有 2 条，没有重复序号的第 3 条')
+    const seqs = reader.listCards().map((card) => card.id).sort()
+    assert.deepEqual(seqs, ['a', 'b'])
+    reader.close()
+    cli.close()
+    plugin.close()
+  })
+
+  it('只读与修复模式在门面层也应拒绝写入', () => {
+    const dir = tempDir()
+    const writer = openStore({ config: makeConfig(), dataDir: dir })
+    writer.putCard(makeCard({ id: 'a' }))
+    writer.close()
+
+    for (const mode of ['readonly', 'repair'] as const) {
+      const store = openStore({ config: makeConfig(), dataDir: dir, mode })
+      // 前提：模式真的被记住了，而不是被默默忽略掉。
+      assert.equal(store.mode, mode, `前提：store.mode 应为 ${mode}`)
+      assert.equal(store.count(), 1, `${mode} 模式必须能读`)
+      assert.throws(
+        () => store.putCard(makeCard({ id: 'x' })),
+        (error: unknown) => error instanceof ReadOnlyModeError && error.code === 'MEMORY_READONLY_MODE',
+        `${mode} 模式必须拒绝写入`,
+      )
+      store.close()
+    }
+
+    // 默认模式必须是可写，否则宿主漏传 mode 会静默失去写能力。
+    const defaulted = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(defaulted.mode, 'write', 'StoreOptions.mode 的默认值必须是 write')
+    defaulted.close()
   })
 })
