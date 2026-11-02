@@ -39,16 +39,22 @@ export const MEMORY_DOMAINS: readonly MemoryDomain[] = ['work', 'study', 'life']
  * - `concept`    概念：定义、术语、原理
  * - `feeling`    感受：起源「我们大多数细节都会忘记，只会留下感受」
  * - `experience` 经验：从事件里沉淀下来的可复用做法（起源「经验的写入和回忆」）
+ * - `summary`    摘要：一天/一周/一月记忆的**压缩**结果（FR-D4 / 起源 L27（第 4 条·今日记忆渐进累积））
  *
  * `feeling` 与 `experience` 是对起源 L11（细节会忘只留感受）与 L19（感受与经验的
  * 写入和回忆）的直接落地：细节可以忘，
  * 感受与经验必须留下。
+ *
+ * `summary` 与其余六种的关系是**层次**而不是并列：其余六种描述「发生了什么」，
+ * `summary` 描述「那段时间整体是什么样的」。它不是日志拼接——日志拼接的信息量
+ * 与原文相等，压缩比是 1:1，那就没有压缩（见 `src/consolidate/summarize.ts`）。
  */
-export type MemoryKind = 'event' | 'fact' | 'promise' | 'concept' | 'feeling' | 'experience'
+export type MemoryKind =
+  | 'event' | 'fact' | 'promise' | 'concept' | 'feeling' | 'experience' | 'summary'
 
 /** 全部记忆卡类型。 */
 export const MEMORY_KINDS: readonly MemoryKind[] = [
-  'event', 'fact', 'promise', 'concept', 'feeling', 'experience',
+  'event', 'fact', 'promise', 'concept', 'feeling', 'experience', 'summary',
 ]
 
 /** 记忆卡生命周期状态。归档不等于删除，随时可恢复（FR-C2）。 */
