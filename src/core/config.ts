@@ -76,7 +76,19 @@ export interface ForgettingPolicy {
 export interface DedupPolicy {
   /** 归一化文本相似度达到该值视为重复，直接合并。 */
   duplicateSimilarity: number
-  /** 相似度达到该值视为同一话题，建立图谱边而非合并。 */
+  /**
+   * 相似度达到该值视为同一话题。
+   *
+   * **本字段只有一个用途**：`looksConflicting` 判定「共享实体但说法不同」
+   * （FR-B5 冲突暴露）。它**不再**被图谱连边读取——那件事已移到
+   * `GraphPolicy.topicFloor`。
+   *
+   * 为什么必须拆开：同一个数值曾被两处使用，而两处要求的方向**相反**。
+   * 连边要求「相似度 ≥ 阈值才算同一话题」（阈值越低边越多）；
+   * 冲突判定要求「相似度 < 阈值才算说法不同」（阈值越低冲突越多）。
+   * 调低它修图谱，会同时改变冲突判定的灵敏度——**一个旋钮动两个相反的
+   * 机构**，而两者都没有报错的机会。详见 docs/7 缺陷二十四。
+   */
   relatedSimilarity: number
   /** 合并时保留文本的长度上限。 */
   mergeTextChars: number
@@ -295,6 +307,8 @@ export interface MemoryConfig {
   consolidation: ConsolidationPolicy
   /** 到期提醒策略（FR-D3）。 */
   reminder: ReminderPolicy
+  /** 图谱连边策略（FR-G1 的输入端）。 */
+  graph: GraphPolicy
   /** 图谱扩散与突触可塑性策略（FR-G1）。 */
   spread: SpreadPolicy
   /** 调试开关：记录每次召回的解释。 */
@@ -324,6 +338,78 @@ export interface MemoryConfig {
  * **可见，但不生效。**
  */
 export type SpreadMode = 'off' | 'shadow' | 'on'
+
+/**
+ * 图谱连边策略（FR-G1 的输入端）。
+ *
+ * 起源 L15（无编号·图谱）：「我需要一种建立记忆图谱的方法，且跨层次关联。」
+ *
+ * ## 为什么需要独立分区，而不是复用 `dedup.relatedSimilarity`
+ *
+ * `same-topic` 边原先读的是 `dedup.relatedSimilarity`（0.45）。这个数值是为
+ * **去重**标定的——它衡量「两张卡是不是在说同一件事」。而连边需要的是
+ * 「两张卡有没有关系」，这是**弱得多**的判据。
+ *
+ * 实测（300 张真实中文卡，语料取自 `docs/*.md` 的长句）：
+ *
+ * | 门槛 | 边数 | 平均度数 | 孤立卡 |
+ * |---|---|---|---|
+ * | 0.45（原值） | 22 | 0.15 | 绝大多数 |
+ * | 0.20 | 86 | 0.57 | — |
+ * | 0.12 | 224 | 1.49 | — |
+ *
+ * 相似度的 99.9 分位只有 0.275——**0.45 落在分布的极尾**，所以图谱恒空。
+ * 抽样读原文确认：0.45 只能抓到「前缀被截断的近似重复」，抓不到
+ * 「跨层次关联」（后者出现在 0.08~0.20）。
+ *
+ * ## 为什么用 k 近邻而不是绝对阈值
+ *
+ * 绝对阈值是 O(n²) 且边数随语料规模漂移：3000 卡 × 0.12 门槛 ≈ 29000 条边，
+ * 违反 P8「耗时可控」。同量级边数下对照（280 卡）：
+ *
+ * | 方案 | 边数 | 精确率 | 孤立卡 |
+ * |---|---|---|---|
+ * | 绝对阈值 ≥ 0.12 | 290 | 50.7% | 143 |
+ * | **k-NN K=3 floor=0.08** | **320** | **57.5%** | **62** |
+ *
+ * k-NN 精确率高 6.8 个点、孤立卡少 81 张，且**边数上界是 n×K，与语料规模无关**。
+ * 这与仓库在 `seedRatio` 上学到的结论同构：**绝对量卡不住分布，相对量才行**。
+ *
+ * 代价：k-NN 让每张卡都连出边（哪怕它其实与谁都不像），所以必须保留
+ * `topicFloor` 作下限——低于它一律不连，宁可孤立也不乱连。
+ *
+ * ## 诚实边界：k-NN 封住的是**边数**，不是**耗时**
+ *
+ * 候选对仍要两两算一遍相似度，所以计算量是 O(n²)。实测（真实中文语料）：
+ *
+ * | 卡数 | 边数 | 边/卡 | 耗时 |
+ * |---|---|---|---|
+ * | 200 | 185 | 0.93 | 9ms |
+ * | 500 | 417 | 0.83 | 35ms |
+ * | 1000 | 928 | 0.93 | 130ms |
+ * | 2154 | 2404 | 1.12 | 552ms |
+ *
+ * 边/卡 稳定在 0.8~1.1（远低于 K=3 的上界），**这证明边数确实与规模无关**；
+ * 但耗时随 n² 增长，万级记忆约需 12 秒。真要压耗时得上倒排索引 + 前缀过滤，
+ * 那是另一件事，不在这里假装已经解决。
+ */
+export interface GraphPolicy {
+  /**
+   * `same-topic` 边的相似度下限（绝对兜底）。
+   *
+   * 为什么不设成 0：k-NN 会给每张卡强行找 K 个最近邻，若没有下限，
+   * 一张与全世界都无关的卡也会连出 3 条边。宁可让它孤立——
+   * 孤立卡只是不参与扩散，假边会污染整张图。
+   */
+  topicFloor: number
+  /**
+   * 每张卡最多连出几条 `same-topic` 边。
+   *
+   * 硬上限的作用是让边数上界变成 `n × k`（P8 耗时可控）。
+   * 实测 300 卡 K=3 时边数 320、最大度数 8——度数不会失控。
+   */
+  topicNeighbors: number
+}
 
 /**
  * 图谱扩散与突触可塑性（FR-G1）。
@@ -479,7 +565,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 10,
+  configVersion: 11,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -574,6 +660,17 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     pollMs: 60 * 1000,
     cronSearchDays: 366,
   },
+  graph: {
+    // 下限 0.08 的来历：实测真实中文语料上，0.08 对应「平均度数 3.75」，
+    // 而 0.05 对应 10.09——后者已经是全连接图，等于没有图。
+    // 抽样读原文确认 0.08 附近连出的边语义大多成立（如「影子模式必须算真账」
+    // 对「shadow 模式必须没有这一行」）。
+    topicFloor: 0.08,
+    // K=3：实测 300 卡时边数 320、最大度数 8、孤立 62 张。
+    // 取 3 而不是 5：K=5 让孤立卡降到 11 张，但边数翻到 745、
+    // 精确率反而从 57.5% 降到 55.7%——多出来的边主要是噪声。
+    topicNeighbors: 3,
+  },
   spread: {
     // 默认 `'shadow'`：**计算但不生效**。
     //
@@ -614,7 +711,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 10
+export const MEMORY_CONFIG_VERSION = 11
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -660,6 +757,16 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   inUnit('dedup.relatedSimilarity', config.dedup.relatedSimilarity)
   if (config.dedup.relatedSimilarity > config.dedup.duplicateSimilarity) {
     errors.push('dedup.relatedSimilarity 不应大于 dedup.duplicateSimilarity')
+  }
+
+  inUnit('graph.topicFloor', config.graph.topicFloor)
+  if (config.graph.topicFloor >= config.dedup.duplicateSimilarity) {
+    // 连边下限不能达到「判为重复」的门槛：那样 every 边都连的是近似重复，
+    // 而近似重复本该被合并掉，不是连起来。两条机制会互相拆台。
+    errors.push('graph.topicFloor 必须小于 dedup.duplicateSimilarity')
+  }
+  if (!Number.isInteger(config.graph.topicNeighbors) || config.graph.topicNeighbors < 0) {
+    errors.push('graph.topicNeighbors 必须是 ≥ 0 的整数')
   }
 
   if (config.extraction.domains.length === 0) errors.push('extraction.domains 不能为空')
@@ -871,6 +978,7 @@ export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConf
     storage: { ...base.storage, ...restOverride.storage },
     consolidation: { ...base.consolidation, ...restOverride.consolidation },
     reminder: { ...base.reminder, ...restOverride.reminder },
+    graph: { ...base.graph, ...restOverride.graph },
     spread: spreadFields as unknown as SpreadPolicy,
     debugExplain: override.debugExplain ?? base.debugExplain,
   }

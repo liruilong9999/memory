@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=10',
+  'configVersion=11',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -128,6 +128,8 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'forgetting.neverArchiveKinds[1]=promise',
   'forgetting.neverArchiveKinds[2]=concept',
   'forgetting.neverArchiveKinds[3]=experience',
+  'graph.topicFloor=0.08',
+  'graph.topicNeighbors=3',
   'recall.absoluteThreshold=0.18',
   'recall.candidateLimit=400',
   'recall.maxCardChars=160',
@@ -192,7 +194,10 @@ describe('摘要配置的默认值与版本', () => {
     //  10 → **删除**两个零读取的死配置：recall.minCards 与 storage.reindexEveryRecords
     //       删字段同样要递增版本：旧配置文件里可能写着它们，回滚快照里也可能有，
     //       版本号是「schema 变过」的唯一凭据。
-    assert.equal(MEMORY_CONFIG_VERSION, 10, '删除死配置项后版本应为 10')
+    //  11 → **新增** graph 分区（topicFloor / topicNeighbors）。图谱连边原先借用
+    //       dedup.relatedSimilarity，而那个数值是为去重标定的、且被冲突判定
+    //       反向共用；拆出独立分区是修缺陷二十四的前提。详见 docs/7。
+    assert.equal(MEMORY_CONFIG_VERSION, 11, '新增 graph 分区后版本应为 11')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
