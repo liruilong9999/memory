@@ -304,6 +304,37 @@ describe('幂等键派生', () => {
     )
   })
 
+  it('同一张卡内容变了必须能落盘（回归：幂等键只看 id 会静默丢弃更新）', () => {
+    // 真实缺陷：put 的幂等键曾只按 card.id 派生，导致同一张卡的后续更新
+    // （冲突标记回写、强度调整、状态变更）全被判成重复提交而丢弃。
+    const store = openStore({ config: makeConfig(), dataDir: tempDir() })
+    const card = makeCard({ id: 'a', text: '原始文本' })
+    assert.equal(store.putCard(card).written, true)
+
+    const updated = { ...card, text: '改过的文本', updatedAt: card.updatedAt + 1000 }
+    assert.equal(store.putCard(updated).written, true, '内容变化应写入成功')
+    assert.equal(store.getCard('a')?.text, '改过的文本')
+    store.close()
+  })
+
+  it('同一张卡完全相同的重复提交仍然幂等（ST-2）', () => {
+    const store = openStore({ config: makeConfig(), dataDir: tempDir() })
+    const card = makeCard({ id: 'a' })
+    assert.equal(store.putCard(card).written, true)
+    assert.equal(store.putCard({ ...card }).written, false, '内容完全相同的重复提交应被跳过')
+    assert.equal(store.count('active'), 1)
+    store.close()
+  })
+
+  it('conflictOf 变化应产生新的幂等键', () => {
+    const card = makeCard({ id: 'a' })
+    const withConflict = { ...card, conflictOf: ['b'] }
+    assert.notEqual(
+      deriveIdempotencyKey({ op: 'put', card }),
+      deriveIdempotencyKey({ op: 'put', card: withConflict }),
+    )
+  })
+
   it('putEdge 应自动补齐边 id 并幂等', () => {
     const store = openStore({ config: makeConfig(), dataDir: tempDir() })
     store.putCard(makeCard({ id: 'a' }))

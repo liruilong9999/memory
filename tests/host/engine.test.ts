@@ -460,6 +460,81 @@ describe('MemoryEngine 重启一致（ST-1）', () => {
  * `dueAt: null`，`pickDue` 永远返回空数组，FR-D3 在实现层不可能通过。
  * 光测 `parseDue` 不够——必须端到端断言「写入的卡带 dueAt、到点能被捡起」。
  */
+describe('冲突标记（FR-B5 / SC-4）', () => {
+  it('对同一对象给出不同说法时，双方都标出冲突', () => {
+    const dir = makeTempDir()
+    const store = openStore({ dataDir: dir })
+    const engine = new MemoryEngine({
+      store,
+      config: makeConfig({ extraction: { domains: [] } }),
+      timeZone: TZ,
+      clock: () => T0,
+    })
+
+    engine.writeTurn({
+      sessionId: 's1', turn: 1, step: 0, seq: 0,
+      userText: '我决定数据库用 PostgreSQL，它的 JSONB 支持最好',
+      assistantText: '好的，PostgreSQL 的 JSONB 确实很适合这个场景。',
+      domain: 'work', at: T0,
+    })
+    engine.writeTurn({
+      sessionId: 's1', turn: 2, step: 0, seq: 0,
+      userText: 'PostgreSQL 太慢了，我决定改用 MySQL',
+      assistantText: '明白，MySQL 在读写性能上确实有优势。',
+      domain: 'work', at: T0 + 3600_000,
+    })
+
+    const cards = store.listCards({ status: 'active' })
+    const conflicting = cards.filter((card) => card.conflictOf.length > 0)
+    assert.ok(conflicting.length >= 2, `应有至少两张卡带冲突标记，实际 ${conflicting.length} 张`)
+
+    // 双向性：新卡标记了旧卡，旧卡也必须标记新卡，否则渲染时只有一侧有警告。
+    for (const card of conflicting) {
+      for (const otherId of card.conflictOf) {
+        const other = cards.find((item) => item.id === otherId)
+        assert.ok(other !== undefined, `冲突指向的卡 ${otherId} 应存在`)
+        assert.ok(
+          other.conflictOf.includes(card.id),
+          `冲突必须双向：${card.id} 标了 ${otherId}，但对方没标回来`,
+        )
+      }
+    }
+    store.close()
+  })
+
+  it('不相关的两句话不产生冲突标记', () => {
+    const dir = makeTempDir()
+    const store = openStore({ dataDir: dir })
+    const engine = new MemoryEngine({
+      store,
+      config: makeConfig({ extraction: { domains: [] } }),
+      timeZone: TZ,
+      clock: () => T0,
+    })
+
+    engine.writeTurn({
+      sessionId: 's1', turn: 1, step: 0, seq: 0,
+      userText: '我决定数据库用 PostgreSQL，它的 JSONB 支持最好',
+      assistantText: '好的。',
+      domain: 'work', at: T0,
+    })
+    engine.writeTurn({
+      sessionId: 's1', turn: 2, step: 0, seq: 0,
+      userText: '今天下午的会议改到三点，记得带上笔记本',
+      assistantText: '好的。',
+      domain: 'work', at: T0 + 3600_000,
+    })
+
+    const cards = store.listCards({ status: 'active' })
+    assert.equal(
+      cards.filter((card) => card.conflictOf.length > 0).length,
+      0,
+      '没有共享实体的话题不应被标成冲突',
+    )
+    store.close()
+  })
+})
+
 describe('到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
   // 2024-01-15 10:00 上海（周一）。
   const MON = Date.UTC(2024, 0, 15, 2, 0, 0)

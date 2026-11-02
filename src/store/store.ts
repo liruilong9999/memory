@@ -393,13 +393,25 @@ export function openStore(options: StoreOptions = {}): MemoryStore {
  * 但「同样的操作重复提交」必须幂等。这里按操作的稳定要素拼键，
  * 既能自动去重，也允许调用方显式覆盖。
  *
+ * **`put` 的键必须包含内容指纹**：只按 id 拼键会把「同一张卡的后续更新」
+ * 误判为重复提交而静默丢弃——冲突标记回写、强度调整、状态变更全部失效。
+ * 包含内容后语义才正确：内容完全相同 → 幂等跳过（ST-2）；内容变了 → 是新版本。
+ *
  * @param op - 操作本体。
  * @returns 16 位十六进制幂等键。
  */
 export function deriveIdempotencyKey(op: JournalOp): string {
   switch (op.op) {
     case 'put':
-      return buildIdempotencyKey('put', op.card.id)
+      // 指纹取「版本时刻 + 文本 + 冲突列表」：这三者是 put 后可能变化的语义字段。
+      // 同一轮重复抽取会得到完全相同的卡（同 id、同 updatedAt、同内容），键相同 → 幂等。
+      return buildIdempotencyKey(
+        'put',
+        op.card.id,
+        String(op.card.updatedAt),
+        op.card.text,
+        op.card.conflictOf.join(','),
+      )
     case 'revise':
       return buildIdempotencyKey('revise', op.id, op.text, String(op.at))
     case 'touch':

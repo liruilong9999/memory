@@ -13,7 +13,7 @@
  */
 
 import type { MemoryConfig } from '../core/config.ts'
-import { extractMemoryCards } from '../core/extraction.ts'
+import { extractMemoryCards, looksConflicting } from '../core/extraction.ts'
 import type { TurnInput } from '../core/extraction.ts'
 import {
   buildFocusPack, formatDuration, formatTime, makeQuery, renderFocusPack, scoreCards,
@@ -21,6 +21,7 @@ import {
 import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
 } from '../core/types.ts'
+import { cardSimilarity } from '../consolidate/dedupe.ts'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import type { MemoryStore } from '../store/store.ts'
 import {
@@ -126,6 +127,10 @@ export class MemoryEngine {
       const spec = parseDue(card.text, input.at, this.timeZone)
       if (spec !== null) card.dueAt = spec.dueAt
     }
+    // FR-B5 / SC-4：写入时就标出冲突，而不是等到召回的渲染阶段。
+    // 只算不写等于没做——`looksConflicting` 此前零调用点，`conflictOf` 恒为空，
+    // 于是真实数据里永远不会出现冲突警告。冲突必须在写入时落到卡上。
+    const conflicts = this.markConflicts(cards, input.at)
     const written: MemoryCard[] = []
     let skipped = 0
     for (const card of cards) {
@@ -155,6 +160,45 @@ export class MemoryEngine {
       cards: written,
       signals: [...new Set(written.flatMap((c) => c.tags))],
     }
+  }
+
+  /**
+   * 给新写入的卡片标出与既有记忆的冲突（FR-B5 / SC-4 / 起源 L19「感受经验」）。
+   *
+   * 冲突判定：共享实体（在谈同一个对象）+ 文本相似度低（说法明显不同）
+   * 就说明两句话对同一件事给出了不同说法，需要并列展示而不是悄悄合并。
+   *
+   * 两个方向都要标：既有卡是已落盘的不可变对象，所以这里返回需要**回写**的
+   * 既有卡（带新 `conflictOf`），由调用方落库；新卡则原地标。
+   *
+   * @param cards - 本轮新抽取的卡片（会被原地修改）。
+   * @param at - 写入时刻。
+   * @returns 需要回写的既有卡片（`conflictOf` 已更新）。
+   */
+  private markConflicts(cards: MemoryCard[], at: number): MemoryCard[] {
+    const updated: MemoryCard[] = []
+    if (cards.length === 0) return updated
+    const related = this.config.dedup.relatedSimilarity
+    const existing = this.store.listCards({ status: 'active' })
+    for (const card of cards) {
+      for (const other of existing) {
+        if (other.id === card.id) continue
+        const similarity = cardSimilarity(card, other)
+        if (!looksConflicting(card, other, similarity, related)) continue
+        if (!card.conflictOf.includes(other.id)) card.conflictOf.push(other.id)
+        if (!other.conflictOf.includes(card.id)) {
+          // 既有卡是不可变对象，复制一份再改，避免就地修改已落盘状态。
+          const patched: MemoryCard = {
+            ...other,
+            conflictOf: [...other.conflictOf, card.id],
+            updatedAt: at,
+          }
+          updated.push(patched)
+        }
+      }
+    }
+    for (const patched of updated) this.store.putCard(patched)
+    return updated
   }
 
   /**
