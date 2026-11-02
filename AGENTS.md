@@ -574,6 +574,44 @@ if (mutated === original) {
         顺带记下真实局限：同轮多句产出的多张卡 `source.seq` 完全相同（它是
         事件级不是句子级），第 4 条用例**故意断言这个局限**，将来引入句子级
         序号时会变红提醒改文档
+  - [x] FR-F1 观测能力只在当次进程内存在 → 真缺陷十一。
+        `onLog` 是**唯一**出口，而它只在 CLI 里被接成「攒进数组、`--verbose`
+        打印」。宿主跑一整天，`write` / `recall` / `consolidate` 的记录
+        **一条都没留下**，重启即清零；`COMMANDS` 里也没有 `logs` 子命令，
+        所以落盘了也读不回来。FR-F1 要的是「最近 N 次操作可回溯」，
+        出问题时恰恰是「上一次运行发生了什么」查不到。
+        修法两层：① `storage.logFile` / `storage.logMaxEntries`（configVersion
+        6→7），JSONL 逐行 append 到 `dataDir/logs/diagnostics.jsonl`，按
+        `logMaxEntries`（默认 500）环形截断，0 表示不限制；**不进事件日志**
+        （journal 是唯一真相源 P2，诊断日志是可丢弃旁路，混进去会让重放依赖
+        观测记录）；落盘失败不抛异常（观测坏掉不该让召回失败）但通过 `onLog`
+        发 `error` 说明——不静默。② CLI `logs` 子命令 + `--limit`（默认 50），
+        直接读文件而不是开引擎（为读日志重放全库代价过高）。
+        **撞到一条真实不变量，改的是实现不是测试**：诊断日志原本叫
+        `dataDir/diagnostics.jsonl`，与分片 `journal-000001.jsonl` 同层同后缀，
+        `tests/cli/memoryctl.test.ts` 的 `journalSize`（按 `.jsonl` 扫顶层、
+        断言恰好一个）立刻红了。先做可达性探测确认生产代码**没被污染**
+        （`listShardFiles` 用 `journal-` 前缀 + 数字校验，探针输出
+        `listShardFiles = ['journal-000001.jsonl']`），但这只说明「本仓库的
+        读法安全」，管不了目录外面的人怎么读——备份脚本、日志采集器、
+        用户自己 `ls *.jsonl` 都会把旁路记录当成事件日志。**该改的是实现**：
+        改到 `logs/` 子目录下，测试一个字没动就全绿。
+        这个先后顺序很重要：**先证明测试守的是真东西，再改实现**，
+        而不是把红的测试改成绿的。
+        测试 12 条（`tests/host/log-persist.test.ts`），核心断言是**跨进程**：
+        写完关库、重开后还能读到同样多的记录——只断言「文件存在」没有意义
+        （空文件也满足），只断言「进程内能读到」分辨不出落盘与只在内存。
+        另守：分目录（用 `fs` 直接列顶层，不用 `listShardFiles`，后者用前缀
+        过滤看不到这个问题）、journal 里不能出现日志的 `kind` 字段（P2 隔离）、
+        `logFile` 空串不落盘、截断保留**最后** N 条（断言与 `all.slice(-2)`
+        逐项相等而不是只比条数）、`logMaxEntries: 0` 不限制、单行损坏跳过。
+        反向验证 5/5 且**全部能编译能运行**。M1 第一版改
+        `this.trimLog(path)` → `void path` **没命中**——`appendFileSync` 还在，
+        文件照样写，只是不截断。**变异要断在真正决定行为的那一行上，
+        不是看起来相关的任意一行。**
+        踩坑：`logFile` 为空串时 `join(dir, '')` 得到目录本身，
+        `readFileSync` 直接 `EISDIR`。**空值经过路径拼接会变成另一个东西**，
+        生产代码里同样成立，所以 `engine` 也先判 `length === 0` 再 `join`。
 
 ### 已修复但值得记住的坑
 
