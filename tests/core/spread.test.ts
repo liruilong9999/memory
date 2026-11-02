@@ -963,6 +963,37 @@ describe('on 模式的 explain 必须自洽且能说出「因为想起了谁」�
     )
   })
 
+  it('扩散字段的可见性：on 有、shadow/off 没有——否则两个真相源会混', () => {
+    // 这三个字段曾经**只在运行时挂上、类型里没声明**，
+    // 于是没有任何消费方能读它，也就没有「因为想起了谁」那一行。
+    // 这条从行为上钉住——on 必须有值，shadow/off 必须为 undefined。
+    const on = explainFixture('on')
+    const onResult = scoreCards(on.cards, on.query, on.config, on.edges)
+    const boosted = onResult.filter((x) => (x.spreadBoost ?? 0) > 0)
+    assert.ok(boosted.length > 0, '前提：on 模式必须有卡获得扩散加分')
+    for (const item of boosted) {
+      assert.ok(
+        (item.spreadSources ?? []).length > 0,
+        `${item.card.id} 有 spreadBoost 就必须有 spreadSources（否则只知道加了分、不知道为什么）`,
+      )
+    }
+
+    for (const mode of ['shadow', 'off'] as const) {
+      const f = explainFixture(mode)
+      const result = scoreCards(f.cards, f.query, f.config, f.edges)
+      for (const item of result) {
+        assert.equal(
+          item.spreadBoost, undefined,
+          `${mode} 模式不得记 spreadBoost——它没生效，记了就是两个真相源`,
+        )
+        assert.equal(
+          item.spreadSources, undefined,
+          `${mode} 模式不得记 spreadSources`,
+        )
+      }
+    }
+  })
+
   it('影子模式不得出现「扩散加分」行——它没生效，写了就是撒谎', () => {
     // 与上一条配对：on 模式必须有这一行，shadow 模式必须没有。
     // 只有前者没有后者的话，「必须有」可能只是因为它被无条件加上了。

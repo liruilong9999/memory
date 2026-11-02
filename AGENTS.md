@@ -486,6 +486,28 @@ if (mutated === original) {
         另：`explainFixture` 是上一个 describe 的局部函数，跨 describe 取不到，
         我在同一个文件里**犯了两次**（第一次是 `shadowFixture`）——
         新 describe 必须自带 fixture。
+  - [x] 影子模式照搬 `spreadBoost`，同一张卡带两个真相源 → 真缺陷八。
+        `applySpread` 给**每一张**卡都挂 `spreadBoost`/`spreadSources`
+        （没加分的挂 0/[]），`attachShadow` 直接 `...item` 复原原总分，
+        于是这两个字段被原样带进影子模式结果。后果：读 `spreadBoost`
+        的消费方会以为加分**已生效**（实际影子模式不改任何排序与注入）；
+        且 `spreadBoost` 与 `shadowSpread.boost` 一个原始值一个 clamp 后的
+        假设值，**可能不同**，出问题无从判断该信哪个。
+        与 `ShadowSpread` 文档「让『实际生效』和『假设生效』在类型层面就是
+        两件事」直接冲突——**光在注释里写不算，必须在数据里真的分开**。
+        修法：`attachShadow` 用解构摘掉这两个字段再返回；不赋 `undefined`
+        （`exactOptionalPropertyTypes` 下「有键值为 undefined」与「没有键」
+        是两件事，赋 undefined 会留下真实存在的键，那是另一种泄漏）。
+        **为什么长期没被发现**：`spreadBoost` 此前没在 `ScoredCard` 上声明，
+        类型层面谁都读不到 ⇒ 「类型没声明」这个缺陷**顺手挡住了下一个缺陷**，
+        但挡的方式是让功能不可用、不是让功能正确。补上声明后第二个缺陷
+        立刻暴露。**类型不是文档，是接口：没有接口的字段等于没有出口，
+        而「没有出口」会掩盖「出口输出的是错东西」。**
+        三条推论记在架构文档 §7.2 真缺陷八，其中一条是这次又踩的：
+        **反向验证的 `expect` 必须是「用例名」不是「断言文案」**——
+        我填成 `assert` 的 message，脚本匹配的是 `✖ <用例名>`，
+        于是两个都命中的变异被报成「未命中」。**期望值选错层次时，
+        反向验证会给出与事实相反的报告。**
   - [ ] `src/store/store.ts` 并发 `append` 无保护，多 agent 会损坏 `maxSeq`（D-08）
   - [x] ST-4 来源指针可定位（抽 100 张卡定位回原始事件）→
         `tests/store/traceability.test.ts` 4 条。**要点不是「字段非空」而是

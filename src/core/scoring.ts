@@ -564,18 +564,29 @@ function attachShadow(
   const originalTotal = new Map(scored.map((item) => [item.card.id, item.score.total]))
   return applied.map((item) => {
     const base = originalTotal.get(item.card.id) ?? item.score.total
-    const restored = { ...item, score: { ...item.score, total: base } }
+    // 影子模式下必须把 `applySpread` 挂上的 `spreadBoost` / `spreadSources`
+    // **摊掉**。它们是 `on` 模式的字段，而影子模式的唯一真相源是
+    // `shadowSpread`。两个同时存在时：
+    //   - 读 `spreadBoost` 的消费方会以为加分已经生效（实际没有）；
+    //   - `shadowSpread.boost` 是假设值、`spreadBoost` 是原始值，
+    //     clamp 后两者可能不同，出问题时无从判断该信哪个。
+    //
+    // 这与 `ShadowSpread` 文档里「让『实际生效』和『假设生效』在类型层面就是
+    // 两件事」是同一个要求：光在注释里写不算，必须在数据里真的分开。
+    const { spreadBoost, spreadSources, ...rest } = item
+    // 原总分从 `scored` 里取，**不用减法还原**（见 `originalTotal` 的注释）。
+    const restored: ScoredCard = { ...rest, score: { ...rest.score, total: base } }
     // 只有**真的被扩散推动**的卡才留观察值。
     //
-    // `applySpread` 会给每张卡都挂 `spreadBoost: 0`，若照搬就会让所有卡都带
-    // 一条 `boost: 0` 的影子记录——那会把「观察到了什么」和「什么都没发生」
-    // 混成同一件事。观察值非空必须等价于「扩散对这张卡有意见」。
-    if (item.spreadBoost <= 0) return restored
+    // 若照搬就会让所有卡都带一条 `boost: 0` 的影子记录——那会把
+    // 「观察到了什么」和「什么都没发生」混成同一件事。
+    // 观察值非空必须等价于「扩散对这张卡有意见」。
+    if (spreadBoost <= 0) return restored
     return {
       ...restored,
       shadowSpread: {
-        boost: item.spreadBoost,
-        sources: item.spreadSources,
+        boost: spreadBoost,
+        sources: spreadSources,
         hypotheticalTotal: item.score.total,
         hypotheticalRank: hypotheticalRank.get(item.card.id) ?? 0,
         actualRank: actualRank.get(item.card.id) ?? 0,
