@@ -320,7 +320,18 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     config,
     timeZone: resolveTimeZone(),
     clock,
-    onLog: (entry) => logger.debug(`${entry.kind} ${entry.summary}`),
+    onLog: (entry) => {
+      // 按 kind 分级：`error` 在 `LogKind` 里是**严重度**而非分类（其余四个
+      // write/recall/consolidate/command 才是分类），所以它必须走 error 级别。
+      //
+      // 曾经一律走 `logger.debug`，后果是**任何错误都进不了默认日志级别**：
+      // 引擎里那些「刻意吞掉但必须留痕」的 catch 块发出的日志，在生产环境
+      // 一条都看不见。那样「留痕」就只是调用过 log 函数，不是能被发现。
+      // 典型受害者：夜整理时刻落盘失败（磁盘满、权限错）→ 每次重启都重新
+      // 整理一遍，幂等、不报错、只是白烧 CPU，而日志里什么也没有。
+      if (entry.kind === 'error') logger.error(`${entry.kind} ${entry.summary}`)
+      else logger.debug(`${entry.kind} ${entry.summary}`)
+    },
   })
 
   const wiring: Wiring = {
@@ -413,7 +424,18 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     timers.length = 0
   }
   if (config.consolidation.enabled) {
-    let lastRunAt: number | null = null
+    // 初值来自引擎（引擎从 `dataDir/meta.json` 读盘），而不是进程内 `null`。
+    //
+    // 用进程内 `null` 的后果：每次进程重启都认为「从未整理过」，于是立刻
+    // 整理一次。它幂等、不丢数据，所以没人会发现——只是白烧全库去重的 CPU。
+    // 这正是「功能悄悄失效」那一类：不报错、不丢数据、只是做了无用功。
+    //
+    // 仍然用 `let`：整理后要刷新。刷新成 `now` 而不是重读磁盘，是因为同进程内
+    // 两者必然一致（`consolidate` 里已经落盘），重读只是多一次 IO。
+    //
+    // 若 `meta.json` 丢了（判据一允许丢），初值退回 `null`，行为退回
+    // 「启动就整理一次」——这是**正确的降级**，不是缺陷。
+    let lastRunAt: number | null = engine.lastConsolidatedAt()
     const timeZone = resolveTimeZone()
     timers.push(setRepeating(ctx, () => {
       const now = engine.now()

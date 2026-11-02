@@ -24,6 +24,7 @@ import type {
 } from '../core/types.ts'
 import { cardSimilarity } from '../consolidate/dedupe.ts'
 import { runConsolidation } from '../consolidate/nightly.ts'
+import { readLastConsolidationAt, writeLastConsolidationAt } from '../store/meta.ts'
 import type { MemoryStore } from '../store/store.ts'
 import {
   buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
@@ -85,8 +86,18 @@ export class MemoryEngine {
   private lastSessionEndAt: number | null = null
   /** 本次会话开始时刻。 */
   private readonly sessionStartedAt: number
-  /** 上次夜整理时刻。 */
-  private lastConsolidationAt: number | null = null
+  /**
+   * 上次夜整理时刻。
+   *
+   * 跨进程持久化在 `dataDir/meta.json`（见 `src/store/meta.ts`）。**不进事件
+   * 日志**：它属于系统调度痕迹而非用户行为，写进日志会让重放不再等于
+   * 「重放用户历史」，并挤占 `seq`。判据见 `meta.ts` 模块注释。
+   *
+   * 这里**刻意不写 `= null` 初始化器**：初值必须来自磁盘。保留初始化器会让
+   * TS 认为属性已被初始化，从而放过「某条构造路径忘了读盘」这种错误——
+   * 那种错误的表现是「重启后立刻重新整理一遍」，幂等、不报错、只是白烧 CPU。
+   */
+  private lastConsolidationAt: number | null
   /** 每轮召回次数计数，用于 FR-F3。 */
   private recallCount = 0
   /**
@@ -108,6 +119,9 @@ export class MemoryEngine {
     this.onLog = options.onLog
     this.sessionStartedAt = this.clock()
     this.lastSessionEndAt = this.detectLastActivity()
+    // 从磁盘恢复：进程重启后不应把「上次整理」忘成 null，否则夜整理每次
+    // 重启都重跑一遍（幂等，但白烧全库去重的 CPU）。
+    this.lastConsolidationAt = readLastConsolidationAt(this.store.dir)
   }
 
   /**
@@ -385,6 +399,35 @@ export class MemoryEngine {
       this.store.append(op, undefined, now)
     }
     this.lastConsolidationAt = now
+    // 落盘失败不应让整理本身失败：整理的操作已经写进日志了（上面那个循环），
+    // 这里只是记「什么时候整理的」。让它抛错会把「整理成功」报成失败。
+    try {
+      writeLastConsolidationAt(this.store.dir, now)
+    } catch (error) {
+      // 刻意吞掉，但**必须留痕**，且留痕必须是**可见的**。
+      //
+      // 为什么吞：整理已经写进日志，落盘只影响「下次要不要整理」。抛错会让
+      // 上层记一条「整理失败」，运维去查「整理为什么失败」——而真相是整理
+      // 成功了，只是没记时间。**报错指向错误的方向，比不报错更费人。**
+      //
+      // 为什么留痕：吞掉后的表现是「每次重启都重新整理一遍」。它幂等、不丢数据，
+      // 所以不值得中断流程；但它**永远不会自己好**（磁盘满、权限错会一直错下去），
+      // 唯一症状是白烧 CPU，没人会注意到。
+      //
+      // 为什么用 kind: 'error'：`LogKind` 里 `error` 是**严重度**而非分类
+      // （其余四个是分类），所以持续失败用它不算污染分类；分类信息放
+      // `detail.phase`。宿主侧 `src/index.ts` 按 kind 分级，`error` 走
+      // `logger.error`，所以这条**真的会出现在日志里**。
+      //
+      // 不要因为「反正幂等」就把这条删掉——幂等说的是结果正确，
+      // 不是说不值得知道。
+      this.log({
+        kind: 'error',
+        at: now,
+        summary: `夜整理已完成，但整理时刻落盘失败：${error instanceof Error ? error.message : String(error)}`,
+        detail: { phase: 'writeMeta', dir: this.store.dir, error: String(error) },
+      })
+    }
     this.log({
       kind: 'consolidate',
       at: now,
@@ -592,6 +635,19 @@ export class MemoryEngine {
       archived: this.store.count('archived'),
       lastConsolidationAt: this.lastConsolidationAt,
     }
+  }
+
+  /**
+   * 取上次整理时刻（供 `src/index.ts` 的定时器判断「今天是否已整理」）。
+   *
+   * 与 `metrics().lastConsolidationAt` 的区别：`metrics()` 是给人看的汇总，
+   * 这个是给调度逻辑用的单一值。分成两个入口是因为**用途不同**——将来
+   * `metrics()` 加字段时，不该让调度逻辑跟着改。
+   *
+   * @returns 毫秒时间戳；从未整理过为 `null`。
+   */
+  lastConsolidatedAt(): number | null {
+    return this.lastConsolidationAt
   }
 
   /**
