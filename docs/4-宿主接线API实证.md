@@ -2539,7 +2539,68 @@ declare const CONSOLIDATION_POLL_MS: number
 - base bundle 提供 `systemPrompt`（`base/cordis.patch.yml:509-512`）、`storageDomain`（`:187-190`）、`commands`（`:320-321`）、`timer`（`:24-26`）⇒ **四个都在 base 里，安全**。
 - 但 `schedule` 只在 web-app bundle 里（`packages/bundle/web-app/cordis.patch.yml:135-136`），**headless / sdk profile 没有**。若 `inject` 里写 `'schedule'`，在那些 profile 下插件**永远不会加载**。
 
-**建议**：`inject` 只列 base 保证有的四个；`schedule` 用 `ctx.inject(['schedule'], cb)` 做可选降级。
+**建议**：`inject` 只列 base 保证有的服务；`schedule` 用 `ctx.inject(['schedule'], cb)` 做可选降级。
+
+### 8.9.1 【实证补充】本仓库最终只列三项，且这一条曾经「文档写了、代码没做」
+
+> 上面那段建议长期只是**建议**：`src/index.ts` 一直没有 `export const inject`，
+> 于是插件在真实宿主上**一条都没激活**（`cannot get property "systemPrompt" without inject`）。
+> 而 1026 条假宿主测试全绿，因为普通对象不像 Proxy 那样抛错。
+> 完整复盘见 [`docs/7-缺陷复盘.md`](7-缺陷复盘.md) 缺陷十九。
+
+**真实 Cordis 的 `ctx` 是 Proxy**：其 `get` 陷阱对任何**未在 `inject` 里声明**的服务名
+**直接抛错**。`?.` 只能防 `undefined`，**防不住抛错** —— 这一点是本仓库最贵的一课。
+
+实测分类（`.tmp/probe-members.mjs`）：
+
+| 成员 | 性质 | 直接读 |
+|---|---|---|
+| `on` / `effect` / `logger` | Context **核心方法** | 安全，不抛 |
+| `interval` / `systemPrompt` / `commands` / `storageDomain` / `goals` / `storage` / `timer` | **服务** | 抛错 |
+
+**四种机制的实测对照**（`.tmp/probe-order.mjs` / `probe-optional.mjs` / `probe-reflect.mjs`）：
+
+| 机制 | 防抛错 | 等就绪 | 缺服务时能否激活 |
+|---|---|---|---|
+| 硬 `inject` | ✅ | ✅ | ❌ 永不激活（违反 C8） |
+| `ctx.reflect.get(name, false)` | ✅ | ❌ | ✅ 但**静默永久降级** |
+| `ctx.inject([...], cb)` | ✅ | ✅（回调延后） | ✅ |
+| 直接属性读 | ❌ 抛错 | —— | ❌ |
+
+**为什么「只用 `reflect.get`」被否决**：它在服务挂载前读到 `undefined` 并**就此定局**，
+没有任何重试。等于把「加载期崩溃」换成「静默永久降级」——后者更难发现，
+因为 `fiber.state` 依然是 2，宿主认为插件一切正常。
+四场景对照（`.tmp/verify-inject-value.mjs`）实测：服务晚到 + 无 `inject` 时，
+注册上下文 **0 个**、命令 **0 个**，而 `fiber.state` 仍为 2。
+
+**本仓库的最终写法**：
+
+```ts
+// src/index.ts
+export const inject = ['systemPrompt', 'commands', 'timer']
+```
+
+只有三项，比上面建议的四个少一个。**少的是 `storageDomain`，理由不是疏忽**：
+
+- `storageDomain` 在 `src/host/adapter.ts` 里**只声明在接口上，生产代码零读取**
+  （数据面走 `config.storage.dataDir` 的本地日志）。这与真缺陷十七同形——
+  **配置里声明了、注释里承诺了、测试里列了，但生产代码零读取**。
+- 声明一个没有消费者的依赖不是保险，是**风险**：凡是没挂 storage-domain 的
+  profile，本插件都会**无故失效**。
+
+`goals` 同理不列：它只影响 `goalScore` 一维，由 `readGoalText` **每轮懒读**，
+服务晚到时下一轮自然取到，不存在静默降级；而它来自独立的 goal 插件，
+不在 base bundle 里，硬列会让未装 goal 的 profile 直接不激活。
+
+**配套改动**：`src/host/adapter.ts` 新增 `readService`，三级回落
+`reflect.get(name, false)` → 直接属性读 → 抛错时返回 `undefined`。
+**第二级不能省**：`on`/`effect`/`logger` 是核心方法而非服务，
+`reflect.get` 对它们恒返回 `undefined`，只靠第一级会把它们全判成缺失。
+
+**真实宿主验证**（`.tmp/verify-activation.mjs`）：真实 Cordis `Context` 下
+`fiber.state = 2`，注册 1 个 `memory:focus-pack` 动态上下文 + 1 个 `memory` 命令。
+配套测试 `tests/host/adapter-strict.test.ts` 用 Proxy 复刻 `get` 陷阱——
+这是本仓库第一批**在单测阶段就能抓住「未声明服务」类缺陷**的测试。
 
 ### 8.10 【确认】"不要 steer" 与 C5 都与宿主一致
 
