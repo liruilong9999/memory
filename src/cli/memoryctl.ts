@@ -84,7 +84,7 @@ export const CLI_NAME = 'memoryctl'
 export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
-const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'help'] as const
+const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'help'] as const
 
 /** 子命令名。 */
 type Command = (typeof COMMANDS)[number]
@@ -112,6 +112,9 @@ export interface CliOptions {
   readonly out: string | undefined
   /** `export` 是否连归档卡一起导出。 */
   readonly includeArchived: boolean
+
+  /** `revise` 的修正原因（FR-A5：要能回答「为什么改」）。 */
+  readonly reason: string
 }
 
 /** 参数解析结果。失败时只带一条人可读信息，不带异常。 */
@@ -250,6 +253,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let json = false
   let verbose = false
   let includeArchived = false
+  let reason = ''
   let helpRequested = false
   let onlyPositionals = false
   let index = 0
@@ -308,11 +312,12 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     const equals = arg.indexOf('=')
     const name = equals >= 0 ? arg.slice(0, equals) : arg
     const inline = equals >= 0 ? arg.slice(equals + 1) : undefined
-    if (name === '--data-dir' || name === '--tz' || name === '--out') {
+    if (name === '--data-dir' || name === '--tz' || name === '--out' || name === '--reason') {
       const value = takeValue(name, inline)
       if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
       if (name === '--data-dir') dataDir = value
       else if (name === '--tz') timeZone = value
+      else if (name === '--reason') reason = value
       else out = value
       continue
     }
@@ -324,7 +329,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     return {
       ok: true,
       options: {
-        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived,
+        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason,
       },
     }
   }
@@ -336,7 +341,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     options: {
       command: first,
       positionals: positionals.slice(1),
-      dataDir, timeZone, json, verbose, out, includeArchived,
+      dataDir, timeZone, json, verbose, out, includeArchived, reason,
     },
   }
 }
@@ -471,6 +476,8 @@ export function helpText(): string {
     '  rebuild                   从事件日志重建索引，打印扫描记录数与活跃卡数',
     '  health                    健康检查；索引不一致时退出码为 1',
     '  consolidate               手动执行一次夜整理（去重、合并、降权、归档）',
+    '  restore <id>              把一张归档卡恢复成活跃（FR-C2：归档必须可逆）',
+    '  revise <id> <新正文>      修正卡片正文并保留旧版本（FR-A5：可查改过什么）',
     '  help                      显示本帮助（等同 -h / --help / 无参数）',
     '',
     '全局选项：',
@@ -483,6 +490,9 @@ export function helpText(): string {
     'export 专用选项：',
     '  --out <路径>              写入文件而不是 stdout（父目录不存在时自动创建）',
     '  --include-archived        连归档卡一起导出',
+    '',
+    'revise 专用选项：',
+    '  --reason <原因>           写进修正历史，供日后回答「为什么改」（默认空）',
     '',
     '退出码：',
     '  0  正常',
@@ -498,6 +508,8 @@ export function helpText(): string {
     `  ${CLI_NAME} health`,
     `  ${CLI_NAME} query "部署" --data-dir ./data`,
     `  ${CLI_NAME} export --include-archived --out backup.json`,
+    `  ${CLI_NAME} restore card_1a2b3c`,
+    `  ${CLI_NAME} revise card_1a2b3c "改用 PostgreSQL" --reason 决策变更`,
     `  ${CLI_NAME} consolidate --json --verbose`,
   ]
   return `${lines.join('\n')}\n`
@@ -629,6 +641,83 @@ function runExport(
  * @param engine - 记忆引擎。
  * @returns 命令结果。
  */
+/**
+ * `restore` 子命令：把一张归档卡恢复成活跃（FR-C2）。
+ *
+ * ## 为什么 CLI 必须有它
+ *
+ * 归档是**自动**发生的（`forgetting.autoArchive` 默认 `true`，夜整理每天跑）。
+ * 在补这条命令之前，数据面的 `restore` 分支实现完整、测试全绿，
+ * 却**没有任何生产入口**——用户被误归档后，唯一的办法是手改 JSONL。
+ * FR-C2 整条需求就是为了保证归档**可逆**。
+ *
+ * 退出码语义：恢复成功 0；卡不存在或本来就没归档 1（并说明原因）。
+ * 不抛异常——id 可能是手抄错的，抛异常会让整条命令失败而不告诉人错在哪。
+ *
+ * @param options - 解析后的参数，`positionals[0]` 为卡片 id。
+ * @param engine - 记忆引擎。
+ * @returns 命令结果。
+ */
+function runRestore(options: CliOptions, engine: MemoryEngine): CliResult {
+  const id = options.positionals[0]
+  if (id === undefined || id.length === 0) {
+    return usageFailure('restore 需要一个卡片 id，例如：memoryctl restore card_1a2b3c')
+  }
+  const card = engine.inspect(id)
+  if (card === undefined) {
+    return { code: EXIT_UNHEALTHY, stdout: '', stderr: `没有这张卡：${id}\n` }
+  }
+  const written = engine.restore(id)
+  if (!written) {
+    // 区分「本来就没归档」与「写库失败」——两者都不是错误，
+    // 但告诉用户「它已经是活跃的」比只说「没做」有用得多。
+    return {
+      code: EXIT_UNHEALTHY,
+      stdout: options.json ? jsonText({ id, restored: false, status: card.status }) : '',
+      stderr: `这张卡没有被归档（当前状态：${card.status}），无需恢复\n`,
+    }
+  }
+  if (options.json) return { code: EXIT_OK, stdout: jsonText({ id, restored: true }), stderr: '' }
+  return { code: EXIT_OK, stdout: `已恢复：${id}\n`, stderr: '' }
+}
+
+/**
+ * `revise` 子命令：修正一张卡的正文并保留旧版本（FR-A5）。
+ *
+ * 用法：`memoryctl revise <id> <新正文> [--reason 原因]`。
+ *
+ * 与 `restore` 同一类缺口：`revisions` 数组此前**恒为空**，
+ * 「查看历史」能查到的历史永远是空的。
+ *
+ * @param options - 解析后的参数。
+ * @param engine - 记忆引擎。
+ * @returns 命令结果。
+ */
+function runRevise(options: CliOptions, engine: MemoryEngine): CliResult {
+  const id = options.positionals[0]
+  if (id === undefined || id.length === 0) {
+    return usageFailure('revise 需要一个卡片 id，例如：memoryctl revise card_1a2b3c "新的正文"')
+  }
+  const text = options.positionals.slice(1).join(' ').trim()
+  if (text.length === 0) {
+    return usageFailure('revise 需要新的正文，例如：memoryctl revise card_1a2b3c "新的正文"')
+  }
+  const card = engine.inspect(id)
+  if (card === undefined) {
+    return { code: EXIT_UNHEALTHY, stdout: '', stderr: `没有这张卡：${id}\n` }
+  }
+  const written = engine.revise(id, text, options.reason)
+  if (!written) {
+    return {
+      code: EXIT_UNHEALTHY,
+      stdout: options.json ? jsonText({ id, revised: false }) : '',
+      stderr: `正文没有变化，未写入修正记录\n`,
+    }
+  }
+  if (options.json) return { code: EXIT_OK, stdout: jsonText({ id, revised: true, text }), stderr: '' }
+  return { code: EXIT_OK, stdout: `已修正：${id}\n`, stderr: '' }
+}
+
 function runRebuild(options: CliOptions, engine: MemoryEngine): CliResult {
   const report = engine.rebuild()
   if (options.json) {
@@ -808,6 +897,12 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
         break
       case 'consolidate':
         result = runConsolidate(options, engine)
+        break
+      case 'restore':
+        result = runRestore(options, engine)
+        break
+      case 'revise':
+        result = runRevise(options, engine)
         break
       default:
         // `help` 已在前面提前返回，这里是穷尽性兜底。

@@ -532,6 +532,31 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const report = engine.rebuild()
     return `索引已重建：扫描 ${report.records} 条日志记录，活跃 ${report.active} 张`
   }
+  if (command === 'restore') {
+    // FR-C2 的生产入口。归档是**自动**发生的（autoArchive 默认开），
+    // 在此之前用户没有任何办法撤销一次误归档——数据面有 `restore` 分支、
+    // 有测试，但没有生产者。能力在、路径缺，比没实现更危险。
+    const id = trimmed.slice('restore'.length).trim()
+    if (id.length === 0) return '用法：/memory restore <卡片 id>'
+    const card = engine.inspect(id)
+    if (card === undefined) return `没有这张卡：${id}`
+    if (!engine.restore(id)) return `这张卡没有被归档（当前状态：${card.status}），无需恢复`
+    return `已恢复：${id}`
+  }
+  if (command === 'revise') {
+    // FR-A5 的生产入口。此前 `revisions` 数组**恒为空**，
+    // 「可查历史」能查到的历史永远是空的。
+    const rest = trimmed.slice('revise'.length).trim()
+    const space = rest.indexOf(' ')
+    if (space < 0) return '用法：/memory revise <卡片 id> <新正文>'
+    const id = rest.slice(0, space)
+    const text = rest.slice(space + 1).trim()
+    if (id.length === 0 || text.length === 0) return '用法：/memory revise <卡片 id> <新正文>'
+    const card = engine.inspect(id)
+    if (card === undefined) return `没有这张卡：${id}`
+    if (!engine.revise(id, text, '会话内手动修正')) return '正文没有变化，未写入修正记录'
+    return `已修正：${id}`
+  }
   if (command === 'status') {
     const metrics = engine.metrics()
     const health = engine.health()
@@ -554,7 +579,7 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const result = engine.recall(trimmed.slice('explain'.length).trim())
     return renderFocusPackExplain(result.pack, result.candidates)
   }
-  return `未知子命令「${command}」，可用：status / health / rebuild / explain`
+  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise`
 }
 
 /** 插件默认配置，供宿主 patch 引用。 */

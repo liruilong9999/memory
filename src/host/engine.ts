@@ -23,6 +23,7 @@ import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
 } from '../core/types.ts'
 import { cardSimilarity } from '../consolidate/dedupe.ts'
+import { normalizeText } from '../core/text.ts'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import { readLastConsolidationAt, writeLastConsolidationAt } from '../store/meta.ts'
 import type { MemoryStore } from '../store/store.ts'
@@ -583,6 +584,87 @@ export class MemoryEngine {
    */
   inspect(id: string): MemoryCard | undefined {
     return this.store.getCard(id)
+  }
+
+  /**
+   * 从归档恢复一张卡（FR-C2 的生产入口）。
+   *
+   * ## 为什么必须有这个方法
+   *
+   * 归档是**自动**发生的（`forgetting.autoArchive` 默认 `true`，夜整理每天跑），
+   * 而 `state.ts` 的 `restore` 分支早就实现了、测试也绿——但 `src/` 里
+   * **没有任何一处构造 `restore` 操作**。也就是说：数据面能力完备，
+   * 用户却永远拿不到。FR-C2 整条需求就是为了保证归档**可逆**，
+   * 而「自动归档 + 无恢复入口」= 不可逆的数据可见性损失。
+   *
+   * 这类缺口比「完全没实现」更危险：审计表上它显示「已实现且有测试」，
+   * 没人会去看生产路径。判据不是「代码里有」，而是「用户够得到」。
+   *
+   * @param id - 卡片 id。
+   * @param now - 恢复时刻；省略时取当前时钟。
+   * @returns 是否真的写了一条恢复记录（卡不存在或本来就是 active 时返回 `false`）。
+   */
+  restore(id: string, now = this.clock()): boolean {
+    const card = this.store.getCard(id)
+    // 卡不存在 ⇒ 无事可做。这里**不报错**：id 可能来自旧日志或用户手抄，
+    // 抛异常会让一条 CLI 命令因一个字符错就整体失败，而「什么都没恢复」
+    // 已经是足够明确的信号。
+    if (card === undefined) return false
+    // 本来就是 active：不写记录。否则每次调用都会追加一条无意义的
+    // `restore`，日志会被「恢复一张没归档的卡」灌满（FR-A3 的日志整洁性）。
+    if (card.status === 'active') return false
+    const outcome = this.store.append({ op: 'restore', id, at: now }, undefined, now)
+    return outcome.written
+  }
+
+  /**
+   * 修正一张卡的正文，保留旧版本（FR-A5 的生产入口）。
+   *
+   * 与 {@link restore} 同一类缺口：`state.ts` 的 `revise` 分支把
+   * `previousText` / `reason` / `actor` 都存好了，`tests/store/state.test.ts`
+   * 也验了累积顺序——但没有任何生产者，于是 `revisions` 数组**恒为空**，
+   * 「查看历史」这个功能实际能查到的历史永远是空的。
+   *
+   * ## `normalized` 必须在这里重算
+   *
+   * 重放层只按 `op.normalized` 覆盖，它**不会**自己调 `normalizeText`。
+   * 若这里直接抄旧值，修正后的卡在检索时仍按旧文本匹配——
+   * 用户改了正文却发现搜不到新词，且没有任何报错。
+   *
+   * @param id - 卡片 id。
+   * @param text - 新正文（非空）。
+   * @param reason - 修正原因，写进 `revisions` 供日后审计。
+   * @param now - 修正时刻；省略时取当前时钟。
+   * @returns 是否真的写了一条修正记录。
+   */
+  revise(id: string, text: string, reason: string, now = this.clock()): boolean {
+    const card = this.store.getCard(id)
+    if (card === undefined) return false
+    const next = text.trim()
+    // 空正文会把卡变成「存在但不可读」——那种状态比删掉更糟：它仍占着
+    // 焦点包名额、仍能被召回，却什么都不说。宁可拒绝也不写。
+    if (next.length === 0) return false
+    // 正文没变：不写记录。否则「保存」按钮每按一次就多一条 revisions，
+    // 而 FR-A5 要回答的是「改过什么」，不是「按过几次保存」。
+    if (next === card.text) return false
+    const outcome = this.store.append(
+      {
+        op: 'revise',
+        id,
+        text: next,
+        normalized: normalizeText(next),
+        reason,
+        at: now,
+        // actor 固定 `manual`：能调用到这个方法的只有用户主动操作
+        // （CLI 子命令 / 会话命令）。若将来出现「系统自动改写」的调用方，
+        // 必须给它另一条入口，而不是复用这里——否则 revisions 里的
+        // 「谁改的」会变成一句假话。
+        actor: 'manual',
+      },
+      undefined,
+      now,
+    )
+    return outcome.written
   }
 
   /**
