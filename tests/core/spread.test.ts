@@ -144,6 +144,100 @@ describe('扩散激活（FR-G1）', () => {
     assert.equal(boosts.length, 2, '受影响面必须被 maxAffected 截断')
   })
 
+  // 以下三条守的是**截断留下的是哪几张**。上面那条只断言数量，
+  // 不管留的是 b/c 还是 b/d，所以它对「排序键是否正确」完全没有约束力——
+  // 而这正是缺陷所在：旧的排序键是截平后的 `boost`，多张卡撞在 `maxBoost`
+  // 上时比较恒等，排序退化成按 id 哈希，与强弱无关。
+  describe('maxAffected 截断必须按强弱取舍，不能退化成按 id 哈希', () => {
+    it('raw 更强的卡优先留下，即使截平后的 boost 完全相同', () => {
+      // 构造：a 以不同边权连到 b/c/d，三者 raw 不同，但都超过 maxBoost。
+      // 旧实现下三者 boost 全 = maxBoost，比较恒等 → 按 id 排序，
+      // 留下的可能是任意两张；新实现必须留下 raw 最大的 d、c。
+      //
+      // **id 顺序故意与强弱顺序相反**（d 最强、b 最弱）：若按 id 排序会留下
+      // b、c，与期望的 c、d 不同。第一版测试把 id 写成 b/c/d 对应强/中/弱，
+      // 于是「按 id 排序」恰好也得到 b、c，反向验证时 M1 变异不红——
+      // 那条测试绿在巧合上，测不出排序键。
+      const config = spreadConfig({ maxAffected: 2, maxBoost: 0.1, hopDecay: 1, maxHops: 1 })
+      const adjacency = buildAdjacency([
+        edge('a', 'd', 'same-entity', 1),    // raw = 1.0 × 1.0 × 1 = 1.0  → 最强
+        edge('a', 'c', 'same-entity', 0.8),  // raw = 0.8              → 次强
+        edge('a', 'b', 'same-entity', 0.6),  // raw = 0.6              → 最弱
+      ])
+      const seeds: SpreadSeed[] = [{ id: 'a', score: 1 }]
+      const selfScores = new Map([['b', 0.5], ['c', 0.5], ['d', 0.5]])
+      const boosts = spreadActivation(seeds, adjacency, selfScores, config)
+      // 前提断言：三者确实都撞在 maxBoost 上（否则本条测不到「截平后无区分度」）
+      assert.equal(boosts.length, 2, '前提：必须发生截断')
+      assert.ok(
+        boosts.every((x) => x.boost === config.spread.maxBoost),
+        '前提：三张卡的 boost 都被截平到 maxBoost，才谈得上「排序键失效」',
+      )
+      const kept = boosts.map((x) => x.id).sort()
+      assert.deepEqual(kept, ['c', 'd'], '必须留下 raw 最强的 c、d，而不是按 id 哈希挑 b、c')
+    })
+
+    it('raw 相同时按自身分取舍：留自身更强的，不留 id 更小的', () => {
+      // 构造 raw 完全相同的三张卡（同一条边权、同一跳），自身分不同。
+      // 这是真实数据里最常见的形态：同一批 weight=1.0 的边一跳传出。
+      const config = spreadConfig({ maxAffected: 2, maxBoost: 0.1, hopDecay: 1, maxHops: 1 })
+      const adjacency = buildAdjacency([
+        edge('a', 'x1', 'same-entity', 1),
+        edge('a', 'x2', 'same-entity', 1),
+        edge('a', 'x3', 'same-entity', 1),
+      ])
+      const seeds: SpreadSeed[] = [{ id: 'a', score: 1 }]
+      // id 字典序是 x1 < x2 < x3，但自身分最高的是 x3、x2。
+      // 旧实现按 id 排序会留下 x1、x2 —— 恰好丢掉自身最强的 x3。
+      const selfScores = new Map([['x1', 0.20], ['x2', 0.35], ['x3', 0.50]])
+      const boosts = spreadActivation(seeds, adjacency, selfScores, config)
+      const kept = boosts.map((x) => x.id).sort()
+      assert.deepEqual(kept, ['x2', 'x3'], 'raw 相同时必须按自身分留，而不是按 id 留')
+      assert.ok(!kept.includes('x1'), '自身分最低的 x1 必须被淘汰')
+    })
+
+    it('全同时按 id 升序兜底：这是 ST-1 确定性的最后一道保险', () => {
+      // 全部 raw、自身分都相同，只剩 id 这一个区分量。
+      //
+      // ## 这条测试的注释曾经撒过谎（实测抓到，已改）
+      //
+      // 第一版写的是「边传入顺序不同也必须得到相同结果」，并断言
+      // `reversed === first`。反向验证时把兜底键改成 `return 0`，
+      // 这条用例确实变红了 —— 但我以为红在第二句，实际红在最后那句
+      // `deepEqual(first, ['p','q','r'])`。
+      //
+      // 直接跑最小复现证明：`buildAdjacency` 内部**已按 `edge.id` 排序**
+      // （见其实现第一行 `const sorted = [...edges].sort(...)`），
+      // 所以把入参边数组反转，建出来的邻接表逐键逐边完全相同。
+      // 变异后正序、逆序结果都是 `q,p,t`，两结果**依然相等**。
+      // 也就是说「输入容器顺序」这个场景在本函数里根本构造不出来，
+      // 那句注释描述的是不存在的行为。
+      //
+      // 兜底键真正的作用就是**给全平局一个确定解**，所以断言必须直接写
+      // 「留下的是 id 字典序最小的三个」，而不是绕道去比两次调用。
+      const config = spreadConfig({ maxAffected: 3, maxBoost: 0.1, hopDecay: 1, maxHops: 1 })
+      const edges = [
+        edge('a', 'p', 'same-entity', 1),
+        edge('a', 'q', 'same-entity', 1),
+        edge('a', 'r', 'same-entity', 1),
+        edge('a', 's', 'same-entity', 1),
+        edge('a', 't', 'same-entity', 1),
+      ]
+      const seeds: SpreadSeed[] = [{ id: 'a', score: 1 }]
+      const selfScores = new Map([['p', 0.5], ['q', 0.5], ['r', 0.5], ['s', 0.5], ['t', 0.5]])
+      const kept = spreadActivation(seeds, buildAdjacency(edges), selfScores, config).map((x) => x.id)
+      // 五张卡 raw 与自身分全部相同，只能靠 id 兜底。
+      // 若兜底键缺失，V8 的稳定排序会保留 Map 插入顺序（即 `q,p,t,...`），
+      // 与 id 升序不同 —— 这正是反向验证里能变红的那一处。
+      assert.deepEqual(kept, ['p', 'q', 'r'], '全同时必须按 id 升序兜底，不能依赖 Map 插入顺序')
+      // 同时确认五张卡确实全部同分（否则上面的断言可能只是碰巧）
+      const all = spreadActivation(
+        seeds, buildAdjacency(edges), selfScores, spreadConfig({ maxAffected: 5, maxBoost: 0.1, hopDecay: 1, maxHops: 1 }),
+      )
+      assert.equal(new Set(all.map((x) => x.boost)).size, 1, '前提：五张卡的 boost 必须完全相同')
+    })
+  })
+
   it('hopDecay 小于 1 是级联的必要条件：两跳的收益小于一跳', () => {
     const config = spreadConfig({ maxBoost: 1, maxHops: 2, hopDecay: 0.5 })
     // a→b→c 链式，b 一跳，c 两跳。

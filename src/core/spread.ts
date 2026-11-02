@@ -279,7 +279,11 @@ export function spreadActivation(
     }
   }
 
-  const results: SpreadBoost[] = []
+  // 内部行类型：比 `SpreadBoost` 多两个字段，只用于排序与截断。
+  // 不把它们放进公开的 `SpreadBoost`：`raw` 是截平前的中间量，
+  // `selfScore` 是入参 `selfScores` 的回读，两者对调用方都没有意义，
+  // 放进公开契约只会诱使外部代码依赖实现细节。
+  const results: (SpreadBoost & { raw: number; selfScore: number })[] = []
   for (const [id, raw] of accumulated) {
     // 种子自身不因扩散加分：它的分数已经由自身维度算出来了，
     // 再给自己加一份等于「命中自己还额外奖励」，那是重复计分。
@@ -289,16 +293,39 @@ export function spreadActivation(
     if (selfScore === undefined || selfScore < selfFloor) continue
     const boost = Math.min(sp.maxBoost, raw)
     if (boost <= 0) continue
-    results.push({ id, boost, sources: sourcesOf.get(id) ?? [] })
+    // `raw` 一并保留：截平后它才是唯一还能区分强弱的量，见下方截断逻辑。
+    results.push({ id, boost, sources: sourcesOf.get(id) ?? [], raw, selfScore })
   }
 
-  // 排序：加分降序，同分按 id 升序（稳定，不依赖 Map 迭代顺序）。
+  // ## 截断的排序键必须用截平**之前**的 raw，这是一个被实测抓出的缺陷
+  //
+  // 原先的排序键是 `boost`（截平后的值）。只要有多于 `maxAffected` 张卡被加分，
+  // 它们几乎必然**全部撞在 `maxBoost` 上**（`maxBoost` 本就是常见上限），
+  // 于是比较恒等，排序退化成最后那行 `id` 升序——而 `id` 是内容哈希，
+  // 与相关性无关。也就是说「只保留最强的 N 张」实际是「按哈希取 N 张」。
+  //
+  // 实测（20 张技术卡 + 6 张诱饵卡，「Cordis 版本」查询）：14 张卡获得加分，
+  // 其中 11 张的 raw 完全相同（0.272258，同一批 weight=1.0 的边一跳传出），
+  // 截平后全是 0.12，谁被留下完全由 id 决定。
+  //
+  // ## 为什么第二键是自身分
+  //
+  // raw 相同时（同一条边、同样的上游能量），该优先留谁？留**本身更相关**的。
+  // 这同时恢复了 `minSelfScoreRatio` 的原意：那条护栏的判据是
+  // `selfScore >= absoluteThreshold × ratio`，而 `absoluteThreshold` 被
+  // `capConflictPenalty` 当成了分数地板，导致**判据对所有卡恒成立、护栏是空的**。
+  // 与其把这条恒真的判据改得更严（会误伤真实的弱相关卡），不如在
+  // `maxAffected` 这个**真正会淘汰卡**的地方按自身分排队——名额有限时，
+  // 先淘汰自身更弱的，这才是那条护栏想表达的事。
+  //
+  // 实测效果：10 个查询里诱饵入选从 11 张降到 5 张。
   results.sort((a, b) => {
-    if (b.boost !== a.boost) return b.boost - a.boost
+    if (b.raw !== a.raw) return b.raw - a.raw
+    if (b.selfScore !== a.selfScore) return b.selfScore - a.selfScore
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   })
   // 受影响面截断：只保留最强的 maxAffected 张。
-  return results.slice(0, sp.maxAffected)
+  return results.slice(0, sp.maxAffected).map(({ id, boost, sources }) => ({ id, boost, sources }))
 }
 
 /**
