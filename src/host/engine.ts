@@ -347,7 +347,11 @@ export class MemoryEngine {
       if (!cards.some((c) => c.id === card.id)) cards.push(card)
     }
 
-    const scored = scoreCards(cards.slice(0, this.config.recall.candidateLimit), query, this.config)
+    // 传入全部边：扩散激活（FR-G1）需要看到整个图谱才能沿边传播。
+    // `spread.enabled` 为 false 时 `scoreCards` 内部直接返回，行为与不传边完全一致。
+    const scored = scoreCards(
+      cards.slice(0, this.config.recall.candidateLimit), query, this.config, this.store.allEdges(),
+    )
     const pack = buildFocusPack(scored, query, this.config)
     const time = this.buildTime(at)
     const text = renderFocusPack(pack, time)

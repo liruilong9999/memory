@@ -255,13 +255,98 @@ export interface MemoryConfig {
   consolidation: ConsolidationPolicy
   /** 到期提醒策略（FR-D3）。 */
   reminder: ReminderPolicy
+  /** 图谱扩散与突触可塑性策略（FR-G1）。 */
+  spread: SpreadPolicy
   /** 调试开关：记录每次召回的解释。 */
   debugExplain: boolean
 }
 
+/**
+ * 图谱扩散与突触可塑性（FR-G1）。
+ *
+ * 起源 L15（无编号·图谱）：「我需要一种建立记忆图谱的方法，且跨层次关联。」
+ * 「跨层次关联」如果只是把边存下来、查询时能看见，那图谱就只是一张示意图——
+ * 一张卡被想起时，与它相连的卡不会因此更容易被想起。本段参数让边**参与计算**。
+ *
+ * 需求归属：`docs/1-需求规格.md` FR-G1「突触学习与图谱扩散」。
+ * 该条在 §7.7「后续扩展」里，触发条件是「稳定记忆跑通、积累了 2 周真实数据」。
+ * 这里提前实现的是它的**规则部分**（扩散、可塑性、剪枝），不含任何语义判断
+ * （`causes` / `part-of` / `contrasts` 三类语义边仍然无产出点，见 `types.ts`）。
+ */
+export interface SpreadPolicy {
+  /**
+   * 是否启用扩散激活。
+   *
+   * 关掉时 `spreadScores` 原样返回，整条链路退化成「只看单卡分数」，
+   * 与引入本功能之前的行为完全一致——这是可回滚的开关（FR-F4）。
+   */
+  enabled: boolean
+  /**
+   * 每跳衰减系数（0..1）。
+   *
+   * 命中卡的激活量传给邻居时乘以它。小于 1 是**级联的必要条件**：
+   * 若等于 1，一跳就能传满，任意连通分量会被整个点亮，扩散变成「全库提权」。
+   */
+  hopDecay: number
+  /** 最大扩散跳数。1 表示只看直接邻居，2 表示邻居的邻居。 */
+  maxHops: number
+  /**
+   * 单张卡从扩散中获得的**最大加分**（0..1，加在归一化总分上）。
+   *
+   * 必须有上限，否则「连接多的卡」会系统性压过「内容匹配的卡」——
+   * 那是把图谱变成人气的排行榜，而不是记忆。上限让扩散只能微调排序。
+   */
+  maxBoost: number
+  /**
+   * 扩散进来的卡自身必须达到的分数下限（相对 `absoluteThreshold` 的倍数）。
+   *
+   * 这是**护栏**：只靠邻居混进焦点包的卡，会把 `absoluteThreshold`
+   * 的语义稀释掉（阈值本来是「这条记忆本身够不够格」）。取 1.0 表示
+   * 「扩散可以帮忙排序，但不能让一张本来不合格的卡合格」。
+   */
+  minSelfScoreRatio: number
+  /**
+   * 同一次召回中，扩散最多影响多少张卡。
+   *
+   * 与 `maxBoost` 是两道独立的闸：`maxBoost` 限制单卡收益，
+   * 这里限制受影响面。没有它，一次强命中可能改写整个候选池的排序，
+   * 让「专注当前位置」（起源 L29）失效。
+   */
+  maxAffected: number
+  /**
+   * 是否让 `distills` 边反向传播。
+   *
+   * 起源 L11（无编号·细节会忘）：「其实我们大多数细节都会忘记，只会留下感受。」
+   * `distills` 边的方向是「感受卡 → 来源事件卡」。严格按有向边传播时，
+   * 命中一条**细节**不会唤起它的**感受**——恰恰与 L11 的意图相反：
+   * 细节该忘、感受该留，所以想起细节时感受应当更容易浮现。
+   * 开启后 `distills` 边双向传播，其余边仍严格单向。
+   */
+  distillBidirectional: boolean
+
+  /* ---- 突触可塑性（边权随时间与共激活变化） ---- */
+
+  /**
+   * 是否启用边权可塑性。
+   *
+   * 关掉时边权停在建立时的初始值，只有扩散生效。
+   */
+  plasticityEnabled: boolean
+  /** 共激活时边权增量（赫布学习：一起被用到的连接变强）。 */
+  reinforceDelta: number
+  /** 边权上限，防止无限增长到「一条边压过一切」。 */
+  maxEdgeWeight: number
+  /** 每次巩固时边权的衰减乘数（0..1），模拟久不用的连接变弱。 */
+  decayFactor: number
+  /** 边权低于该值即视为失效并删除（突触剪枝）。 */
+  pruneThreshold: number
+  /** 单次巩固最多删除多少条失效边，保证耗时可控（P8）。 */
+  maxPrunePerRun: number
+}
+
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 3,
+  configVersion: 4,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -352,11 +437,30 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     enabled: true,
     pollMs: 60 * 1000,
   },
+  spread: {
+    // 默认**关闭**。理由：FR-G1 的触发条件是「稳定记忆跑通、积累了 2 周真实数据」，
+    // 现在一条真实数据都没有。默认开启等于让一个未经真实数据检验的机制
+    // 悄悄改变每一次召回的排序——而且改得不多，正是最难发现的那一类。
+    // 开关留在这里，打开它是一次显式决定，不是继承来的默认。
+    enabled: false,
+    hopDecay: 0.5,
+    maxHops: 2,
+    maxBoost: 0.12,
+    minSelfScoreRatio: 1,
+    maxAffected: 5,
+    distillBidirectional: true,
+    plasticityEnabled: false,
+    reinforceDelta: 0.05,
+    maxEdgeWeight: 1,
+    decayFactor: 0.98,
+    pruneThreshold: 0.1,
+    maxPrunePerRun: 200,
+  },
   debugExplain: true,
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 3
+export const MEMORY_CONFIG_VERSION = 4
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -461,6 +565,53 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   }
   // 轮询间隔太短会空转烧 CPU，太长则提醒延迟不可接受（FR-D3）。
   if (config.reminder.pollMs < 1000) errors.push('reminder.pollMs 必须 ≥ 1000（1 秒）')
+
+  // 图谱扩散（FR-G1）。这里的每条约束都对应一种「扩散会把召回带坏」的具体方式，
+  // 不是形式化的范围检查——写校验时逐条想清楚了它拦住的是哪种坏结果。
+  const sp = config.spread
+  inUnit('spread.hopDecay', sp.hopDecay)
+  inUnit('spread.maxBoost', sp.maxBoost)
+  // hopDecay 必须严格小于 1：等于 1 时一跳传满，连通分量会被整体点亮，
+  // 扩散退化成「全库提权」，与起源 L29「专注当前位置」直接冲突。
+  if (sp.hopDecay >= 1) errors.push('spread.hopDecay 必须 < 1（等于 1 会让扩散退化成全库提权）')
+  if (sp.hopDecay <= 0) errors.push('spread.hopDecay 必须 > 0（为 0 时扩散完全无效）')
+  if (!Number.isInteger(sp.maxHops) || sp.maxHops < 1) {
+    errors.push('spread.maxHops 必须是 ≥ 1 的整数')
+  }
+  // maxHops 上限 3：跳数越多，一次命中影响的面积越大。超过 3 跳时
+  // hopDecay^3 已小于常见边权，收益趋近于噪声，却仍要付出遍历成本。
+  if (sp.maxHops > 3) errors.push('spread.maxHops 不得大于 3（更远的跳数收益已是噪声）')
+  // 护栏不能小于 1：小于 1 等于允许「自身不合格的卡靠邻居混进焦点包」，
+  // 那会把 absoluteThreshold 的语义稀释掉（阈值本来是「这条记忆本身够不够格」）。
+  if (sp.minSelfScoreRatio < 1) {
+    errors.push('spread.minSelfScoreRatio 必须 ≥ 1（小于 1 会让不合格的卡靠邻居混进焦点包）')
+  }
+  if (!Number.isInteger(sp.maxAffected) || sp.maxAffected < 0) {
+    errors.push('spread.maxAffected 必须是 ≥ 0 的整数')
+  }
+  if (sp.maxAffected > config.recall.maxCards) {
+    errors.push('spread.maxAffected 不得大于 recall.maxCards（受影响面不该超过焦点包容量）')
+  }
+  // 可塑性参数只在启用时才要求合法：关着的时候配错值不该拦住整个配置。
+  if (sp.plasticityEnabled) {
+    if (sp.reinforceDelta <= 0) errors.push('spread.reinforceDelta 必须 > 0（否则强化永不发生）')
+    if (sp.maxEdgeWeight <= 0 || sp.maxEdgeWeight > 1) {
+      errors.push('spread.maxEdgeWeight 必须落在 (0, 1]')
+    }
+    // 衰减乘数必须落在 (0,1)：等于 1 永不衰减（剪枝永远不会触发），
+    // 等于 0 一次巩固就清零（所有边瞬间失效）。
+    if (sp.decayFactor <= 0 || sp.decayFactor >= 1) {
+      errors.push('spread.decayFactor 必须落在 (0, 1)（等于 1 永不衰减，等于 0 一次清空）')
+    }
+    // 剪枝阈值必须小于边权上限，否则「上限本身就在剪枝区间里」，
+    // 新建立的边会立刻被判失效。
+    if (sp.pruneThreshold >= sp.maxEdgeWeight) {
+      errors.push('spread.pruneThreshold 必须小于 spread.maxEdgeWeight')
+    }
+    if (!Number.isInteger(sp.maxPrunePerRun) || sp.maxPrunePerRun < 0) {
+      errors.push('spread.maxPrunePerRun 必须是 ≥ 0 的整数')
+    }
+  }
   return { ok: errors.length === 0, errors }
 }
 
@@ -485,6 +636,7 @@ export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConf
     storage: { ...base.storage, ...override.storage },
     consolidation: { ...base.consolidation, ...override.consolidation },
     reminder: { ...base.reminder, ...override.reminder },
+    spread: { ...base.spread, ...override.spread },
     debugExplain: override.debugExplain ?? base.debugExplain,
   }
   // 数组字段必须整体替换，浅合并会让用户的自定义关键词被默认值覆盖。

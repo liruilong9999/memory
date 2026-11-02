@@ -13,9 +13,10 @@
  */
 
 import type { MemoryConfig } from './config.ts'
+import { applySpread, buildAdjacency, spreadActivation } from './spread.ts'
 import { coverage, estimateTokens, tokenSet, truncate } from './text.ts'
 import type {
-  FocusPack, MemoryCard, ScoreBreakdown, ScoredCard, TimeState,
+  FocusPack, MemoryCard, MemoryEdge, ScoreBreakdown, ScoredCard, TimeState,
 } from './types.ts'
 
 /**
@@ -355,6 +356,7 @@ export function filterByDomain(
  */
 export function scoreCards(
   cards: readonly MemoryCard[], query: RecallQuery, config: MemoryConfig,
+  edges: readonly MemoryEdge[] = [],
 ): ScoredCard[] {
   // 先按域过滤再打分：域外的卡连候选都不该算，否则白花 CPU 且会污染相对阈值。
   const inDomain = filterByDomain(cards, query.domains)
@@ -363,7 +365,48 @@ export function scoreCards(
     if (b.score.total !== a.score.total) return b.score.total - a.score.total
     return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
   })
-  return scored
+  if (edges.length === 0 || !config.spread.enabled) return scored
+  return mergeSpread(scored, edges, config)
+}
+
+/**
+ * 把扩散结果合并进已排序的候选。
+ *
+ * 与 `spread.ts` 的 `applySpread` 分工不同：那个函数只做「加法」，本函数负责
+ * 「谁当种子、护栏用哪个分数表」——那是打分链路的语境，属于本文件。
+ *
+ * **种子只取已过绝对阈值的卡。** 若让低分卡也当种子，一条刚过线的卡
+ * 会把自己的弱激活撒给邻居，扩散就从「强化确定命中」退化成「放大噪声」。
+ * 阈值在这里被复用为「值得传播」的判据，与它「值得展示」的判据一致。
+ *
+ * 需求 FR-G1；护栏见 `SpreadPolicy.minSelfScoreRatio`。
+ *
+ * @param scored - 已按自身分数排序的候选。
+ * @param edges - 全部图谱边。
+ * @param config - 配置。
+ * @returns 合并扩散加分并重新排序的结果。
+ */
+function mergeSpread(
+  scored: readonly ScoredCard[], edges: readonly MemoryEdge[], config: MemoryConfig,
+): ScoredCard[] {
+  const selfScores = new Map(scored.map((item) => [item.card.id, item.score.total]))
+  const seeds = scored
+    .filter((item) => item.score.total >= config.recall.absoluteThreshold)
+    .map((item) => ({ id: item.card.id, score: item.score.total }))
+  // 邻接表按**全部边**构造：扩散才能从候选卡走到「本轮没被检索命中」的邻居。
+  // 但结果只对候选池内的卡生效——`selfScores` 里没有的卡会被护栏挡掉。
+  const adjacency = buildAdjacency(edges)
+  const boosts = spreadActivation(seeds, adjacency, selfScores, config)
+  // 没有任何卡获得扩散加分时，返回入参本身而不是拷贝：调用方拿到的是同一份
+  // 已排序数组，行为与不启用扩散时完全一致（零回归）。
+  if (boosts.length === 0) return [...scored]
+
+  const applied = applySpread(scored, boosts)
+  applied.sort((a, b) => {
+    if (b.score.total !== a.score.total) return b.score.total - a.score.total
+    return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
+  })
+  return applied
 }
 
 /**

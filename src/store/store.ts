@@ -270,6 +270,25 @@ export class MemoryStore {
   }
 
   /**
+   * 取全部图谱边（FR-G1 扩散激活的输入）。
+   *
+   * 与 `snapshot().edges` 的区别：本方法返回**拷贝后的数组**，调用方拿到的是
+   * 稳定快照，不会因为后续写入看到「一半旧的、一半新的」边集。扩散计算需要
+   * 遍历整个边集，遍历途中若边集被改动，结果将不可复现（ST-1）。
+   *
+   * 为什么不直接让调用方用 `snapshot()`：那会把全部卡片也一并暴露出去，
+   * 而扩散只需要边。接口越窄，调用方越不可能顺手改到它不该改的东西。
+   *
+   * @returns 全部边的拷贝，按 id 升序（顺序稳定，便于断言与复现）。
+   */
+  allEdges(): MemoryEdge[] {
+    this.ensureOpen()
+    return [...this.state.edges.values()]
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((edge) => ({ ...edge }))
+  }
+
+  /**
    * 卡片计数。
    *
    * @param status - 只统计某个生命周期状态；省略表示全部。

@@ -54,7 +54,15 @@ describe('摘要配置的默认值与版本', () => {
 
   it('configVersion 与常量一致（改默认配置必须同时递增两者）', () => {
     assert.equal(DEFAULT_CONFIG.configVersion, MEMORY_CONFIG_VERSION)
-    assert.equal(MEMORY_CONFIG_VERSION, 3, '新增摘要与蒸馏参数后版本应为 3')
+    // 这条是**绊线**，不是回归测试：它写死版本号，故意让「改了默认配置却忘了
+    // 递增版本」变红。递增时改这里的数字是预期动作，不是修测试。
+    //
+    // 版本历史（每次递增都在这里留一行，让后来者知道该不该再递增）：
+    //   1 → 初始契约层
+    //   2 → 时间感与到期提醒参数
+    //   3 → 摘要与蒸馏参数
+    //   4 → 图谱扩散与突触可塑性参数（FR-G1）
+    assert.equal(MEMORY_CONFIG_VERSION, 4, '新增扩散与可塑性参数后版本应为 4')
   })
 
   it('层级上限默认递增：日 > 周 > 月', () => {

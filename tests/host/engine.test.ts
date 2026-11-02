@@ -684,3 +684,62 @@ describe('到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
     store.close()
   })
 })
+
+describe('图谱扩散不写库（FR-G1 / 起源 L29）', () => {
+  it('recall 不得改动图谱边权，也不得新增边记录', () => {
+    // 这条守的是**可塑性没有接线**这个事实在行为上成立，而不是只在配置里成立。
+    // 起源 L29（第 5 条·专注当前位置）：「看见」不等于「使用」。若召回会强化
+    // 边权，那么一次偶然召回就让那对卡连得更紧，下次更容易一起出现——马太效应，
+    // 与 L29 要求的「不代入其它记忆」正好相反。
+    //
+    // 为什么必须在 engine 层测：`reinforceEdges` 是纯函数、返回新对象，
+    // 所以在 `core/` 层断言「入参数组没变」**即使接了线也依然绿**。
+    // 真正能发现问题的是「库里的边权/边数有没有变」，那需要真实 store + 日志。
+    const dir = tempDir()
+    const config = makeConfig({
+      spread: { enabled: true, plasticityEnabled: true },
+    })
+    const store = openStore({ dataDir: dir, config })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+
+    // 写两条共享实体的卡。`same-entity` 边的产出条件是「实体集有交集」，
+    // 而 `extractEntities` 只认四类：文件路径、URL、驼峰/下划线标识符、
+    // 引号内专名。所以这里必须用**引号专名**才能真的抽出实体——
+    // 写「DSH」「Cordis」这类普通单词是抽不出来的，entities 会是空数组，
+    // 边一条都不会产出，而「边权没变」的断言会**空绿**。
+    // 这个坑是写这条测试时踩到的：第一版没加前提断言，看起来是绿的。
+    // 两个实体只部分重叠（共享 CordisPlugin，各自另有专名），这样边权 = 1/3 < 1，
+    // 可塑性一旦接线就**必然**改变它。若两卡实体完全相同，边权就是 1（已在上限），
+    // 强化成了 no-op，这条测试又会空绿——这是第二层坑。
+    const first = engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」的版本用「ThreePointTwo」', at: T0,
+    }))
+    const second = engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」需要重新构建，因为「BuildScript」有问题',
+      turn: 2, at: T0 + 1000,
+    }))
+    // 前提一：两张卡都真的写进去了（写入过滤会丢掉「不重要」的句子）。
+    assert.ok(first.written > 0 && second.written > 0, '前提：两句话都必须入库')
+    engine.consolidate(T0 + 2000)
+
+    // 前提断言：必须真的有边，否则后面「边权没变」是空绿。
+    const edgesBefore = store.allEdges()
+    assert.ok(edgesBefore.length > 0, '前提：夜整理必须产出边，否则本用例无效')
+
+    // 前提二：边权必须 < 1。等于上限时强化是 no-op，「边权没变」会空绿。
+    assert.ok(
+      edgesBefore.every((e) => e.weight < 1),
+      `前提：边权必须小于上限，否则强化天然是 no-op（实际 ${edgesBefore.map((e) => e.weight).join(',')}）`,
+    )
+    const weightsBefore = edgesBefore.map((e) => [e.id, e.weight] as const)
+
+    // 反复召回：若可塑性被接进召回链路，这里就会改边权。
+    for (let index = 0; index < 5; index += 1) engine.recall('项目 alpha 构建配置')
+
+    const edgesAfter = store.allEdges()
+    assert.equal(edgesAfter.length, edgesBefore.length, '召回不得新增或删除边')
+    const weightsAfter = edgesAfter.map((e) => [e.id, e.weight] as const)
+    assert.deepEqual(weightsAfter, weightsBefore, '召回不得改动任何边权')
+    store.close()
+  })
+})
