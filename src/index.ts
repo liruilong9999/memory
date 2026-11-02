@@ -524,6 +524,13 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     // FR-B4「可解释」：`ScoredCard.explain` 一直算出来了却没有任何出口，
     // 等于「算了但没暴露」。这个子命令把每个候选的分数构成摆出来，
     // 让「为什么想起这张卡」可以被人核对。
+    //
+    // ⚠️ 交叉引用：离线 CLI `src/cli/memoryctl.ts` 的 `renderRecall` 与本分支
+    // 输出格式**必须逐行保持一致**（「焦点包 N 张，候选 M 张」→ 空行 → `■ 文本`
+    // → 两空格缩进的「总分 X（有冲突）」→ 两空格缩进的 explain 各行）。
+    // 两处是刻意的重复实现：本命令吃一个字符串且没有 JSON 出口，
+    // CLI 需要独立出口与退出码。改任何一处都要同步另一处，
+    // 否则同一个库在终端与会话里会看到两种格式。
     const result = engine.recall(trimmed.slice('explain'.length).trim())
     if (result.pack.cards.length === 0) {
       return `没有命中任何记忆（候选 ${result.candidates} 张）`

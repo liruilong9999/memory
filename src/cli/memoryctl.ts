@@ -65,12 +65,21 @@ export const EXIT_USAGE = 2
 export const CLI_NAME = 'memoryctl'
 
 /**
- * 时区回退值。
+ * 时区回退值：**只在前两步都拿不到时区时才用到**。
  *
- * 优先级是「`--tz` 显式指定 → 系统时区 → 本常量」。跟随系统时区是刻意的：
- * 宿主侧（`src/host/adapter.ts` 的 `resolveTimeZone`）用的也是系统时区，
- * CLI 与宿主看同一个库时必须用同一套时间语义，否则「今天整理过没有」会打架。
- * 只有 `Intl` 解析不出来时才退到这个常量。
+ * 为什么 `--tz` 的默认值不是直接写死本常量（虽然需求规格的初稿就是这么写的）：
+ * 宿主侧（`src/host/adapter.ts` 的 `resolveTimeZone`）解析的是**系统时区**。
+ * CLI 与宿主读的是同一个库、同一批 `createdAt`/`dueAt`/`lastConsolidationAt`，
+ * 一旦两边默认时区不同，「今天整理过没有」「距上次会话多久」就会算出两个答案——
+ * 同一个库在终端里说「3 小时前」，在会话里说「昨天」。这种不一致极难排查，
+ * 而且会在跨时区机器上稳定复现。
+ *
+ * 因此取值顺序固定为：
+ * 1. 显式 `--tz <IANA>`（用户说了算，也便于复现 bug）；
+ * 2. 系统时区（与宿主天然一致，这是绝大多数情况）；
+ * 3. 本常量（仅在 `Intl` 拿不到系统时区时兜底，保证永远有一个可用值）。
+ *
+ * 想改回写死：只改 {@link resolveTimeZone} 的第一行，别删这三步。
  */
 export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
@@ -495,7 +504,12 @@ export function readOnlyRecall(
 /**
  * 渲染一次只读召回结果。
  *
- * 格式与 `src/index.ts` 的 `/memory explain` 逐行对齐。
+ * ⚠️ 交叉引用：`src/index.ts` 里 `/memory explain` 分支的渲染逻辑与本函数
+ * 输出格式**必须逐行保持一致**（「焦点包 N 张，候选 M 张」→ 空行 → `■ 文本`
+ * → 两空格缩进的「总分 X（有冲突）」→ 两空格缩进的 explain 各行）。
+ * 这是两份实现（宿主命令吃字符串且没有 JSON 模式，CLI 需要独立出口与退出码），
+ * 改任何一处都要同步另一处，否则同一个库在终端与会话里看到两种格式。
+ * 收敛为单一实现的计划见 `docs/5-起源对照审查.md` 遗留项，当前刻意不动。
  *
  * @param pack - 焦点包。
  * @param candidates - 候选池大小。
