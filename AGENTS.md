@@ -61,6 +61,40 @@ pnpm cli --help    # 离线命令行
 2. `pnpm test` 全绿
 3. 新增行为有对应单测
 4. 仓库有 `.codegraph/` 时执行一次 `codegraph sync`
+5. **在干净 HEAD 上再验一次**（见下）
+
+### 为什么必须在干净 HEAD 上验（血的教训）
+
+`pnpm typecheck` 在工作区跑绿，**只证明工作区绿，不证明 HEAD 绿**。
+这两件事曾被混为一谈，代价是 `907afe9` 这个提交点**编译不过**却没被发现：
+
+```text
+src/core/scoring.ts(488,10): error TS2678:
+  Type '"summary"' is not comparable to type 'MemoryKind'.
+```
+
+根因是一个改动的两半被劈开：`907afe9` 收了 `scoring.ts` 的 `case 'summary'`
+（该文件在提交者写范围内，合理），但定义 `MemoryKind` 的 `types.ts` 留在
+另一人的工作区。于是**提交点自相矛盾，而两个人的工作区都是绿的**。
+
+这不是编码错误，是**多人并行 + 按写范围分别提交**的必然产物。只要还在
+多人协作，就必须有这一步：
+
+```bash
+git worktree add .tmp/verify HEAD --detach
+cd .tmp/verify && ln -s ../../node_modules node_modules
+npx tsc -p tsconfig.json --noEmit && pnpm test
+cd ../.. && git worktree remove .tmp/verify --force
+```
+
+**用 `git worktree` 而不是 `git stash`**：`stash` 会把你和别人正在写的
+未提交文件一起收走，`pop` 时若冲突就是二次事故；`worktree` 完全隔离，
+不碰任何人的工作区。
+
+> 更深一层的教训：这一轮反复在修「看起来对、实际不对」的问题（测试替实现
+> 打掩护、靠运气绿、缺陷伪装成改进），而这次是**验证本身伪装成验证**——
+> 我跑了一个绿的命令，就以为验证过了。**问「我验的是哪个东西」和问
+> 「它绿的时候说明什么」一样重要。**
 
 ## 五、Git 规范
 
