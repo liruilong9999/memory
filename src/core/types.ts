@@ -384,6 +384,10 @@ export interface ConsolidationReport {
   decayed: number
   /** 归档的卡数。 */
   archived: number
+  /** 新产出的摘要卡数（日 + 周 + 月，FR-D4 / 起源 L27）。 */
+  summarized: number
+  /** 新蒸馏出的感受卡数（起源 L11）。 */
+  distilled: number
   /** 重建的索引条数。 */
   reindexed: number
   /** 人可读的变更摘要行。 */

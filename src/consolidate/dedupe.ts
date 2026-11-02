@@ -101,6 +101,15 @@ export function sortByAge(cards: readonly MemoryCard[]): MemoryCard[] {
  * 只考虑 `active` 且未被合并过的卡：已归档的卡不再参与整理，
  * 已被合并掉的卡（`mergedInto` 有值）已经是作废视图。
  *
+ * **摘要卡不参与去重**（`kind === 'summary'`）。这不是优化，是必须：
+ * 摘要卡的文本是模板化统计句（`2023-11-15：7 条记忆，主要涉及工作，关键词 …`），
+ * 任意两天的日摘要字面相似度极高，会被判成重复卡合并掉——于是「每天一张
+ * 日摘要」在去重之后只剩一张，跨周期层级压缩被自己的去重逻辑毁掉。
+ * 实测：两天的日摘要确实进了同一分组。
+ *
+ * 也不能靠调高 `duplicateSimilarity` 绕开：那会同时放过真正的重复事件卡。
+ * 摘要卡的重复性由 `buildCardId`（日期键进 id）保证，本就不需要文本去重。
+ *
  * @param cards - 候选卡（通常是本轮工作集）。
  * @param config - 完整配置。
  * @returns 分组列表，只含成员 ≥ 2 的组；按组内最早卡的年龄排序。
@@ -108,7 +117,12 @@ export function sortByAge(cards: readonly MemoryCard[]): MemoryCard[] {
 export function findDuplicateGroups(
   cards: readonly MemoryCard[], config: MemoryConfig,
 ): DuplicateGroup[] {
-  const pool = sortByAge(cards.filter((card) => card.status === 'active' && card.mergedInto === undefined))
+  const pool = sortByAge(cards.filter((card) => (
+    card.status === 'active'
+    && card.mergedInto === undefined
+    // 摘要卡按「层级 + 日期键」唯一，文本相似是设计使然，不是重复。
+    && card.kind !== 'summary'
+  )))
   if (pool.length < 2) return []
 
   const threshold = config.dedup.duplicateSimilarity

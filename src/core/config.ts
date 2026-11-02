@@ -132,6 +132,89 @@ export interface ConsolidationPolicy {
   maxCardsPerRun: number
   /** 一次整理中归档比例上限，避免一次性清空。 */
   maxArchiveRatio: number
+
+  /**
+   * 是否产出日 / 周 / 月摘要（FR-D4 / 起源 L27）。
+   *
+   * 起源 L27（第 4 条·渐进累积与夜间整理）：「今日记忆渐进累积，夜晚休眠整理，
+   * 很长时间迭代」。摘要就是「迭代」的载体——一天压成一张，再往上压成周、月，
+   * 层级本身就是长时间迭代的形态。
+   */
+  summaryEnabled: boolean
+  /** 单次整理最多新建几张摘要卡，保证耗时可控（P8）。 */
+  maxSummariesPerRun: number
+  /**
+   * 日摘要文本的字符上限。
+   *
+   * 这个上限是**压缩的强制手段**，不是排版偏好：日摘要如果只是把当天卡片的
+   * 文本拼起来，信息量与原文相等，压缩比 1:1，那就不是压缩而是换了个地方存。
+   * 字符上限让「摘要」在物理上不可能退化成「日志」。
+   */
+  dailySummaryMaxChars: number
+  /** 周摘要文本的字符上限。 */
+  weeklySummaryMaxChars: number
+  /** 月摘要文本的字符上限。 */
+  monthlySummaryMaxChars: number
+  /**
+   * 摘要相对来源的目标压缩比（0..1）。
+   *
+   * 这是压缩的**算术闸门**：摘要字符数不超过「来源总字符数 × 该比例」。
+   * 有了它，「摘要比原文短」就是算出来的必然结果，而不是靠自觉。
+   * 配置层拒绝 `>= 1` 的值——那等于允许摘要不比原文短，压缩就只是名字。
+   */
+  summaryTargetRatio: number
+  /**
+   * 产出摘要所需的最小来源字符数。
+   *
+   * 一天只有一张 20 字的卡时，「摘要」不可能比原文短。硬做出来的东西
+   * 是**假压缩**：比原文长，还多占一条记录。宁可承认这一天不需要压缩。
+   */
+  summaryMinSourceChars: number
+  /**
+   * 上一级摘要所需的最少下级摘要数量。
+   *
+   * 一周只有一天有记录时，周摘要与那天的日摘要内容几乎相同——那不是压缩，
+   * 是复制。层级的意义来自「多个下级被合成一个」，只有一个下级时它不成立。
+   */
+  summaryMinChildren: number
+  /** 摘要卡最多保留的关键实体数。 */
+  summaryMaxEntities: number
+  /** 摘要卡最多保留的关键标签数。 */
+  summaryMaxTags: number
+  /** 摘要里「最值得记住的一件事」的引用字符数，超长截断。 */
+  summaryBriefChars: number
+
+  /**
+   * 是否从事件卡蒸馏感受卡（起源 L11）。
+   *
+   * 起源 L11（无编号·细节会忘）：「其实我们大多数细节都会忘记，只会留下感受。」
+   * 关掉它，系统就只剩「记住细节」这一半能力。
+   */
+  distillEnabled: boolean
+  /**
+   * 触发蒸馏的最低平均情绪强度。
+   *
+   * 低于它说明这一天只是「有事发生」，还谈不上「有感受」——宁可不出感受卡，
+   * 也不要给每一天都硬造一条感受，那会让感受层变成噪声层。
+   */
+  distillMinEmotional: number
+  /** 同一主题至少出现在几张带情绪的卡里，才算「反复经历」。 */
+  distillMinRecurrence: number
+  /**
+   * 主题词项的最小字符数。
+   *
+   * 短词项（单字、高频二元组）在几乎每张卡里都出现，拿它当主题等于没有主题：
+   * 所有卡被聚成同一个桶，蒸馏退化成「今天发生了很多事」。
+   */
+  distillThemeMinChars: number
+  /** 一次整理最多蒸馏出几条感受，防止一天产出过多（P8）。 */
+  distillMaxPerRun: number
+  /** 感受卡文本的字符上限。 */
+  distillMaxChars: number
+  /** 感受卡里引用一个具体例子的字符数，超长截断。 */
+  distillExampleChars: number
+  /** 感受卡指向来源事件卡的 `distills` 边权重（0..1）。 */
+  distillEdgeWeight: number
 }
 
 /** 到期提醒参数（FR-D3 / SC-5 / 起源 L21）。 */
@@ -178,7 +261,7 @@ export interface MemoryConfig {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 2,
+  configVersion: 3,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -241,6 +324,29 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     dailyAt: '03:30',
     maxCardsPerRun: 5000,
     maxArchiveRatio: 0.05,
+    summaryEnabled: true,
+    maxSummariesPerRun: 8,
+    // 一天按 12 张卡算，日摘要 180 字 ≈ 原文的 1/6；上限是压缩的强制手段，
+    // 不是排版偏好（见 ConsolidationPolicy.dailySummaryMaxChars 注释）。
+    dailySummaryMaxChars: 180,
+    weeklySummaryMaxChars: 140,
+    monthlySummaryMaxChars: 110,
+    summaryTargetRatio: 0.5,
+    summaryMinSourceChars: 120,
+    summaryMinChildren: 2,
+    summaryMaxEntities: 6,
+    summaryMaxTags: 6,
+    summaryBriefChars: 40,
+    distillEnabled: true,
+    // 0.28 的含义：至少命中一个中等情绪词、或两个弱信号，才算「有感受」。
+    // 定得再低，日常事务性记录也会被算成感受。
+    distillMinEmotional: 0.28,
+    distillMinRecurrence: 2,
+    distillThemeMinChars: 2,
+    distillMaxPerRun: 3,
+    distillMaxChars: 120,
+    distillExampleChars: 30,
+    distillEdgeWeight: 0.6,
   },
   reminder: {
     enabled: true,
@@ -250,7 +356,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 2
+export const MEMORY_CONFIG_VERSION = 3
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -309,6 +415,47 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   }
 
   if (config.consolidation.maxArchiveRatio > 1) errors.push('consolidation.maxArchiveRatio 必须 ≤ 1')
+  if (config.consolidation.maxSummariesPerRun < 0) {
+    errors.push('consolidation.maxSummariesPerRun 不能为负')
+  }
+  // 摘要字符上限必须 ≥ 1，否则摘要永远为空——那是悄悄关掉摘要功能，不是配置。
+  for (const key of ['dailySummaryMaxChars', 'weeklySummaryMaxChars', 'monthlySummaryMaxChars'] as const) {
+    if (config.consolidation[key] < 1) errors.push(`consolidation.${key} 必须 ≥ 1`)
+  }
+  // 层级越往上，摘要必须越短。这条校验是「层级压缩」的守门人：
+  // 若周摘要比日摘要还长，「压缩」就只是名字，信息量并没有减少。
+  if (config.consolidation.weeklySummaryMaxChars > config.consolidation.dailySummaryMaxChars) {
+    errors.push('consolidation.weeklySummaryMaxChars 不应大于 dailySummaryMaxChars（层级越高应越短）')
+  }
+  if (config.consolidation.monthlySummaryMaxChars > config.consolidation.weeklySummaryMaxChars) {
+    errors.push('consolidation.monthlySummaryMaxChars 不应大于 weeklySummaryMaxChars（层级越高应越短）')
+  }
+  inUnit('consolidation.distillMinEmotional', config.consolidation.distillMinEmotional)
+  inUnit('consolidation.distillEdgeWeight', config.consolidation.distillEdgeWeight)
+  inUnit('consolidation.summaryTargetRatio', config.consolidation.summaryTargetRatio)
+  // 压缩比必须严格小于 1：等于 1 允许「摘要与原文一样长」，大于 1 允许更长，
+  // 两者都让「压缩」变成纯命名。这条校验是假压缩的最后一道门。
+  if (config.consolidation.summaryTargetRatio >= 1) {
+    errors.push('consolidation.summaryTargetRatio 必须 < 1（否则允许产出不比原文短的「摘要」）')
+  }
+  if (config.consolidation.summaryMinSourceChars < 1) {
+    errors.push('consolidation.summaryMinSourceChars 必须 ≥ 1')
+  }
+  if (config.consolidation.summaryMinChildren < 2) {
+    errors.push('consolidation.summaryMinChildren 必须 ≥ 2（只有一个下级时是复制不是压缩）')
+  }
+  if (config.consolidation.summaryMaxEntities < 0) {
+    errors.push('consolidation.summaryMaxEntities 不能为负')
+  }
+  if (config.consolidation.distillMinRecurrence < 1) {
+    errors.push('consolidation.distillMinRecurrence 必须 ≥ 1')
+  }
+  if (config.consolidation.distillThemeMinChars < 1) {
+    errors.push('consolidation.distillThemeMinChars 必须 ≥ 1')
+  }
+  if (config.consolidation.distillMaxPerRun < 0) errors.push('consolidation.distillMaxPerRun 不能为负')
+  if (config.consolidation.distillMaxChars < 1) errors.push('consolidation.distillMaxChars 必须 ≥ 1')
+  if (config.consolidation.distillExampleChars < 1) errors.push('consolidation.distillExampleChars 必须 ≥ 1')
   if (!/^\d{2}:\d{2}$/u.test(config.consolidation.dailyAt)) {
     errors.push('consolidation.dailyAt 必须是 HH:mm 形式')
   }

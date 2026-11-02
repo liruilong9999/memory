@@ -184,6 +184,34 @@ describe('findDuplicateGroups 重复分组', () => {
     assert.equal(findDuplicateGroups(cards, strict).length, 0)
     assert.equal(findDuplicateGroups(cards, loose).length, 1)
   })
+
+  it('摘要卡不参与去重（否则每天一张日摘要会被合并成一张）', () => {
+    const config = makeConfig()
+    // 两天的日摘要文本只差日期，字面相似度极高——若参与去重必然被判重复。
+    const day1 = makeCard({
+      id: 's1', kind: 'summary', text: '2023-11-15：7 条记忆，主要涉及工作，关键词 摘要、压缩',
+    })
+    const day2 = makeCard({
+      id: 's2', kind: 'summary', text: '2023-11-16：7 条记忆，主要涉及工作，关键词 摘要、压缩',
+    })
+    // 前提断言：这两张卡若参与去重，相似度确实超标——防止将来阈值改动
+    // 让本用例变成「因为不够像所以不合并」，从而失去意义。
+    assert.ok(
+      cardSimilarity(day1, day2) >= config.dedup.duplicateSimilarity,
+      `前提不成立：相似度 ${cardSimilarity(day1, day2)} 未达阈值 ${config.dedup.duplicateSimilarity}`,
+    )
+    assert.equal(
+      findDuplicateGroups([day1, day2], config).length, 0,
+      '摘要卡必须被排除在去重之外',
+    )
+  })
+
+  it('摘要卡与事件卡之间也不做去重', () => {
+    const config = makeConfig()
+    const summary = makeCard({ id: 's1', kind: 'summary', text: '2023-11-15：7 条记忆，关键词 摘要、压缩' })
+    const event = makeCard({ id: 'e1', kind: 'event', text: '2023-11-15：7 条记忆，关键词 摘要、压缩' })
+    assert.equal(findDuplicateGroups([summary, event], config).length, 0)
+  })
 })
 
 describe('mergeGroup 合并', () => {

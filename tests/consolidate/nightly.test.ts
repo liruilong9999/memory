@@ -12,11 +12,22 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { runConsolidation } from '../../src/consolidate/nightly.ts'
+import { decayCard } from '../../src/consolidate/decay.ts'
+import { releaseExpiredDue } from '../../src/consolidate/archive.ts'
 import { applyRecord, createEmptyState } from '../../src/store/state.ts'
 import type { JournalOp, MemoryCard } from '../../src/core/types.ts'
 import { DAY_MS, makeCard, makeConfig } from './fixtures.ts'
 
 const T0 = 1_700_000_000_000
+
+/**
+ * 测试统一使用的时区。
+ *
+ * 刻意用东八区而不是 `'UTC'`：自然日边界（FR-D4）在 UTC 下与东八区不同，
+ * 用 UTC 测出来的「一天」在东八区用户眼里是错的，而测试仍然会绿。
+ * 用真实时区测，边界才真的被验证过。
+ */
+const TZ = 'Asia/Shanghai'
 
 /**
  * 把操作序列应用到卡片数组上，模拟数据面重放。
@@ -58,7 +69,7 @@ describe('runConsolidation 开关与空输入', () => {
   it('开关关闭时不做任何变更，但仍给出可读报告', () => {
     const config = makeConfig({ consolidation: { enabled: false } })
     const cards = [makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.equal(result.ops.length, 0)
     assert.equal(result.report.merged, 0)
     assert.equal(result.report.archived, 0)
@@ -67,7 +78,7 @@ describe('runConsolidation 开关与空输入', () => {
   })
 
   it('空库整理不抛错，报告可读', () => {
-    const result = runConsolidation({ cards: [] }, makeConfig(), T0)
+    const result = runConsolidation({ cards: [] }, makeConfig(), T0, TZ)
     assert.equal(result.ops.length, 0)
     assert.equal(result.report.beforeActive, 0)
     assert.equal(result.report.afterActive, 0)
@@ -76,12 +87,12 @@ describe('runConsolidation 开关与空输入', () => {
 
   it('接受 MemoryState 形态的 Map 输入', () => {
     const cards = new Map([['a', makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 })]])
-    const result = runConsolidation({ cards }, makeConfig(), T0)
+    const result = runConsolidation({ cards }, makeConfig(), T0, TZ)
     assert.equal(result.report.beforeActive, 1)
   })
 
   it('缺省 edges 视为空', () => {
-    const result = runConsolidation({ cards: [] }, makeConfig(), T0)
+    const result = runConsolidation({ cards: [] }, makeConfig(), T0, TZ)
     assert.deepEqual(result.edges, [])
   })
 })
@@ -93,7 +104,7 @@ describe('runConsolidation 衰减（FR-C4）', () => {
       id: 'a', text: '部署走 CI', createdAt: T0, updatedAt: T0,
       lastAccessAt: null, strength: 1, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 60 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 60 * DAY_MS, TZ)
     const puts = result.ops.filter((op) => op.op === 'put')
     assert.equal(puts.length, 1)
     assert.ok(result.report.decayed >= 1)
@@ -101,7 +112,7 @@ describe('runConsolidation 衰减（FR-C4）', () => {
 
   it('刚写入的卡不产生衰减操作', () => {
     const cards = [makeCard({ id: 'a', text: '部署走 CI', createdAt: T0, updatedAt: T0, strength: 1 })]
-    const result = runConsolidation({ cards }, makeConfig(), T0)
+    const result = runConsolidation({ cards }, makeConfig(), T0, TZ)
     assert.equal(result.ops.filter((op) => op.op === 'put').length, 0)
     assert.equal(result.report.decayed, 0)
   })
@@ -117,7 +128,7 @@ describe('runConsolidation 衰减（FR-C4）', () => {
       id: 'intense', text: '部署走 CI 乙', createdAt: T0, updatedAt: T0,
       lastAccessAt: null, strength: 1, emotional: 1, accessCount: 0,
     })
-    const result = runConsolidation({ cards: [calm, intense] }, config, at)
+    const result = runConsolidation({ cards: [calm, intense] }, config, at, TZ)
     const map = replay([calm, intense], result.ops)
     const calmStrength = map.get('calm')?.strength ?? 1
     const intenseStrength = map.get('intense')?.strength ?? 1
@@ -126,7 +137,7 @@ describe('runConsolidation 衰减（FR-C4）', () => {
 
   it('过期到期时刻在整理时被清掉', () => {
     const cards = [makeCard({ id: 'a', text: '提醒我交报告', dueAt: T0, createdAt: T0 })]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     const map = replay(cards, result.ops)
     assert.equal(map.get('a')?.dueAt, null)
   })
@@ -139,7 +150,7 @@ describe('runConsolidation 去重合并（FR-C1）', () => {
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, config, T0 + DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + DAY_MS, TZ)
     const mergeOps = result.ops.filter((op) => op.op === 'merge')
     assert.equal(mergeOps.length, 1)
     assert.equal(result.report.merged, 1)
@@ -154,7 +165,7 @@ describe('runConsolidation 去重合并（FR-C1）', () => {
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     assert.ok(result.report.afterActive < result.report.beforeActive)
   })
 
@@ -163,7 +174,7 @@ describe('runConsolidation 去重合并（FR-C1）', () => {
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     const merged = [...replay(cards, result.ops).values()].find((card) => card.id === 'a')
     assert.deepEqual(merged?.mergeOf, ['b'])
   })
@@ -173,7 +184,7 @@ describe('runConsolidation 去重合并（FR-C1）', () => {
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
       makeCard({ id: 'b', text: '今天天气不错适合散步', createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     assert.equal(result.report.merged, 0)
   })
 })
@@ -190,7 +201,7 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
       id: 'a', text: '部署走 CI 甲', kind: 'event', createdAt: T0, updatedAt: T0,
       lastAccessAt: null, strength: 0.1, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.ok(result.report.archived >= 1)
     assert.equal(replay(cards, result.ops).get('a')?.status, 'archived')
   })
@@ -202,7 +213,7 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
       createdAt: T0, updatedAt: T0, lastAccessAt: null,
       strength: 0.01, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.equal(result.report.archived, 0)
     assert.equal(replay(cards, result.ops).get('a')?.status, 'active')
   })
@@ -214,7 +225,7 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
       createdAt: T0, updatedAt: T0, lastAccessAt: null,
       strength: 0.01, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.equal(result.report.archived, 0)
   })
 
@@ -227,7 +238,7 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
       id: `c${index}`, kind: 'event', createdAt: T0 + index, updatedAt: T0 + index,
       lastAccessAt: null, strength: 0.01, emotional: 0, accessCount: 0,
     }))
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     // 上限 = floor(20 × 0.1) = 2
     assert.equal(result.report.archived, 2)
   })
@@ -241,11 +252,15 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
       id: 'a', kind: 'event', createdAt: T0, updatedAt: T0, lastAccessAt: null,
       strength: 0.1, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     const archived = replay(cards, result.ops).get('a')
     assert.equal(archived?.status, 'archived')
-    // 归档动作本身不打折；归档前的那点强度是衰减算出来的，与归档无关。
-    assert.equal(archived?.strength, archived?.strength)
+    // 归档动作本身不打折：归档后的强度必须**严格等于**纯衰减算出来的值。
+    // 早期这里写的是 `assert.equal(archived?.strength, archived?.strength)`——
+    // 自己等于自己，永远为真，等于什么都没验证。真正的判据是「归档这一步
+    // 没有额外乘任何系数」，所以拿独立算出的衰减值来比。
+    const decayedOnly = decayCard(releaseExpiredDue(cards[0]!, T0 + 30 * DAY_MS), T0 + 30 * DAY_MS, config)
+    assert.equal(archived?.strength, decayedOnly.strength)
     assert.ok((archived?.strength ?? 0) > 0)
   })
 
@@ -264,7 +279,7 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
         updatedAt: T0 + DAY_MS, lastAccessAt: null, strength: 0.01, emotional: 0, accessCount: 0,
       }),
     ]
-    const result = runConsolidation({ cards }, config, T0 + 2 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 2 * DAY_MS, TZ)
     const archiveOps = result.ops.filter((op) => op.op === 'archive')
     assert.ok(archiveOps.every((op) => op.op !== 'archive' || op.id !== 'b'))
   })
@@ -276,7 +291,7 @@ describe('runConsolidation 连边（FR-C1 重建索引）', () => {
       makeCard({ id: 'a', text: '部署脚本在 build.sh', entities: ['build.sh'], createdAt: T0 }),
       makeCard({ id: 'b', text: 'build.sh 需要加执行权限', entities: ['build.sh'], createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     assert.ok(result.ops.some((op) => op.op === 'edge'))
     assert.ok(result.edges.length > 0)
   })
@@ -287,8 +302,8 @@ describe('runConsolidation 连边（FR-C1 重建索引）', () => {
       makeCard({ id: 'a', text: '部署脚本在 build.sh', entities: ['build.sh'], createdAt: T0 }),
       makeCard({ id: 'b', text: 'build.sh 需要加执行权限', entities: ['build.sh'], createdAt: T0 + DAY_MS }),
     ]
-    const first = runConsolidation({ cards }, config, T0 + DAY_MS)
-    const second = runConsolidation({ cards, edges: first.edges }, config, T0 + DAY_MS)
+    const first = runConsolidation({ cards }, config, T0 + DAY_MS, TZ)
+    const second = runConsolidation({ cards, edges: first.edges }, config, T0 + DAY_MS, TZ)
     assert.equal(second.ops.filter((op) => op.op === 'edge').length, 0)
   })
 })
@@ -300,7 +315,7 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
       id: `c${index}`, createdAt: T0 + index, updatedAt: T0 + index,
       lastAccessAt: null, strength: 1, emotional: 0, accessCount: 0,
     }))
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.ok(result.report.notes.some((note) => note.includes('顺延')))
   })
 
@@ -311,8 +326,8 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
       makeCard({ id: 'b', text: '部署走 CI 流水线', entities: ['build.sh'], createdAt: T0 + DAY_MS }),
       makeCard({ id: 'c', text: '数据库迁移用 Alembic', createdAt: T0 + 2 * DAY_MS }),
     ]
-    const first = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
-    const second = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const first = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
+    const second = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     assert.deepEqual(first.ops, second.ops)
     assert.deepEqual(first.report, second.report)
   })
@@ -322,14 +337,14 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     assert.equal(result.report.beforeActive, 2)
     assert.equal(result.report.afterActive, 1)
   })
 
   it('报告包含人可读的变更摘要（FR-C1）', () => {
     const cards = [makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 })]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS, TZ)
     assert.ok(result.report.notes[0]?.includes('夜整理完成'))
   })
 
@@ -338,14 +353,14 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
       makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 }),
       makeCard({ id: 'b', text: '今天天气不错', createdAt: T0 }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0)
+    const result = runConsolidation({ cards }, makeConfig(), T0, TZ)
     assert.equal(result.cards.length, 2)
   })
 
   it('不修改入参卡片（纯函数）', () => {
     const cards = [makeCard({ id: 'a', text: '部署走 CI', createdAt: T0, strength: 1 })]
     const snapshot = { ...cards[0]! }
-    runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS)
+    runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS, TZ)
     assert.deepEqual(cards[0], snapshot)
   })
 })
@@ -364,7 +379,7 @@ describe('runConsolidation 返回值与重放一致（P2 事件日志是唯一�
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS, strength: 0.1, lastAccessAt: null }),
       makeCard({ id: 'c', text: '数据库迁移用 Alembic', createdAt: T0, updatedAt: T0, strength: 1, lastAccessAt: null }),
     ]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     const replayed = replayState(cards, result.ops)
     const returned = new Map(result.cards.map((card) => [card.id, card]))
     assert.deepEqual([...returned.keys()].sort(), [...replayed.cards.keys()].sort())
@@ -378,7 +393,7 @@ describe('runConsolidation 返回值与重放一致（P2 事件日志是唯一�
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0, updatedAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     const victim = result.cards.find((card) => card.id === 'b')
     assert.equal(victim?.mergedInto, 'a')
     assert.equal(victim?.status, 'archived', '被合并的卡必须作废，否则它还会被召回')
@@ -392,7 +407,7 @@ describe('runConsolidation 返回值与重放一致（P2 事件日志是唯一�
       makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0, updatedAt: T0 }),
       makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS }),
     ]
-    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
     const replayed = replayState(cards, result.ops)
     assert.deepEqual(
       result.edges.map((edge) => edge.id).sort(),
@@ -410,7 +425,7 @@ describe('runConsolidation 返回值与重放一致（P2 事件日志是唯一�
       id: 'a', kind: 'event', createdAt: T0, updatedAt: T0, lastAccessAt: null,
       strength: 0.1, emotional: 0, accessCount: 0,
     })]
-    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS, TZ)
     const archived = result.cards.find((card) => card.id === 'a')
     assert.equal(archived?.status, 'archived')
     // 强度只由衰减决定（decay 之后的值），归档动作不再乘任何系数。

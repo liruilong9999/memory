@@ -15,28 +15,17 @@
  * 边 id 用 {@link buildEdgeId} 派生，因此「同起点 + 同终点 + 同关系」天然只有一条边，
  * 反复整理不会产生重复边（ST-2 幂等）。
  *
+ * 边对象本身的构造（id 派生、边权稳定化）不在这里，而在 `src/core/graph.ts`——
+ * 那是契约级的规则，数据面（`src/store/state.ts` 重放 `merge` 时自动建
+ * `supersedes` 边）也要用同一份，不能各写一遍。
+ *
  * @module dsh-memory/consolidate/graph
  */
 
-import type { EdgeRelation, MemoryCard, MemoryEdge } from '../core/types.ts'
-import { buildEdgeId } from '../core/types.ts'
+import type { MemoryCard, MemoryEdge } from '../core/types.ts'
 import type { MemoryConfig } from '../core/config.ts'
+import { makeEdge } from '../core/graph.ts'
 import { jaccard, normalizeText, tokenSet } from '../core/text.ts'
-import { clamp01 } from './decay.ts'
-
-/**
- * 把数值压到两位小数的确定值，用于边权。
- *
- * 为什么做这一步：浮点运算的末位在不同 V8 版本 / 不同求和顺序下可能抖动，
- * 而边权会写进日志、参与打分。先四舍五入到两位小数，能让「同样输入同样输出」
- * 在跨版本重放时也成立（ST-1）。
- *
- * @param value - 原始数值。
- * @returns 0..1 之间、精度为 0.01 的数值。
- */
-function stableWeight(value: number): number {
-  return Math.round(clamp01(value) * 100) / 100
-}
 
 /**
  * 实体的归一化键。
@@ -65,22 +54,6 @@ function entityKeysOf(card: MemoryCard): Set<string> {
     if (key.length > 0) keys.add(key)
   }
   return keys
-}
-
-/**
- * 构造一条边，边权做稳定化处理。
- *
- * @param from - 起点卡 id。
- * @param to - 终点卡 id。
- * @param relation - 边语义。
- * @param weight - 原始边权。
- * @param now - 建立时刻。
- * @returns 新的边对象。
- */
-function makeEdge(
-  from: string, to: string, relation: EdgeRelation, weight: number, now: number,
-): MemoryEdge {
-  return { id: buildEdgeId(from, to, relation), from, to, relation, weight: stableWeight(weight), createdAt: now }
 }
 
 /**

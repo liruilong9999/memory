@@ -19,6 +19,9 @@ import type { ConsolidationReport, JournalOp, MemoryCard, MemoryEdge } from '../
 import type { MemoryConfig } from '../core/config.ts'
 import { truncate } from '../core/text.ts'
 import { applyRecord, createEmptyState } from '../store/state.ts'
+import { distillFeelings, feelingToCard } from '../core/distill.ts'
+import { distillEdges } from '../core/graph.ts'
+import { buildSummaries } from './summarize.ts'
 import { decayCard } from './decay.ts'
 import { findDuplicateGroups, mergeGroup, sortByAge } from './dedupe.ts'
 import { applyArchiveRatio, releaseExpiredDue, shouldArchive } from './archive.ts'
@@ -127,10 +130,14 @@ function mergeNote(merged: MemoryCard, absorbed: readonly MemoryCard[]): string 
  * @param state - 输入状态。
  * @param config - 完整配置。
  * @param now - 整理时刻（毫秒时间戳），由调用方传入。
+ * @param timeZone - IANA 时区名（如 `Asia/Shanghai`），**必填、无默认值**。
+ *   自然日的边界由它定义（FR-D4）：东八区用户的「今天」与 UTC 的「今天」
+ *   相差 8 小时，默认成 `'UTC'` 会让每天 08:00 前的记忆被算进前一天，
+ *   而且**悄无声息**。给静默错误发通行证，比让调用方编译不过糟糕得多。
  * @returns 报告 + 待写入操作 + 整理后的卡与边。
  */
 export function runConsolidation(
-  state: ConsolidationInput, config: MemoryConfig, now: number,
+  state: ConsolidationInput, config: MemoryConfig, now: number, timeZone: string,
 ): ConsolidationResult {
   const notes: string[] = []
   const ops: JournalOp[] = []
@@ -175,6 +182,8 @@ export function runConsolidation(
         merged: 0,
         decayed: 0,
         archived: 0,
+        summarized: 0,
+        distilled: 0,
         reindexed: 0,
         notes,
       },
@@ -202,7 +211,45 @@ export function runConsolidation(
     decayedCards.push(settled)
   }
 
-  // 三、去重合并。
+  // 三、感受蒸馏（起源 L11 / FR-C5）：从「有情绪的事件」里提炼感受卡。
+  //
+  // **必须排在去重之前**，这是一个实测出来的顺序约束，不是风格偏好：
+  // 「反复经历」的证据是「多张卡共享同一主题」。而夜整理的去重会把高度相似的
+  // 卡合并成一张——三张「上线又出问题」的卡在去重后只剩一张，
+  // `distillMinRecurrence = 2` 就永远达不到，感受层从此一条都产不出来。
+  // 曾在去重之后接蒸馏，端到端测试直接暴露 `distilled = 0`。
+  //
+  // 顺序上的代价是：刚产出的感受卡会进入后续的去重候选池。这没有害处——
+  // 感受卡的文本是「反复牵动情绪」的模板句，与来源事件卡的字面相似度很低，
+  // 达不到 `duplicateSimilarity`。若将来调低该阈值，需重新审视这条顺序。
+  let distilled = 0
+  if (config.consolidation.distillEnabled) {
+    const drafts = distillFeelings(decayedCards, config)
+    for (const draft of drafts) {
+      const sources = draft.sourceIds
+        .map((id) => replayed.cards.get(id))
+        .filter((card): card is MemoryCard => card !== undefined)
+      if (sources.length === 0) continue
+      const feeling = feelingToCard(draft, sources, now, config)
+      // 已存在就跳过：`put` 覆盖会重置 createdAt/strength，等于每次整理
+      // 都让同一条感受「变新」，遗忘曲线永远不推进。
+      if (replayed.cards.has(feeling.id)) continue
+      emit({ op: 'put', card: feeling })
+      // `distills` 边：感受指向来源事件卡。这是七种边里第一个有真实产出的
+      // 语义（起源 L15「跨层次关联」：感受层连回事件层）。
+      const edgesOfFeeling = distillEdges(
+        feeling.id, sources.map((card) => card.id), config.consolidation.distillEdgeWeight, now,
+      )
+      for (const edge of edgesOfFeeling) {
+        if (replayed.edges.has(edge.id)) continue
+        emit({ op: 'edge', edge })
+      }
+      distilled += 1
+      notes.push(`蒸馏出感受「${brief(feeling.text)}」，连回 ${sources.length} 张来源卡`)
+    }
+  }
+
+  // 四、去重合并。
   const groups = findDuplicateGroups(decayedCards, config)
   const absorbedIds = new Set<string>()
   for (const group of groups) {
@@ -216,7 +263,32 @@ export function runConsolidation(
     notes.push(mergeNote(merged, absorbed))
   }
 
-  // 四、归档：候选必须排除刚被合并掉的卡。
+  // 五、摘要与层级压缩（FR-D4 / 起源 L27）：事件 → 日 → 周 → 月。
+  //
+  // 排在归档之前：被归档的卡不该再进入当天的摘要——归档的语义是
+  // 「这段记忆已经不重要了」，把它算进「今天发生了什么」是自相矛盾。
+  // 排在蒸馏之后：日摘要要能把刚蒸馏出的感受也统计进去，否则
+  // 「今天的感受」在日摘要里永远缺席。
+  let summarized = 0
+  if (config.consolidation.summaryEnabled) {
+    const liveNow = [...replayed.cards.values()].filter(isLive)
+    const batch = buildSummaries(liveNow, replayed.cards, now, timeZone, config)
+    // 顺序固定为日 → 周 → 月：上层摘要的输入是本轮刚产出的下层摘要，
+    // 顺序错了周摘要就会少算这一天。
+    for (const summary of [...batch.dailies, ...batch.weeklies, ...batch.monthlies]) {
+      if (replayed.cards.has(summary.id)) continue
+      emit({ op: 'put', card: summary })
+      summarized += 1
+    }
+    if (summarized > 0) {
+      notes.push(
+        `产出摘要 ${summarized} 张（日 ${batch.dailies.length}、`
+        + `周 ${batch.weeklies.length}、月 ${batch.monthlies.length}）`,
+      )
+    }
+  }
+
+  // 六、归档：候选必须排除刚被合并掉的卡。
   const archiveCandidates: MemoryCard[] = []
   for (const card of decayedCards) {
     if (absorbedIds.has(card.id)) continue
@@ -233,19 +305,21 @@ export function runConsolidation(
     emit({ op: 'archive', id: card.id, at: now, reason: '强度低于归档阈值（夜整理自动归档）' })
   }
 
-  // 五、连边：基于整理后的活跃卡重建图谱，只补尚不存在的边。
+  // 七、连边：基于整理后的活跃卡重建图谱，只补尚不存在的边。
   const activeAfter = [...replayed.cards.values()].filter(isLive)
   const knownEdgeIds = new Set(replayed.edges.keys())
   const freshEdges = buildEdges(activeAfter, config, now).filter((edge) => !knownEdgeIds.has(edge.id))
   for (const edge of freshEdges) emit({ op: 'edge', edge })
   const edges = [...replayed.edges.values()]
 
-  // 六、汇总报告（FR-C1：每次整理必须有一份可读报告）。
+  // 八、汇总报告（FR-C1：每次整理必须有一份可读报告）。
   const afterActive = activeAfter.length
   notes.unshift(
     `夜整理完成：活跃卡 ${beforeActive} → ${afterActive}，合并 ${groups.length} 组重复卡，`
     + `衰减 ${decayed} 张，归档 ${toArchive.length} 张低强度卡，新增 ${freshEdges.length} 条图谱边`,
   )
+  if (summarized > 0) notes.push(`新增摘要 ${summarized} 张（起源 L27 层级压缩）`)
+  if (distilled > 0) notes.push(`新增感受 ${distilled} 条（起源 L11 细节会忘，只留感受）`)
   if (deferred > 0) {
     notes.push(`本次处理上限 ${limit} 张，尚有 ${deferred} 张顺延到下一次整理`)
   }
@@ -261,6 +335,8 @@ export function runConsolidation(
     merged: groups.length,
     decayed,
     archived: toArchive.length,
+    summarized,
+    distilled,
     // 索引是可丢弃可重建的派生视图（FR-A7）：重建索引 = 为每张活跃卡重新登记。
     reindexed: afterActive,
     notes,
