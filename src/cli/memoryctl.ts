@@ -40,14 +40,12 @@ import { pathToFileURL } from 'node:url'
 import { DEFAULT_CONFIG, validateConfig } from '../core/config.ts'
 import type { MemoryConfig } from '../core/config.ts'
 import { renderFocusPackExplain } from '../core/render.ts'
-import { buildFocusPack, formatTime, makeQuery, scoreCards } from '../core/scoring.ts'
-import type { RecallQuery } from '../core/scoring.ts'
-import type { FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
+import { formatTime } from '../core/scoring.ts'
+import type { MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
 import { MemoryEngine } from '../host/engine.ts'
 import { EXPORT_FORMAT_VERSION } from '../store/export.ts'
 import { openStore } from '../store/store.ts'
 import type { MemoryStore } from '../store/store.ts'
-import { pickDue } from '../time/clock.ts'
 
 /* ------------------------------------------------------------------ *
  * 一、常量与类型
@@ -455,52 +453,19 @@ export function helpText(): string {
  * 五、子命令实现
  * ------------------------------------------------------------------ */
 
-/**
- * 只读召回：组装焦点包，但**绝不写库**。
- *
- * 为什么不直接调 `engine.recall()`：那个方法在返回前会对每张命中卡
- * `append({ op: 'touch', strength: +accessBoost })`——它是给宿主「真的把这批
- * 记忆注入了上下文、即将被模型使用」准备的。CLI 的 `query` 只是运维人员
- * 敲一下看看库里有什么，**没有人会使用这些记忆**，凭什么算「使用」？
- * 若沿用 `engine.recall`，每敲一次查询就悄悄强化那几张卡：`accessCount` 上涨、
- * 半衰期变长、越来越容易被召回——这是富者愈富的马太效应，恰好与
- * 起源 L29（第 5 条·专注当前位置）要求的**抑制**语义相反，等于给 CLI
- * 开了一条无意的数据污染通道。
- *
- * 所以这里只取引擎的**纯函数**部分，候选池的组装规则与 `engine.recall`
- * 逐条对齐（倒排命中 → 已到期 → 钉住），但跳过 `touch` 与 `recallCount += 1`。
- * 附带好处：CLI 不依赖引擎改动，recall-dev 后续把「看到」与「使用」分开时，
- * 这个文件一行都不用动。
- *
- * @param store - 记忆库，只读访问。
- * @param config - 配置，提供候选上限与预算。
- * @param timeZone - 时区，用于构造时间读数。
- * @param queryText - 查询原文。
- * @param now - 当前时刻（毫秒）。
- * @returns 焦点包与候选池大小。
- */
-export function readOnlyRecall(
-  store: MemoryStore, config: MemoryConfig, timeZone: string, queryText: string, now: number,
-): { pack: FocusPack; candidates: number } {
-  const query = makeQuery(queryText, config, now)
-  // 候选池三路来源与 engine.recall 一致，缺一路就会漏掉「该想起的」。
-  const hitIds = new Set(store.search(query.tokens).map((hit) => hit.id))
-  const cards: MemoryCard[] = []
-  for (const id of hitIds) {
-    const card = store.getCard(id)
-    if (card !== undefined && card.status === 'active') cards.push(card)
-  }
-  for (const card of pickDue(store.listCards({ status: 'active' }), now)) {
-    if (!hitIds.has(card.id)) cards.push(card)
-  }
-  for (const card of store.listCards({ status: 'active', pinned: true })) {
-    if (!cards.some((existing) => existing.id === card.id)) cards.push(card)
-  }
-
-  const limited = cards.slice(0, config.recall.candidateLimit)
-  const scored = scoreCards(limited, query, config)
-  return { pack: buildFocusPack(scored, query, config), candidates: limited.length }
-}
+// 只读召回直接用 `engine.peek()`，本文件不再自己拼候选池。
+//
+// 这里原先有一份手写的 `readOnlyRecall`：自己走倒排命中 → 已到期 → 钉住三路
+// 组装候选池，再 `scoreCards` + `buildFocusPack`。当时 `engine.recall` 还会写
+// `touch`，CLI 想只读只能绕开引擎。后来引擎把「看到」与「使用」拆开了——
+// `peek` 纯只读、`confirmRecall` 才写——那份手写实现就变成了纯粹的重复，
+// 而且是会漂移的重复：它的 `candidates` 返回的是 `candidateLimit` 截断后的
+// 数量，`peek` 返回的是完整候选池大小，同一个库在终端与会话里会报出两个
+// 不同的候选数。少一份实现就少一处需要人肉同步的漂移点。
+//
+// 判断依据：`peek` 已在 `src/host/engine.ts` 里提供等价语义，且 CLI 本来就
+// 会构造一个 `MemoryEngine`（export/rebuild/health/consolidate 都要用），
+// 不存在「为了用 peek 额外拉起引擎」的代价。
 
 // 人读渲染统一走 `src/core/render.ts` 的 `renderFocusPackExplain`。
 // 这里原先有一份本地实现，与 `src/index.ts` 的 `/memory explain` 逐行重复，
@@ -510,23 +475,20 @@ export function readOnlyRecall(
 /**
  * `query` 子命令（FR-F2）。
  *
- * 纯只读：不改 `accessCount`、不改 `strength`、不写事件日志，因此
- * 「查一下看看」不会污染记忆库。「使用并强化」需要宿主侧显式确认，
- * 该能力在实现中，CLI 不提供、也不该提供。
+ * 纯只读：走 `engine.peek()`，不改 `accessCount`、不改 `strength`、
+ * 不写事件日志，因此「查一下看看」不会污染记忆库。
+ * 「使用并强化」需要宿主侧显式确认（`engine.confirmRecall`），CLI 不提供、
+ * 也不该提供——运维敲一眼不等于记忆被用过。
  *
  * @param options - 解析后的参数。
- * @param store - 记忆库。
- * @param timeZone - 时区。
- * @param now - 当前时刻（毫秒）。
+ * @param engine - 记忆引擎（只调用其只读入口）。
  * @returns 命令结果。
  */
-function runQuery(
-  options: CliOptions, store: MemoryStore, timeZone: string, now: number,
-): CliResult {
+function runQuery(options: CliOptions, engine: MemoryEngine): CliResult {
   const queryText = options.positionals.join(' ').trim()
   if (queryText.length === 0) return usageFailure('query 需要一个关键词，例如：memoryctl query "部署"')
 
-  const result = readOnlyRecall(store, CLI_CONFIG, timeZone, queryText, now)
+  const result = engine.peek(queryText)
   if (!options.json) {
     return { code: EXIT_OK, stdout: `${renderFocusPackExplain(result.pack, result.candidates)}\n`, stderr: '' }
   }
@@ -760,7 +722,7 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
     })
     switch (options.command) {
       case 'query':
-        result = runQuery(options, store, timeZone, clock())
+        result = runQuery(options, engine)
         break
       case 'export':
         result = runExport(options, store, engine, clock())

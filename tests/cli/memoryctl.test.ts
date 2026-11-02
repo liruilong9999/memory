@@ -17,7 +17,7 @@ import { join } from 'node:path'
 
 import {
   CLI_NAME, EXIT_OK, EXIT_UNHEALTHY, EXIT_USAGE, FALLBACK_TIME_ZONE,
-  healthExitCode, helpText, isValidTimeZone, parseArgs, readOnlyRecall, resolveTimeZone, runCli,
+  healthExitCode, helpText, isValidTimeZone, parseArgs, resolveTimeZone, runCli,
 } from '../../src/cli/memoryctl.ts'
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import { buildCardId } from '../../src/core/types.ts'
@@ -350,20 +350,46 @@ describe('query 是纯只读的（不污染记忆库）', () => {
     assert.deepEqual(pick(), before, 'query 改了访问计数或强度')
   })
 
-  it('对照：宿主的 recall 会写库（证明上一条测试有牙）', () => {
-    // 若把 query 改回 engine.recall，上面三条必然失败。这里显式证明
+  it('对照：宿主的 confirmRecall 会写库（证明上一条测试有牙）', () => {
+    // 若把 query 改回「会写库」的实现，上面三条必然失败。这里显式证明
     // 「写入是能被观测到的」，避免测试因为库根本不落盘而假绿。
+    //
+    // 注意钉的是 `confirmRecall` 而不是 `recall`：引擎已经把「看到」与「使用」
+    // 拆开了，`recall` 现在也是只读的（见下一条测试）。真正会加深记忆强度的
+    // 入口只剩 `confirmRecall` 这一个，拿它当正对照才是当前事实。
     const dir = tempDir()
     seedStore(dir)
     const before = journalSize(dir)
     const store = openStore({ config: DEFAULT_CONFIG, dataDir: dir })
     try {
       const engine = new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock })
-      engine.recall('部署')
+      const pack = engine.peek('部署')
+      assert.ok(pack.pack.cards.length > 0, '得先召回到卡，否则 confirmRecall 无事可确认')
+      const written = engine.confirmRecall(pack.pack.cards.map((scored) => scored.card.id))
+      assert.ok(written > 0, 'confirmRecall 一条都没确认，说明它没写库')
     } finally {
       store.close()
     }
-    assert.ok(journalSize(dir) > before, '宿主 recall 都没写库，那上面「字节数不变」的测试就是假绿')
+    assert.ok(journalSize(dir) > before, '宿主 confirmRecall 都没写库，那上面「字节数不变」的测试就是假绿')
+  })
+
+  it('对照：宿主的 recall 现在也是只读的（不写库）', () => {
+    // 这条与上一条配对，两头堵死：
+    //   confirmRecall 必须写（否则「只读测试」可能因库不落盘而假绿）；
+    //   recall 必须不写（否则「看到」与「使用」的分离又漏回去了）。
+    // 起源 L29（第 5 条·专注当前位置）：被召回只是「看见」，不该加深记忆。
+    const dir = tempDir()
+    seedStore(dir)
+    const before = journalSize(dir)
+    const store = openStore({ config: DEFAULT_CONFIG, dataDir: dir })
+    try {
+      const engine = new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock })
+      const result = engine.recall('部署')
+      assert.ok(result.pack.cards.length > 0, '得先真的召回到东西，否则「没写库」可能只是没干活')
+    } finally {
+      store.close()
+    }
+    assert.equal(journalSize(dir), before, 'engine.recall 竟然写了库：召回只是「看见」，不是「使用」')
   })
 })
 
