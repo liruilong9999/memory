@@ -451,7 +451,21 @@ export function deriveIdempotencyKey(op: JournalOp): string {
     case 'merge':
       return buildIdempotencyKey('merge', op.into.id, op.ids.join(','), String(op.at))
     case 'edge':
-      return buildIdempotencyKey('edge', op.edge.id)
+      // 幂等键必须包含**边权**，否则「更新已有边的权重」会被当成重复写入丢弃。
+      //
+      // 这里曾经只写 `buildIdempotencyKey('edge', op.edge.id)`，后果是：
+      // `putEdge` 用同一个 id 改权重时，派生出的幂等键与上次完全相同，
+      // 数据面判定为重复而**静默丢弃**，读回来还是旧权重。
+      // 探针实测：写入 0.33，再用同 id 写 0.38，`allEdges()` 读回 0.33。
+      //
+      // 为什么这个缺陷一直没被发现：`edge` 的产出点只有夜整理，
+      // 而夜整理只**新建**边、从不修改已存在的边（`knownEdgeIds` 过滤），
+      // 所以幂等键不含权重在当时的调用模式下永远正确。
+      // 直到突触可塑性（FR-G1）需要改边权，这个前提才失效。
+      //
+      // 加入 `weight` 后：新建边仍然幂等（同 id 同权重的重复整理被正确丢弃），
+      // 而改权重是**不同的键**，会作为新记录追加，重放时后者覆盖前者。
+      return buildIdempotencyKey('edge', op.edge.id, String(op.edge.weight))
     case 'purge':
       return buildIdempotencyKey('purge', op.id, String(op.at))
     default:

@@ -346,6 +346,58 @@ describe('幂等键派生', () => {
     assert.equal(second.written, false)
     store.close()
   })
+
+  it('putEdge 改边权必须能落盘（回归：幂等键只看 id 会静默丢弃更新）', () => {
+    // 这是 FR-G1 突触可塑性暴露出来的真缺陷，必须留一条测试守住。
+    //
+    // 缺陷：`deriveIdempotencyKey` 的 `edge` 分支原来只取 `op.edge.id`，
+    // 不含权重。于是「用同一个 id 改权重」派生出的幂等键与上次完全相同，
+    // 数据面判定为重复、**静默丢弃**，读回来还是旧值。
+    // 探针实测：写 0.33，再用同 id 写 0.38，`allEdges()` 读回 0.33。
+    //
+    // 为什么长期没被发现：`edge` 的产出点只有夜整理，而夜整理只**新建**边、
+    // 从不修改已有边（它用 `knownEdgeIds` 过滤掉已存在的），所以「幂等键不含
+    // 权重」在当时的调用模式下永远正确。直到可塑性需要改边权，前提才失效。
+    //
+    // 上面那条用例为什么没抓到：它只用**同一权重**写两次，验证的是「重复被丢弃」，
+    // 而缺陷恰恰在「不同权重也被当成重复」。**只测「该丢弃的丢弃」、
+    // 不测「该更新的更新」，缺陷就能从中间溜过去。**
+    const store = openStore({ config: makeConfig(), dataDir: tempDir() })
+    store.putCard(makeCard({ id: 'a' }))
+    store.putCard(makeCard({ id: 'b' }))
+    const base = { ...makeEdge('a', 'b'), id: 'e-fixed' }
+
+    const first = store.putEdge({ ...base, weight: 0.33 })
+    assert.equal(first.written, true, '前提：第一次写入必须成功')
+    assert.equal(store.edgesOf('a')[0]?.weight, 0.33, '前提：第一次权重必须读得回来')
+
+    const second = store.putEdge({ ...base, weight: 0.38 })
+    assert.equal(second.written, true, '改权重必须是新记录，不能被当成重复丢弃')
+    assert.equal(store.edgesOf('a')[0]?.weight, 0.38, '改权重后必须读回新值')
+
+    // 而「同 id 同权重」仍然必须幂等——修缺陷不能把 ST-2 一起弄坏。
+    const third = store.putEdge({ ...base, weight: 0.38 })
+    assert.equal(third.written, false, '同 id 同权重仍须幂等（ST-2）')
+    store.close()
+  })
+
+  it('改边权后重开库仍读到新权重（重放一致，ST-1）', () => {
+    // 上一条验证的是内存视图。幂等键影响的是**日志里有没有这条记录**，
+    // 所以必须重开一次，从磁盘重放来证明「新记录真的写进去了」。
+    // 若幂等键仍然不含权重，日志里就只有一条 edge 记录，重开后读回 0.33。
+    const dir = tempDir()
+    const store = openStore({ config: makeConfig(), dataDir: dir })
+    store.putCard(makeCard({ id: 'a' }))
+    store.putCard(makeCard({ id: 'b' }))
+    const base = { ...makeEdge('a', 'b'), id: 'e-replay' }
+    store.putEdge({ ...base, weight: 0.33 })
+    store.putEdge({ ...base, weight: 0.38 })
+    store.close()
+
+    const reopened = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(reopened.edgesOf('a')[0]?.weight, 0.38, '重放后必须是最新权重')
+    reopened.close()
+  })
 })
 
 describe('来源指针（FR-A4 / ST-4）', () => {
