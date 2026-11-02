@@ -110,6 +110,68 @@ describe('mergeConfig 的数组语义', () => {
   })
 })
 
+/**
+ * 旧版 `spread.enabled`（布尔）到 `spread.mode`（三态）的迁移。
+ *
+ * 为什么这组测试必须有：配置版本 5 把布尔开关换成三态，若只是加新字段，
+ * 旧配置 `{ spread: { enabled: true } }` 会**静默降级**成默认的 `'shadow'`——
+ * 用户明确要求「打开扩散」，系统回答「好的，我不改排序」。
+ * 不报错、不告警、行为与意图相反，事后无从发现。
+ *
+ * 这组测试守的是「旧配置的意图被如实执行」，不是「旧字段还能被读到」。
+ */
+describe('mergeConfig 的 spread.enabled 迁移', () => {
+  it('enabled: true 迁移成 on（旧版行为是真实参与排序）', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { enabled: true } } as never)
+    assert.equal(merged.spread.mode, 'on', 'enabled=true 必须迁移成 on，不能降级成 shadow')
+  })
+
+  it('enabled: false 迁移成 off（旧版行为是完全不计算）', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { enabled: false } } as never)
+    assert.equal(merged.spread.mode, 'off', 'enabled=false 必须迁移成 off')
+  })
+
+  it('迁移后不留 enabled 字段（已无读者，留着会误导）', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { enabled: true } } as never)
+    assert.equal(
+      (merged.spread as unknown as Record<string, unknown>).enabled,
+      undefined,
+      'enabled 已无任何读者，不能留在合并结果里',
+    )
+    // 反向确认：正常的 spread 字段必须都在，不能因为删 enabled 把别的删掉。
+    for (const key of ['mode', 'hopDecay', 'maxHops', 'maxBoost', 'seedRatio', 'maxAffected'] as const) {
+      assert.ok(key in merged.spread, `${key} 必须保留`)
+    }
+  })
+
+  it('显式写 mode 时以 mode 为准，旧字段不覆盖它', () => {
+    // 两个都写是用户自己矛盾。不替他猜，但也不能让旧字段赢——
+    // 新字段是更具体的那个，且旧字段只用来补空缺。
+    const merged = mergeConfig(DEFAULT_CONFIG, {
+      spread: { enabled: true, mode: 'off' },
+    } as never)
+    assert.equal(merged.spread.mode, 'off', '显式 mode 必须优先于旧 enabled')
+  })
+
+  it('既没写 mode 也没写 enabled 时保持默认 shadow', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { maxBoost: 0.2 } })
+    assert.equal(merged.spread.mode, 'shadow', '只改其它字段时 mode 必须保持默认值')
+  })
+
+  it('enabled 不是布尔值时忽略它（不猜用户意图）', () => {
+    const merged = mergeConfig(DEFAULT_CONFIG, { spread: { enabled: 'yes' } } as never)
+    assert.equal(merged.spread.mode, 'shadow', '非布尔的 enabled 无法解释，必须退回默认值')
+  })
+
+  it('迁移后的配置能通过校验（不能产出一个非法配置）', () => {
+    for (const enabled of [true, false]) {
+      const merged = mergeConfig(DEFAULT_CONFIG, { spread: { enabled } } as never)
+      const validation = validateConfig(merged)
+      assert.equal(validation.ok, true, `enabled=${enabled} 迁移后必须仍是合法配置：${validation.errors.join('; ')}`)
+    }
+  })
+})
+
 describe('validateConfig', () => {
   /** 造一份合法配置，供各用例按需破坏单个字段。 */
   function base(): typeof DEFAULT_CONFIG {

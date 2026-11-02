@@ -723,6 +723,40 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
 }
 
 /**
+ * 把旧版 `spread.enabled`（布尔）迁移成 `spread.mode`（三态）。
+ *
+ * 为什么需要迁移而不是直接忽略：`enabled` 在配置版本 4 及以前是扩散的开关，
+ * 版本 5 换成了三态 `mode`。若只是把新字段加进去，`{ spread: { enabled: true } }`
+ * 这种旧配置会**静默降级**成默认的 `'shadow'`——用户明确要求「打开扩散」，
+ * 系统却回答「好的，我不改排序」。不报错、不告警、行为与用户意图相反，
+ * 而且事后无从发现。这正是本仓库反复吃亏的那一类缺陷。
+ *
+ * 映射关系（`enabled` 原本的语义就是这个）：
+ * - `true`  → `'on'`：扩散真实参与排序，与旧版行为逐位一致。
+ * - `false` → `'off'`：完全不计算，与旧版行为逐位一致。
+ *
+ * **显式写了 `mode` 时以 `mode` 为准**：新字段是新事实，旧字段只用来补空缺。
+ * 两个都写是用户自己矛盾，不替他猜，`mode` 是更具体的那个。
+ *
+ * 迁移后**不把 `enabled` 带进结果**：留着一个已无读者的字段，下一个人会以为
+ * 它还在起作用。配置对象的形状必须与代码实际读的字段一致。
+ *
+ * @param override - 用户提供的 spread 段（可能含旧字段）。
+ * @param fallback - 合并前的 `mode`（默认值或 base 里的值）。
+ * @returns 迁移后的 `mode`。
+ */
+function migrateSpreadMode(override: unknown, fallback: SpreadMode): SpreadMode {
+  if (typeof override !== 'object' || override === null) return fallback
+  const partial = override as { mode?: unknown; enabled?: unknown }
+  // 显式写了合法 mode 时，新字段优先。
+  if (partial.mode === 'off' || partial.mode === 'shadow' || partial.mode === 'on') return partial.mode
+  // 否则退回旧布尔字段。
+  if (partial.enabled === true) return 'on'
+  if (partial.enabled === false) return 'off'
+  return fallback
+}
+
+/**
  * 深合并用户配置与默认配置。
  *
  * 宿主的 patch 行是**整块替换 config**（不深合并），所以插件入口必须自己做
@@ -733,17 +767,24 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
  * @returns 合并后的新对象，不修改入参。
  */
 export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConfig> = {}): MemoryConfig {
+  // `spread` 段要单独处理：它可能含旧版布尔字段 `enabled`，见 `migrateSpreadMode`。
+  const { spread: spreadOverride, ...restOverride } = override
+  const spreadFields = { ...base.spread, ...spreadOverride } as Record<string, unknown>
+  // 旧字段不许留在结果里——它已经没有任何读者，留着只会误导。
+  delete spreadFields.enabled
+  spreadFields.mode = migrateSpreadMode(spreadOverride, base.spread.mode)
+
   const merged: MemoryConfig = {
     configVersion: override.configVersion ?? base.configVersion,
-    weights: { ...base.weights, ...override.weights },
-    recall: { ...base.recall, ...override.recall },
-    forgetting: { ...base.forgetting, ...override.forgetting },
-    dedup: { ...base.dedup, ...override.dedup },
-    extraction: { ...base.extraction, ...override.extraction },
-    storage: { ...base.storage, ...override.storage },
-    consolidation: { ...base.consolidation, ...override.consolidation },
-    reminder: { ...base.reminder, ...override.reminder },
-    spread: { ...base.spread, ...override.spread },
+    weights: { ...base.weights, ...restOverride.weights },
+    recall: { ...base.recall, ...restOverride.recall },
+    forgetting: { ...base.forgetting, ...restOverride.forgetting },
+    dedup: { ...base.dedup, ...restOverride.dedup },
+    extraction: { ...base.extraction, ...restOverride.extraction },
+    storage: { ...base.storage, ...restOverride.storage },
+    consolidation: { ...base.consolidation, ...restOverride.consolidation },
+    reminder: { ...base.reminder, ...restOverride.reminder },
+    spread: spreadFields as unknown as SpreadPolicy,
     debugExplain: override.debugExplain ?? base.debugExplain,
   }
   // 数组字段必须整体替换，浅合并会让用户的自定义关键词被默认值覆盖。
