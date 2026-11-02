@@ -1135,7 +1135,7 @@ function runConsolidate(options: CliOptions, engine: MemoryEngine): CliResult {
   const lines = [
     `整理完成：合并 ${report.merged} 组，归档 ${report.archived} 张`,
     `活跃 ${report.beforeActive} → ${report.afterActive} 张`,
-    `降权 ${report.decayed} 张，重建索引 ${report.reindexed} 条`,
+    `降权 ${report.decayed} 张，重建索引 ${report.reindexed} 张卡`,
   ]
   if (report.notes.length > 0) {
     lines.push('')

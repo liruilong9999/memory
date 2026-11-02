@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=9',
+  'configVersion=10',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -132,7 +132,6 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'recall.candidateLimit=400',
   'recall.maxCardChars=160',
   'recall.maxCards=7',
-  'recall.minCards=1',
   'recall.overheadTokens=100',
   'recall.relativeThreshold=0.55',
   'recall.tokenBudget=900',
@@ -160,7 +159,6 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'storage.journalSegmentBytes=4194304',
   'storage.logFile=logs/diagnostics.jsonl',
   'storage.logMaxEntries=500',
-  'storage.reindexEveryRecords=2000',
   'weights.confidence=0.1',
   'weights.conflict=0.25',
   'weights.goal=0.1',
@@ -191,7 +189,10 @@ describe('摘要配置的默认值与版本', () => {
     //   7 → storage.logFile / storage.logMaxEntries（FR-F1 诊断日志落盘）
     //   8 → reminder.cronSearchDays（FR-D3 cron 分支的搜索上界）
     //   9 → storage.configSnapshotMaxEntries（FR-F4 配置快照台账上限）
-    assert.equal(MEMORY_CONFIG_VERSION, 9, '新增配置快照上限后版本应为 9')
+    //  10 → **删除**两个零读取的死配置：recall.minCards 与 storage.reindexEveryRecords
+    //       删字段同样要递增版本：旧配置文件里可能写着它们，回滚快照里也可能有，
+    //       版本号是「schema 变过」的唯一凭据。
+    assert.equal(MEMORY_CONFIG_VERSION, 10, '删除死配置项后版本应为 10')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

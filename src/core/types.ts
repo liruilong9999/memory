@@ -521,7 +521,17 @@ export interface ConsolidationReport {
   summarized: number
   /** 新蒸馏出的感受卡数（起源 L11）。 */
   distilled: number
-  /** 重建的索引条数。 */
+  /**
+   * 本次**真的重建**倒排索引时覆盖的卡片数（FR-C1 最小集里的「重建索引」）。
+   *
+   * 由调用方回填：`runConsolidation` 是纯函数、拿不到索引（索引住在数据面，
+   * FR-A7），所以它在报告里填 0；`MemoryEngine.consolidate()` 调
+   * `store.rebuildIndex()` 之后把真实条数写回来。
+   *
+   * 这条字段曾经是假的（`reindexed: afterActive`，把活跃卡数换个名字），
+   * 于是报告在**报一个没发生的动作**。判据必须是「重建返回的条数」，
+   * 不是「和索引条数碰巧相等的另一个数字」。
+   */
   reindexed: number
   /** 人可读的变更摘要行。 */
   notes: string[]

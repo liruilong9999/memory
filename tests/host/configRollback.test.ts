@@ -237,7 +237,7 @@ describe('回滚覆盖层的生效点（FR-F4 验收：改坏能一键回滚）'
     )
     // 浅合并会让 recall 段只剩 absoluteThreshold 一个字段，
     // 其余字段变成 undefined，然后在校验处炸出一堆假错误。
-    assert.equal(rescued.recall.minCards, DEFAULT_CONFIG.recall.minCards)
+    assert.equal(rescued.recall.maxCardChars, DEFAULT_CONFIG.recall.maxCardChars)
     assert.equal(rescued.recall.tokenBudget, DEFAULT_CONFIG.recall.tokenBudget)
     assert.equal(rescued.recall.maxCards, DEFAULT_CONFIG.recall.maxCards)
   })

@@ -447,6 +447,14 @@ export class MemoryEngine {
     for (const op of ops) {
       this.store.append(op, undefined, now)
     }
+    // FR-C1 把「重建索引」列为夜整理最小集的一项，所以这里**真的重建**，
+    // 报告里的条数取重建返回的真实统计，而不是把活跃卡数换个名字打印一遍。
+    //
+    // 为什么由 engine 做而不是 nightly：`runConsolidation` 是纯函数（ST-1），
+    // 输入只有 `(state, config, now, timeZone)`，索引不在其中——索引是数据面的
+    // 派生视图（FR-A7），nightly 碰不到。纯函数层报 0、调用方回填，
+    // 是唯一能同时保住「纯函数无 IO」和「报告不说谎」的写法。
+    report.reindexed = this.store.rebuildIndex().cards
     this.lastConsolidationAt = now
     // 落盘失败不应让整理本身失败：整理的操作已经写进日志了（上面那个循环），
     // 这里只是记「什么时候整理的」。让它抛错会把「整理成功」报成失败。

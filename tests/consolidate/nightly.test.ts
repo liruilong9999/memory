@@ -77,6 +77,30 @@ describe('runConsolidation 开关与空输入', () => {
     assert.ok(result.report.notes.length > 0)
   })
 
+  it('纯函数层不许编造 reindexed（索引不在它的输入里）', () => {
+    // `runConsolidation` 是纯函数（ST-1），输入只有 (state, config, now, timeZone)。
+    // 倒排索引住在数据面 `store` 里（FR-A7 派生视图），**根本不在输入里**，
+    // 所以它没有任何依据说「我重建了多少条索引」。
+    //
+    // 它曾经写 `reindexed: afterActive`，注释还配了一句「重建索引 = 为每张活跃卡
+    // 重新登记」——那是把活跃卡数换个名字打印，而 FR-C1 明确把「重建索引」
+    // 列进夜整理最小集。真正重建发生在 `MemoryEngine.consolidate()`（有 store）。
+    //
+    // 这条用例守的是**分层边界**：报告里这一格由调用方回填，纯函数层只能填 0。
+    // 如果哪天有人图省事又把它填成活跃卡数，引擎那条测试仍可能绿（引擎会覆盖），
+    // 只有这里会红。**一个说错的观测点比没有观测点更危险。**
+    const cards = [
+      makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 }),
+      makeCard({ id: 'b', text: '部署走流水线，别手工发版', createdAt: T0 }),
+    ]
+    const result = runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS, TZ)
+    assert.ok(result.report.afterActive > 0, '前提：必须有活跃卡，否则 0 与编造值无法区分')
+    assert.equal(
+      result.report.reindexed, 0,
+      '纯函数层拿不到索引，reindexed 必须由调用方回填',
+    )
+  })
+
   it('空库整理不抛错，报告可读', () => {
     const result = runConsolidation({ cards: [] }, makeConfig(), T0, TZ)
     assert.equal(result.ops.length, 0)

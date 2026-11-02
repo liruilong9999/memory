@@ -34,8 +34,6 @@ export interface RecallPolicy {
   relativeThreshold: number
   /** 焦点包硬上限条数（FR-B2，默认 7）。 */
   maxCards: number
-  /** 焦点包最少条数，低于此值不强行凑数。 */
-  minCards: number
   /** 每轮记忆注入 token 硬上限（FR-E3）。 */
   tokenBudget: number
   /** 单条卡片摘要字符上限，超出截断（Q-09）。 */
@@ -118,8 +116,6 @@ export interface StoragePolicy {
   journalSegmentBytes: number
   /** 是否每次写入都 fsync（FR-A3 原子性）。 */
   fsyncOnWrite: boolean
-  /** 索引重建阈值：日志新增条数达到该值后自动重建倒排索引。 */
-  reindexEveryRecords: number
   /**
    * 诊断日志文件名（FR-F1）；相对 `dataDir`。设空串表示**不落盘**。
    *
@@ -483,7 +479,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 9,
+  configVersion: 10,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -496,7 +492,6 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     absoluteThreshold: 0.18,
     relativeThreshold: 0.55,
     maxCards: 7,
-    minCards: 1,
     tokenBudget: 900,
     maxCardChars: 160,
     // 两行标题 + 当前时间行 + 两处空行 + 一行免责尾注，中文约 90 字。
@@ -539,7 +534,6 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     dataDir: '.dsh-memory',
     journalSegmentBytes: 4 * 1024 * 1024,
     fsyncOnWrite: true,
-    reindexEveryRecords: 2000,
     logFile: 'logs/diagnostics.jsonl',
     logMaxEntries: 500,
     // 配置快照（FR-F4）：每次启动时配置若与上一条不同就追加一条。
@@ -620,7 +614,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 9
+export const MEMORY_CONFIG_VERSION = 10
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -653,9 +647,6 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   inUnit('recall.absoluteThreshold', config.recall.absoluteThreshold)
   inUnit('recall.relativeThreshold', config.recall.relativeThreshold)
   if (config.recall.maxCards < 1) errors.push('recall.maxCards 必须 ≥ 1')
-  if (config.recall.minCards < 0 || config.recall.minCards > config.recall.maxCards) {
-    errors.push('recall.minCards 必须落在 0..maxCards 之间')
-  }
   if (config.recall.tokenBudget < 64) errors.push('recall.tokenBudget 必须 ≥ 64')
   if (config.recall.candidateLimit < config.recall.maxCards) {
     errors.push('recall.candidateLimit 必须 ≥ recall.maxCards')

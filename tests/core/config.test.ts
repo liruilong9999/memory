@@ -27,7 +27,6 @@ describe('DEFAULT_CONFIG', () => {
       ['recall.absoluteThreshold', DEFAULT_CONFIG.recall.absoluteThreshold],
       ['recall.relativeThreshold', DEFAULT_CONFIG.recall.relativeThreshold],
       ['recall.maxCards', DEFAULT_CONFIG.recall.maxCards],
-      ['recall.minCards', DEFAULT_CONFIG.recall.minCards],
       ['recall.tokenBudget', DEFAULT_CONFIG.recall.tokenBudget],
       ['recall.maxCardChars', DEFAULT_CONFIG.recall.maxCardChars],
       ['recall.overheadTokens', DEFAULT_CONFIG.recall.overheadTokens],
@@ -232,13 +231,6 @@ describe('validateConfig', () => {
     const result = validateConfig(config)
     assert.equal(result.ok, false)
     assert.ok(result.errors.some((error) => error.includes('maxCards')))
-  })
-
-  it('minCards 大于 maxCards 时报错', () => {
-    const config = base()
-    config.recall.minCards = config.recall.maxCards + 1
-    const result = validateConfig(config)
-    assert.equal(result.ok, false)
   })
 
   it('tokenBudget 为 0 时报错', () => {

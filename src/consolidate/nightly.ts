@@ -337,8 +337,16 @@ export function runConsolidation(
     archived: toArchive.length,
     summarized,
     distilled,
-    // 索引是可丢弃可重建的派生视图（FR-A7）：重建索引 = 为每张活跃卡重新登记。
-    reindexed: afterActive,
+    // 本函数是纯函数，**拿不到索引**（索引住在数据面 `store` 里，FR-A7）。
+    // 这里恒为 0，由调用方重建后回填——`MemoryEngine.consolidate()` 会真的
+    // 调 `store.rebuildIndex()` 并把返回的条数写回来。
+    //
+    // 早期版本写的是 `reindexed: afterActive`，注释还配了一句「重建索引 =
+    // 为每张活跃卡重新登记」。那是**报一个没发生的动作**：FR-C1 明确把
+    // 「重建索引」列进夜整理最小集，而报告只是把活跃卡数换个名字打印了一遍。
+    // 更糟的是它看起来完全合理——数字不为 0、量纲也对，只有去读实现才发现
+    // 索引一次都没重建。**一个说错的观测点比没有观测点更危险，因为人会信它。**
+    reindexed: 0,
     notes,
   }
 

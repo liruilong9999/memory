@@ -18,6 +18,7 @@ import type { MemoryConfig } from '../../src/core/config.ts'
 import type { MemoryLogEntry } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
 import { openStore } from '../../src/store/store.ts'
+import { indexStats } from '../../src/store/inverted.ts'
 import type { MemoryStore } from '../../src/store/store.ts'
 import { makeCard, makeTempDir, removeDirContents } from '../store/helpers.ts'
 import { makeConfig } from '../consolidate/fixtures.ts'
@@ -399,6 +400,62 @@ describe('MemoryEngine 整理（FR-C1 / FR-C4）', () => {
     const report = engine.consolidate(T0 + 30 * 24 * 60 * 60 * 1000)
     assert.ok(report.notes.length > 0)
     assert.ok(report.beforeActive >= report.afterActive)
+  })
+
+  it('报告的 reindexed 是索引里真实登记的张数（FR-C1 重建索引）', () => {
+    // 这条守的是「报告不许报一个没发生的动作」。
+    //
+    // 曾经的实现是 `reindexed: afterActive`——把活跃卡数换个名字打印一遍。
+    // 它看起来完全合理：数字不为 0、量纲也对。只有去读实现才知道索引一次都
+    // 没重建。所以这里的判据不能是「> 0」，必须是**与索引实际内容相等**。
+    const { store, engine } = openEngine()
+    engine.writeTurn(turnInput({ userText: '决定用 Qt5 开发，沿用现有 cmake 配置' }))
+    engine.writeTurn(turnInput({
+      userText: '决定用 Cordis 插件承载记忆模块，避免污染宿主',
+      turn: 2, at: T0 + 1000,
+    }))
+    assert.ok(store.count('active') >= 2, '前提：至少两张活跃卡，否则条数没有区分度')
+
+    const report = engine.consolidate(T0 + 30 * 24 * 60 * 60 * 1000)
+
+    // 判据一：报告的条数 == 索引里真实登记的张数。
+    // 索引是派生视图（FR-A7），`indexStats().cards` 就是「登记了几张」。
+    assert.equal(
+      report.reindexed, indexStats(store.indexSnapshot()).cards,
+      'reindexed 必须等于索引里真实登记的张数',
+    )
+    // 判据二：重建后索引与卡片集合一致。只对上数字还不够——两边可以一起错。
+    assert.equal(store.isIndexHealthy(), true, '重建后索引必须与卡片集合一致')
+    // 注意：这里**故意不断言** `reindexed !== afterActive`。
+    // 没有归档卡时两者天然相等，那样断言会绿在巧合上而不是规则上。
+    // 「不许是活跃卡数的别名」由下一条用例用归档卡把它变成**必然不等**来守。
+  })
+
+  it('归档卡也登记进索引，所以 reindexed 大于活跃卡数（前提：两者量纲不同）', () => {
+    // 上一条靠「多一张归档卡」让 reindexed != afterActive。这条**单独证明**
+    // 那个前提成立：如果归档卡不进索引，上一条的 notEqual 就只是巧合，
+    // 而不是规则。**让测试由规则决定，不由巧合决定。**
+    const { store, engine } = openEngine()
+    engine.writeTurn(turnInput({ userText: '决定用 Qt5 开发，沿用现有 cmake 配置' }))
+    engine.writeTurn(turnInput({
+      userText: '决定用 Cordis 插件承载记忆模块，避免污染宿主',
+      turn: 2, at: T0 + 1000,
+    }))
+    // 手工归档一张，制造「索引张数 > 活跃张数」。
+    const victim = engine.query({ status: 'active' })[0]
+    assert.ok(victim !== undefined, '前提：必须有一张活跃卡')
+    store.append({ op: 'archive', id: victim.id, at: T0 + 2000, reason: '测试制造归档' })
+    assert.equal(store.count('archived'), 1, '前提：确实有一张归档卡')
+
+    const report = engine.consolidate(T0 + 30 * 24 * 60 * 60 * 1000)
+    assert.equal(report.reindexed, indexStats(store.indexSnapshot()).cards)
+    // 这条才是「reindexed 不许是活跃卡数的别名」的真正判据：
+    // 归档卡也在索引里（`buildIndex` 不过滤 status），所以两者**必然不等**。
+    // 若实现退回 `reindexed: afterActive`，这里立刻变红。
+    assert.ok(
+      report.reindexed > report.afterActive,
+      `归档卡必须也在索引里：reindexed=${report.reindexed}，afterActive=${report.afterActive}`,
+    )
   })
 
   it('整理结果落库，重开 store 后仍在（P2 日志是唯一真相源）', () => {
