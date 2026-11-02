@@ -11,8 +11,10 @@
  * @module dsh-memory/store/state
  */
 
-import { buildEdgeId } from '../core/types.ts'
-import type { MemoryCard, MemoryEdge, MemoryRevision, JournalRecord } from '../core/types.ts'
+import { buildEdgeId, MEMORY_DOMAINS, MEMORY_KINDS } from '../core/types.ts'
+import type {
+  MemoryCard, MemoryDomain, MemoryEdge, MemoryKind, MemoryRevision, JournalRecord,
+} from '../core/types.ts'
 
 /**
  * 重放得到的记忆状态。
@@ -118,6 +120,59 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * 判断字符串是否属于某个只读常量数组。
+ *
+ * 为什么用常量数组而不是手抄枚举：`MemoryKind` / `MemoryDomain` 是联合类型，
+ * 手抄一份枚举等于多一处必须同步的真相源，漏同步时是**静默降级**（数据损坏），
+ * 而 TypeScript 抓不到（`raw['kind']` 是 `unknown`，加不加分支都能编译）。
+ *
+ * @param candidate - 待判断的值。
+ * @param allowed - 允许值常量数组。
+ * @returns 是已知成员时返回 `true`。
+ */
+function isKnownValue<T extends string>(
+  candidate: unknown, allowed: readonly T[],
+): candidate is T {
+  return typeof candidate === 'string' && (allowed as readonly string[]).includes(candidate)
+}
+
+/**
+ * 把日志里的 `kind` 投影成卡片类型。
+ *
+ * 三种情况必须区分对待，这是 ST-1「同样输入得到同样输出」的底线：
+ * 1. 已知成员 → 原样保留；
+ * 2. **未知但合法的字符串** → 原样保留。这是**前向兼容**：日志是唯一真相源（P2），
+ *    旧版本读到新版本写入的 `kind`（例如后续新增的 `summary`）时，投影必须忠实，
+ *    不能把 `kind:'summary'` 悄悄改成 `'fact'` —— 那样日志写的是 A、重放出来是 B，
+ *    同一条日志两种结果，直接破坏重放确定性，而且事后无从发现。
+ * 3. 缺失或非字符串 → 退回 `'fact'`。这种情况**没有信息可保留**，才允许兜底。
+ *
+ * @param raw - 日志里的原始值。
+ * @returns 卡片类型。
+ */
+function coerceKind(raw: unknown): MemoryKind {
+  if (isKnownValue(raw, MEMORY_KINDS)) return raw
+  // 未知字符串原样透传（前向兼容，见上）。断言是刻意的：`MemoryKind` 是闭合联合，
+  // 但**日志里可能装着比当前代码更新的值**，投影层的职责是搬运而非裁决。
+  if (typeof raw === 'string' && raw.length > 0) return raw as MemoryKind
+  return 'fact'
+}
+
+/**
+ * 把日志里的 `domain` 投影成记忆域。
+ *
+ * 语义与 {@link coerceKind} 完全一致：已知保留、未知字符串透传、缺失才兜底。
+ *
+ * @param raw - 日志里的原始值。
+ * @returns 记忆域。
+ */
+function coerceDomain(raw: unknown): MemoryDomain {
+  if (isKnownValue(raw, MEMORY_DOMAINS)) return raw
+  if (typeof raw === 'string' && raw.length > 0) return raw as MemoryDomain
+  return 'work'
+}
+
+/**
  * 补齐卡片缺省字段，避免历史日志（老版本格式）缺字段导致下游崩溃。
  *
  * @param raw - 日志里的卡片对象。
@@ -148,9 +203,8 @@ function coerceCard(raw: unknown): MemoryCard | null {
   const status = raw['status']
   const card: MemoryCard = {
     id,
-    domain: domain === 'work' || domain === 'study' || domain === 'life' ? domain : 'work',
-    kind: kind === 'event' || kind === 'fact' || kind === 'promise' || kind === 'concept'
-      || kind === 'feeling' || kind === 'experience' ? kind : 'fact',
+    domain: coerceDomain(domain),
+    kind: coerceKind(kind),
     text: asString(raw['text'], ''),
     normalized: asString(raw['normalized'], ''),
     createdAt: asNumber(raw['createdAt'], 0),

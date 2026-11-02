@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { buildEdgeId } from '../../src/core/types.ts'
+import { buildEdgeId, MEMORY_DOMAINS, MEMORY_KINDS } from '../../src/core/types.ts'
 import type { JournalRecord, MemoryCard, MemoryEdge } from '../../src/core/types.ts'
 import {
   EMPTY_STATE, applyRecord, applyRecordPure, cloneState, countCards, createEmptyState,
@@ -322,6 +322,57 @@ describe('重放确定性（ST-1）', () => {
     const without = rebuildState([record])
     assert.equal(withDup.cards.size, without.cards.size)
     assert.deepEqual(getCard(withDup, 'a'), getCard(without, 'a'))
+  })
+})
+
+describe('未知枚举值不静默降级（前向兼容）', () => {
+  it('未知 kind 经真实重放后原样保留，不被改成 fact', () => {
+    // 构造一条「未来版本写入的」put 记录：`kind:'summary'` 当前代码不认识。
+    // 走 applyRecord 真实重放路径，不手搓状态。
+    const state = createEmptyState()
+    // 刻意绕过类型系统：`kind:'summary'` 不在 `MemoryKind` 里，这正是要测的场景。
+    // 日志是外部输入（可能是更新版本写的），运行时不保证符合当前联合类型。
+    const raw = { ...makeCard({ id: 'a' }), kind: 'summary' }
+    applyRecord(state, makeRecord(1, { op: 'put', card: raw as unknown as MemoryCard }))
+    const card = getCard(state, 'a')
+    // 静默降级会让日志写 A、重放得 B，同一条日志两种结果，破坏 ST-1 且事后无从发现。
+    assert.equal(card?.kind, 'summary', '未知 kind 必须原样透传，不能降级成 fact')
+  })
+
+  it('未知 domain 经真实重放后原样保留，不被改成 work', () => {
+    const state = createEmptyState()
+    const raw = { ...makeCard({ id: 'a' }), domain: 'hobby' }
+    applyRecord(state, makeRecord(1, { op: 'put', card: raw as unknown as MemoryCard }))
+    assert.equal(getCard(state, 'a')?.domain, 'hobby', '未知 domain 必须原样透传')
+  })
+
+  it('所有 MEMORY_KINDS 都能写入并重放往返', () => {
+    // 这条测试的价值：以后给 MemoryKind 加值时自动覆盖，不需要有人记得改白名单。
+    const state = createEmptyState()
+    MEMORY_KINDS.forEach((kind, index) => {
+      applyRecord(state, putRecord(index + 1, makeCard({ id: `k-${kind}`, kind })))
+    })
+    for (const kind of MEMORY_KINDS) {
+      assert.equal(getCard(state, `k-${kind}`)?.kind, kind, `kind=${kind} 往返后应保持不变`)
+    }
+  })
+
+  it('所有 MEMORY_DOMAINS 都能写入并重放往返', () => {
+    const state = createEmptyState()
+    MEMORY_DOMAINS.forEach((domain, index) => {
+      applyRecord(state, putRecord(index + 1, makeCard({ id: `d-${domain}`, domain })))
+    })
+    for (const domain of MEMORY_DOMAINS) {
+      assert.equal(getCard(state, `d-${domain}`)?.domain, domain, `domain=${domain} 往返后应保持不变`)
+    }
+  })
+
+  it('缺失 kind 时才兜底成 fact（无信息可保留）', () => {
+    const state = createEmptyState()
+    const raw: Record<string, unknown> = { ...makeCard({ id: 'a' }) }
+    delete raw['kind']
+    applyRecord(state, makeRecord(1, { op: 'put', card: raw as unknown as MemoryCard }))
+    assert.equal(getCard(state, 'a')?.kind, 'fact')
   })
 })
 

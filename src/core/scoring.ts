@@ -393,8 +393,17 @@ export function formatCardLine(card: MemoryCard, text: string): string {
 /**
  * 卡片类型的中文标签。
  *
+ * 为什么必须处理「未知类型」而不是靠 `switch` 的隐式 `undefined`：
+ * 投影层（`src/store/state.ts` 的 `coerceKind`）对未知 `kind` 采取**忠实透传**
+ * 策略——日志里写的是 `summary`，重放出来就必须还是 `summary`，不许静默改成
+ * `fact`（那样日志写 A、重放得 B，破坏 ST-1 且事后无从发现）。既然未知类型
+ * 能走到渲染层，这里就不能让它变成 `undefined`——那会渲染出
+ * `- [undefined] xxx`，比降级更难查。
+ *
+ * 因此兜底返回**类型名本身**：不发明中文、不假装认识，把真相摆出来。
+ *
  * @param kind - 类型。
- * @returns 中文标签。
+ * @returns 中文标签；未知类型返回其原始名称。
  */
 export function kindLabel(kind: MemoryCard['kind']): string {
   switch (kind) {
@@ -404,6 +413,7 @@ export function kindLabel(kind: MemoryCard['kind']): string {
     case 'concept': return '概念'
     case 'feeling': return '感受'
     case 'experience': return '经验'
+    default: return String(kind)
   }
 }
 
