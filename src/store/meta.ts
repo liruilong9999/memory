@@ -92,7 +92,7 @@
  * @module dsh-memory/store/meta
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -220,7 +220,27 @@ export function writeMeta(dir: string, meta: StoreMeta): void {
   // Windows 上 `renameSync` 覆盖已存在文件是允许的（底层 MoveFileEx 带
   // REPLACE_EXISTING），所以这里不需要先删目标文件——先删反而会制造一个
   // 「目标不存在」的窗口，把原子性毁掉。
-  renameSync(tmp, path)
+  try {
+    renameSync(tmp, path)
+  } catch (error) {
+    // `rename` 失败时把临时文件清掉。
+    //
+    // 不清的后果**不是数据损坏**（`meta.json` 本身没被碰过，读者读到的还是
+    // 旧值），而是**数据目录里留下一个来历不明的 `meta.json.tmp`**：
+    // 运维看到会疑惑「这是不是没写完的残留、要不要删」，将来若有「扫描数据
+    // 目录里的文件」的逻辑，它还可能被误认为有效数据。这类「不影响正确性、
+    // 只让人困惑」的残留最容易长期留着。
+    //
+    // 清理本身也可能失败（比如整个目录权限都没了），所以再套一层 try——
+    // **清理失败绝不能掩盖原始错误**，否则上层看到的会是一个 ENOENT，
+    // 而真正的原因（EPERM / 磁盘满）被吞掉了。
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // 尽力而为：清理不掉就算了，原始错误更重要。
+    }
+    throw error
+  }
 }
 
 /**

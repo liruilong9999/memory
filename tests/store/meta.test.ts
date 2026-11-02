@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 
@@ -74,6 +74,70 @@ describe('元信息读写', () => {
     // 原子写是「先写 .tmp 再 rename」，rename 之后 .tmp 必须消失。
     // 若这里多了 .tmp，说明 rename 没执行（比如被改成 copyFile）。
     assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.tmp')), [])
+  })
+
+  it('rename 失败时应清掉临时文件，且原始错误不能被清理动作掩盖', () => {
+    const dir = tempDir()
+
+    // 制造 `rename` 必然失败的条件：把目标路径占成一个**非空目录**。
+    // POSIX 与 Windows 上 `rename(文件 → 已存在的非空目录)` 都会失败。
+    // 这不是 mock，是真实的系统调用失败。
+    const target = metaFilePath(dir)
+    mkdirSync(target, { recursive: true })
+    writeFileSync(join(target, 'blocker'), 'x', 'utf8')
+
+    let caught: unknown
+    try {
+      writeLastConsolidationAt(dir, 1_000)
+    } catch (error) {
+      caught = error
+    }
+
+    // 正向证据 1：错误真的抛出来了（否则后面的清理断言没有意义）。
+    assert.ok(caught instanceof Error, '前提：rename 必须真的失败并抛出')
+
+    // ## 正向证据 2：**直接证明 `.tmp` 曾被创建**
+    //
+    // 「目录里没有 .tmp」这条断言有个致命的绿法：**如果 writeFileSync 就失败了，
+    // .tmp 也从未存在**，断言照样通过——但它测的是「根本没走到 rename」，
+    // 不是「rename 失败后清理了」。
+    //
+    // 直接证据在错误消息里：`rename` 的系统错误会带**源路径**，而源路径就是
+    // tmp 路径。若失败发生在 writeFileSync，消息里不会有 `meta.json.tmp`，
+    // 也不会有 `->` 这个 rename 特征。
+    const message = (caught as Error).message
+    assert.match(message, /meta\.json\.tmp/, `前提：错误消息必须包含 .tmp 源路径，实际：${message}`)
+    assert.match(message, /->|rename/i, `前提：失败必须发生在 rename 这一步，实际：${message}`)
+
+    // 核心断言：失败后不能留下来历不明的 .tmp。
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.endsWith('.tmp')),
+      [],
+      'rename 失败后必须清掉 meta.json.tmp',
+    )
+
+    // 原始错误必须原样抛出，不能被清理动作的二次失败替换掉。
+    // 若清理失败的 ENOENT 覆盖了 EPERM，运维会去查错的方向。
+    assert.ok(
+      !/^ENOENT/.test(message),
+      `原始错误不能被清理动作掩盖，实际：${message}`,
+    )
+
+    // ## 这条用例的诚实边界（反向验证结论）
+    //
+    // 已实测两个变异体：
+    // - 删掉整个清理逻辑 → **红 1 条**（就是本用例），符合预期；
+    // - 把清理改成「不加 try、让 unlinkSync 的异常直接抛出」→ **红 0 条**。
+    //
+    // 第二个变异为什么抓不到：本用例里 `unlinkSync(tmp)` **会成功**
+    // （tmp 确实存在、目录可写），所以「清理失败」那条分支根本没被执行，
+    // 「原始错误被掩盖」也就无从发生。要抓到它，需要构造
+    // 「rename 失败 **且** unlink 也失败」的环境（比如整个目录失去写权限），
+    // 而这在 Windows/POSIX 上不可移植（Windows 的目录只读属性不阻止删除子文件）。
+    //
+    // **所以本用例守的是「清理真的发生了」，不是「清理失败时原始错误不被掩盖」。**
+    // 后者的保护来自那层 `catch {}` 的**存在**，而不是这条断言——这一点必须写明，
+    // 否则后人会以为这里已经守住了。
   })
 })
 
