@@ -233,6 +233,30 @@ export interface ResolvedCliConfig {
    * 回滚就是把它修成目标快照，差异里自然包含那个坏掉的叶子。
    */
   readonly baseline: MemoryConfig
+  /**
+   * 本次要操作的数据目录（已考虑 `--data-dir`）。
+   *
+   * ## 为什么不能直接用 `config.storage.dataDir`（真缺陷十六）
+   *
+   * 配置坏掉时 `config` 已经退回 `DEFAULT_CONFIG`，而 `DEFAULT_CONFIG` 里的
+   * `storage.dataDir` 是**库默认路径**。于是探针实测到这一幕：
+   *
+   * ```text
+   * 用户库（patch 指定）里有 3 张卡
+   * patch 写成 absoluteThreshold: -5
+   * memoryctl health
+   *   → 数据目录报成了另一个目录（默认 .dsh-memory）
+   *   → 活跃：0 张
+   * ```
+   *
+   * 用户看到的不是「配置坏了」，而是「我那 3 条记忆丢了」——
+   * 而它们好端端地在另一个目录里。**看错库比报错库更危险。**
+   *
+   * 正解是从 `baseline`（默认值 + patch、**未校验**）取目录：那才是
+   * 「假如没有校验失败，宿主会用哪个目录」。与 `baseline` 同源，
+   * 不另开一条推导链。
+   */
+  readonly dataDir: string
   /** 配置来自哪里，供 `health` 与人读输出显示。 */
   readonly source: string
   /**
@@ -259,6 +283,22 @@ export interface ResolvedCliConfig {
  *   `--data-dir X config rollback` 会去改另一个库的覆盖层。
  * @returns 解析结果；`config` 一定可用。
  */
+/**
+ * 从一份配置里取出可用的数据目录。
+ *
+ * `mergeConfig` 不校验类型，所以 patch 写成 `dataDir: 42` 会原样传过来。
+ * 直接拿它拼路径会得到 `resolve(42)` 而抛错，而那个错误
+ * 会被报成「打不开记忆库」——真正的原因是配置写错了，不是库坏了。
+ *
+ * @param config - 待取目录的配置（通常是未校验的 `baseline`）。
+ * @returns 数据目录；不是非空字符串时退回默认目录。
+ */
+function usableDataDir(config: MemoryConfig): string {
+  const candidate: unknown = config.storage.dataDir
+  if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  return DEFAULT_CONFIG.storage.dataDir
+}
+
 function resolveCliConfig(io: CliIo, dataDirOverride: string | undefined): ResolvedCliConfig {
   const notes: string[] = []
   const path = io.configPath ?? fileURLToPath(new URL('../../cordis.patch.yml', import.meta.url))
@@ -268,6 +308,9 @@ function resolveCliConfig(io: CliIo, dataDirOverride: string | undefined): Resol
     return {
       config: DEFAULT_CONFIG,
       baseline: DEFAULT_CONFIG,
+      // 连 patch 都读不到时只能用默认目录——这里没有更好的选择，
+      // 但已在 stderr 报了「配置提醒」，不是静默猜一个目录。
+      dataDir: usableDataDir(DEFAULT_CONFIG),
       source: 'DEFAULT_CONFIG（未读到 patch）',
       degraded: true,
       notes,
@@ -307,6 +350,9 @@ function resolveCliConfig(io: CliIo, dataDirOverride: string | undefined): Resol
     return {
       config: DEFAULT_CONFIG,
       baseline: merged,
+      // 从 `merged`（含 patch）取目录，不从 `DEFAULT_CONFIG`：
+      // 配置坏了不代表用户的库没了，也不代表他想看默认那个空库。
+      dataDir: usableDataDir(merged),
       source: 'DEFAULT_CONFIG（patch 非法）',
       degraded: true,
       notes,
@@ -315,6 +361,10 @@ function resolveCliConfig(io: CliIo, dataDirOverride: string | undefined): Resol
   return {
     config: effective,
     baseline: merged,
+    // 成功时也取 `merged` 而不取 `effective`：`storage` 在
+    // `ROLLBACK_EXCLUDED_TOP_KEYS` 里，回滚层改不到它，两者本就相等。
+    // 取同一个来源可以避免「成功与失败两条路用不同目录」。
+    dataDir: usableDataDir(merged),
     source: rollback === null ? path : `${path} + 回滚层`,
     degraded: false,
     notes,
@@ -982,14 +1032,34 @@ function runRebuild(options: CliOptions, engine: MemoryEngine): CliResult {
 /**
  * 由健康检查结果推导退出码（FR-F5）。
  *
- * 单独抽成纯函数，是为了让「索引不一致 ⇒ 退出码 1」这条约定能被直接断言：
- * 索引不一致是数据面内部的坏状态，端到端很难造出来，但退出码语义必须锁死。
+ * 单独抽成纯函数，是为了让判据能被直接断言：索引不一致是数据面内部的
+ * 坏状态，端到端很难造出来，但退出码语义必须锁死。
+ *
+ * ## 为什么配置也在判据里（真缺陷十五）
+ *
+ * 原实现只看 `indexOk`。于是下面这个场景报了「健康：正常」、退出 0：
+ *
+ * ```text
+ * patch 写成 recall.absoluteThreshold: -5
+ *   → 宿主 resolveConfig 抛错，插件根本没法加载
+ *   → memoryctl health 报「健康：正常」、exit 0
+ * ```
+ *
+ * 而「一条命令报健康/异常」恰恰是为这种时候存在的：用户发现记忆不生效，
+ * 跑一条 health，得到的答案是「一切正常」。**一个报错的观测点比没有
+ * 观测点更危险，因为人会信它。**
+ *
+ * 配置降级（读不到 patch 或校验失败退回默认值）与索引不一致是**两件不同的事**，
+ * 但对「这个库现在能不能用」而言同样是否。两个字段都**必填**：
+ * 设成可选会让下一个调用方漏传，而漏传的后果恰恰是回到真缺陷十五。
  *
  * @param health - 只取判定所需字段，便于单测构造。
- * @returns 索引一致时 {@link EXIT_OK}，否则 {@link EXIT_UNHEALTHY}。
+ * @param health.indexOk - 索引与卡片是否一致。
+ * @param health.configOk - 配置是否真的被读到并通过校验（`!degraded`）。
+ * @returns 两项都正常时 {@link EXIT_OK}，否则 {@link EXIT_UNHEALTHY}。
  */
-export function healthExitCode(health: { indexOk: boolean }): number {
-  return health.indexOk ? EXIT_OK : EXIT_UNHEALTHY
+export function healthExitCode(health: { indexOk: boolean; configOk: boolean }): number {
+  return health.indexOk && health.configOk ? EXIT_OK : EXIT_UNHEALTHY
 }
 
 /**
@@ -1007,12 +1077,19 @@ function runHealth(
   options: CliOptions, store: MemoryStore, engine: MemoryEngine, resolved: ResolvedCliConfig,
 ): CliResult {
   const health = engine.health()
-  const code = healthExitCode(health)
+  // 配置降级与索引不一致都是「这个库现在不能信」。
+  // 用 `!resolved.degraded` 而不是重新算一遍校验：判据只能有一份。
+  const configOk = !resolved.degraded
+  const code = healthExitCode({ indexOk: health.indexOk, configOk })
   if (options.json) {
     return {
       code,
       stdout: jsonText({
         ...health,
+        // 首行的 `healthy` 必须与退出码一致，否则脚本读 json 与读 exit code
+        // 会得到相反结论。不重新算，直接用同一个结果覆盖。
+        healthy: code === EXIT_OK,
+        configOk,
         dataDir: store.dir,
         configSource: resolved.source,
         spreadMode: resolved.config.spread.mode,
@@ -1021,7 +1098,10 @@ function runHealth(
     }
   }
   const lines = [
-    `健康：${health.healthy ? '正常' : '异常'}`,
+    // 文案也由 `code` 推出，不单独算。原写法 `health.healthy ? ...`
+    // 与退出码依赖两个不同字段，现在只靠巧合一致——
+    // 一旦判据变形，就会出现「报异常却 exit 0」这种最坏的组合。
+    `健康：${code === EXIT_OK ? '正常' : '异常'}`,
     `活跃：${health.active} 张`,
     `归档：${health.archived} 张`,
     `图谱边：${health.edges} 条`,
@@ -1030,6 +1110,10 @@ function runHealth(
     // 配置来源与扩散模式必须报出来：健康检查是运维判断「这个库现在是什么样」
     // 的唯一入口，而 CLI 曾经用库默认值（shadow）而宿主用 patch（on），
     // 同一个库报出两套分数。报出来才能让人发现两边不一致。
+    // 「配置来源」告诉人配置从哪来，但「配置是否可用」是另一件事。
+    // 只报来源的话，`DEFAULT_CONFIG（patch 非法）` 这一行需要读者自己
+    // 从括号里推断严重性——而它与第一行「健康」是同一个结论。
+    `配置：${configOk ? '正常' : '异常（本次使用库默认配置，不是你配的那份）'}`,
     `配置来源：${resolved.source}`,
     `扩散模式：${resolved.config.spread.mode}`,
   ]
@@ -1336,7 +1420,7 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
   // （校验报错 / 开库报错），而回滚正是为了修复那个错误——
   // **先校验等于拒绝救自己**。它也不需要开库：台账是目录里的独立文件，
   // 不经事件日志（见 `src/store/configLedger.ts` 的模块注释）。
-  const configDataDir = options.dataDir ?? cliConfig.storage.dataDir
+  const configDataDir = options.dataDir ?? resolved.dataDir
   if (options.command === 'config') {
     // 传 `baseline` 而不是 `cliConfig`：patch 已坏时 `cliConfig` 已退回默认值，
     // 拿它当「当前值」会让回滚误以为「已经就是目标值」而什么都不写。
@@ -1349,7 +1433,9 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
     return storeFailure(`配置校验失败：\n${validation.errors.map((line) => `- ${line}`).join('\n')}`)
   }
 
-  const dataDir = options.dataDir ?? cliConfig.storage.dataDir
+  // 与 `config` 子命令同一个来源：配置坏掉时也要看用户那个库，
+  // 不能因为配置降级就把整个库换成默认目录（真缺陷十六）。
+  const dataDir = options.dataDir ?? resolved.dataDir
   let store: MemoryStore
   try {
     store = openStore({ config: cliConfig, dataDir })

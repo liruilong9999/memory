@@ -26,6 +26,7 @@ import { buildCardId } from '../../src/core/types.ts'
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
 import { loadPatchConfig } from '../../src/host/patchConfig.ts'
+import { resolveConfig } from '../../src/host/adapter.ts'
 import { openStore } from '../../src/store/store.ts'
 import { makeTempDir, removeDirContents } from '../store/helpers.ts'
 
@@ -265,9 +266,99 @@ describe('health（FR-F5）', () => {
     assert.equal(typeof payload['dataDir'], 'string')
   })
 
-  it('索引不一致时退出码为 1', () => {
-    assert.equal(healthExitCode({ indexOk: true }), EXIT_OK)
-    assert.equal(healthExitCode({ indexOk: false }), EXIT_UNHEALTHY)
+  it('索引不一致或配置不可用时退出码都为 1', () => {
+    // 四种组合全写出来：只写「都正常」与「都异常」两条的话，
+    // 一个 `&&` 写成 `||` 的实现也会全绿。
+    assert.equal(healthExitCode({ indexOk: true, configOk: true }), EXIT_OK)
+    assert.equal(healthExitCode({ indexOk: false, configOk: true }), EXIT_UNHEALTHY)
+    assert.equal(healthExitCode({ indexOk: true, configOk: false }), EXIT_UNHEALTHY)
+    assert.equal(healthExitCode({ indexOk: false, configOk: false }), EXIT_UNHEALTHY)
+  })
+
+  it('配置坏到宿主起不来时，health 报异常且退出码为 1（真缺陷十五）', () => {
+    // 这是 FR-F5 验收口径「一条命令报健康/异常」最需要它生效的场景：
+    // patch 写坏了，宿主根本加载不了插件，用户发现记忆不生效。
+    // 原实现在这里报「健康：正常」、exit 0——一个报错的观测点比没有
+    // 观测点更危险，因为人会信它。
+    const dir = tempDir()
+    const patch = join(dir, 'cordis.patch.yml')
+    writeFileSync(patch, [
+      'config:',
+      '  recall:',
+      '    absoluteThreshold: -5',
+      '',
+    ].join('\n'), 'utf8')
+
+    // 前提防御：这份 patch 必须真的是坏的，
+    // 否则下面两条断言可能绿在「根本没读到配置」上。
+    const loaded = loadPatchConfig(patch)
+    assert.equal(loaded.ok, true, '前提：patch 必须能被读到（否则测的是另一条路）')
+    assert.throws(
+      () => resolveConfig(loaded.ok ? loaded.config : {}),
+      /absoluteThreshold/u,
+      '前提：这份配置必须使宿主抛错',
+    )
+
+    const result = runCli(['health', '--data-dir', dir], { configPath: patch })
+    assert.equal(result.code, EXIT_UNHEALTHY)
+    assert.match(result.stdout, /健康：异常/u)
+    // 配置那一行也必须说异常：否则读人只看到一个孤零零的「异常」
+    // 而不知道哪里坏了（索引那行会报「一致」）。
+    assert.match(result.stdout, /配置：异常/u)
+
+    // json 的 `healthy` 与退出码必须同一个结论。
+    // 否则脚本读 json 得到 `healthy: true`、读 exit code 得到 1，
+    // **同一条命令报两个相反的结果**——与真缺陷七
+    //（同一张卡报两个总分）同形。
+    const asJson = runCli(['health', '--data-dir', dir, '--json'], { configPath: patch })
+    assert.equal(asJson.code, EXIT_UNHEALTHY)
+    const payload = JSON.parse(asJson.stdout) as Record<string, unknown>
+    assert.equal(payload['healthy'], false, 'json 的 healthy 不能与退出码相反')
+    assert.equal(payload['configOk'], false)
+  })
+
+  it('配置坏掉时仍然看的是用户那个库，不是默认空库（真缺陷十六）', () => {
+    // 探针实测过的一幕：用户库里有 3 张卡，patch 写成 `-5` 之后
+    // 敲一句 `health`，报的是**另一个目录**、活跃 0 张。
+    // 用户看到的不是「配置坏了」，而是「我那 3 条记忆丢了」——
+    // 而它们好端端地在另一个目录里。**看错库比报错库更危险。**
+    //
+    // 这条与上一条必须分开：上一条只验「有没有报异常」，
+    // 它在「报了异常但看错了库」的实现下依然全绿。
+    const dir = tempDir()
+    const userData = join(dir, 'user-library')
+    seedStore(userData)
+    const patch = join(dir, 'cordis.patch.yml')
+    writeFileSync(patch, [
+      'config:',
+      '  storage:',
+      `    dataDir: '${userData.replace(/\\/g, '/')}'`,
+      '  recall:',
+      '    absoluteThreshold: -5',
+      '',
+    ].join('\n'), 'utf8')
+
+    // 不给 `--data-dir`：用户真实用法就是只敲 `health`。
+    const result = runCli(['health'], { configPath: patch })
+    assert.equal(result.code, EXIT_UNHEALTHY)
+    // 前提防御：库里必须真的有卡，否则「报 0 张」与「看错库」分不出来。
+    assert.match(result.stdout, /活跃：2 张/u, '前提：用户库里应有 2 张活跃卡')
+    assert.ok(
+      result.stdout.includes(userData),
+      `数据目录必须是用户那个，实际输出：\n${result.stdout}`,
+    )
+  })
+
+  it('patch 完全读不到时也报异常（库能打开不等于配置对）', () => {
+    // 这条与上一条是**两条不同的路**：上一条是「读到了但不合法」，
+    // 这一条是「根本没读到」。两条路都得报异常——
+    // 因为用户配的那份没生效，他看到的行为与他的意图无关。
+    const dir = tempDir()
+    const missing = join(dir, '不存在的-patch.yml')
+    const result = runCli(['health', '--data-dir', dir], { configPath: missing })
+    assert.equal(result.code, EXIT_UNHEALTHY)
+    assert.match(result.stdout, /健康：异常/u)
+    assert.match(result.stdout, /配置：异常/u)
   })
 
   it('统计到已种下的卡片', () => {
@@ -695,7 +786,15 @@ describe('CLI 与宿主必须用同一份配置（真缺陷九）', () => {
       ['health', '--data-dir', dir],
       { now: fixedClock, configPath: 'D:/不存在的目录/cordis.patch.yml' },
     )
-    assert.equal(result.code, EXIT_OK, '配置读不到不该让健康检查失败')
+    // 这条断言曾经写的是 `EXIT_OK`，理由是「配置读不到不该让
+    // 健康检查失败」。**那把缺陷固化成了契约**：
+    // 配置读不到时插件按默认值运行，用户配的那份一行都没生效，
+    // 而他跑 health 得到的答案是「一切正常」。那正是 FR-F5 要报的异常。
+    // 保留下来的那一半仍然成立：库本身没坏（索引一致、卡片读得出），
+    // 所以输出里「索引」那行仍报一致——两件事分开报，但退出码要能被脚本判断。
+    assert.equal(result.code, EXIT_UNHEALTHY, '配置降级不能报成健康')
+    assert.match(result.stdout, /索引：一致/u, '库本身确实没坏，这一行不该跟着变异常')
+    assert.match(result.stdout, /配置：异常/u)
     assert.match(result.stderr, /配置提醒/u, '退回默认值必须报出来')
     assert.match(result.stderr, /默认配置/u)
   })
