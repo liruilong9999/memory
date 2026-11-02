@@ -945,3 +945,121 @@ describe('影子观察值的可观测出口（FR-G1 / FR-F1）', () => {
     assert.equal(lib.logs.length, before, 'peek 不得写日志')
   })
 })
+
+/**
+ * ST-1 验收口径：「连续 10 次召回结果完全一致」。
+ *
+ * 原有那条「同样查询两次结果一致」只做 2 次，而需求写的是 10 次。差的不只是
+ * 数量——**2 次只能发现「第 2 次就变了」的错误**，发现不了「前几次稳定、
+ * 后面逐渐漂移」的错误，而那恰恰是最容易发生的形态：
+ *
+ * - 召回若累积任何状态（访问计数、最近访问时间、边权），结果会**单调漂移**，
+ *   第 2 次和第 1 次差异极小（可能还没跨过排序临界点），第 10 次才看得出来；
+ * - 浮点累积误差同理，它是**累加**的，样本太少时低于可见分辨率。
+ *
+ * 所以这里不是把 2 改成 10 就算完，还要断言**每一次都与第 1 次逐字段相同**
+ * （不只是卡片 id 顺序），以及**库状态在 10 次召回前后完全没变**。
+ */
+describe('ST-1 连续 10 次召回完全一致（需求规格 12.1）', () => {
+  /** 造一个有足够多卡、能产生真实排序的库。 */
+  function richLibrary(): { store: MemoryStore; engine: MemoryEngine; dir: string } {
+    const dir = tempDir()
+    const store = openStore({ dataDir: dir })
+    const engine = new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock: () => T0 })
+    // 十几张卡、部分共享实体（能产出边），确保排序不是平凡的单元素列表。
+    const texts = [
+      '决定「CordisPlugin」的版本用「ThreePointTwo」',
+      '决定「CordisPlugin」需要重新构建，因为「BuildScript」有问题',
+      '项目用什么开发',
+      '项目用什么开发语言，决定用 TypeScript',
+      '部署走 CI 流水线',
+      '部署方案改成分阶段发布',
+      '数据库选型定 PostgreSQL',
+      '数据库备份每天凌晨跑',
+      '日志格式统一成 JSON',
+      '日志保留三十天',
+      '接口超时设为三秒',
+      '接口重试两次',
+    ]
+    for (let index = 0; index < texts.length; index += 1) {
+      engine.writeTurn(turnInput({ userText: texts[index]!, turn: index + 1, at: T0 + index * 1000 }))
+    }
+    engine.consolidate(T0 + 20_000)
+    return { store, engine, dir }
+  }
+
+  it('连续 10 次召回，每次结果与第 1 次逐字段相同', () => {
+    const lib = richLibrary()
+    const query = '项目用什么开发'
+
+    const first = lib.engine.recall(query)
+    // 前提：必须真的召回了一些卡，否则「10 次都是空」也能通过——那是空绿。
+    assert.ok(first.pack.cards.length > 0, '前提：这个查询必须命中至少一张卡')
+
+    // 比较的必须是**完整可观察输出**，不只是 id 顺序：
+    // 分数若漂移，排序可能暂时不变，但 injected 文本/总分已经变了。
+    const baseline = JSON.stringify(first.pack.cards.map((item) => ({
+      id: item.card.id,
+      total: item.score.total,
+      text: item.card.text,
+      explain: item.explain,
+      shadow: item.shadowSpread ?? null,
+    })))
+
+    for (let round = 2; round <= 10; round += 1) {
+      const next = lib.engine.recall(query)
+      const actual = JSON.stringify(next.pack.cards.map((item) => ({
+        id: item.card.id,
+        total: item.score.total,
+        text: item.card.text,
+        explain: item.explain,
+        shadow: item.shadowSpread ?? null,
+      })))
+      assert.equal(actual, baseline, `第 ${round} 次召回与第 1 次不一致（ST-1 要求 10 次完全一致）`)
+      assert.equal(next.pack.tokens, first.pack.tokens, `第 ${round} 次的 token 占用变了`)
+      assert.equal(next.candidates, first.candidates, `第 ${round} 次的候选数变了`)
+    }
+    lib.store.close()
+  })
+
+  it('10 次召回前后库状态完全没变（recall 不得写库）', () => {
+    // ST-1 的「一致」如果靠「每次都重新算一遍、顺便把状态也改了」来实现，
+    // 那 10 次看起来一致只是巧合。必须同时断言**副作用为零**。
+    const lib = richLibrary()
+    const snapshot = (): string => JSON.stringify({
+      cards: lib.store.listCards().map((card) => ({
+        id: card.id, strength: card.strength, accessCount: card.accessCount,
+        lastAccessAt: card.lastAccessAt, updatedAt: card.updatedAt,
+      })).sort((a, b) => (a.id < b.id ? -1 : 1)),
+      edges: lib.store.allEdges().map((edge) => ({ id: edge.id, weight: edge.weight }))
+        .sort((a, b) => (a.id < b.id ? -1 : 1)),
+    })
+
+    const before = snapshot()
+    for (let round = 1; round <= 10; round += 1) lib.engine.recall('项目用什么开发')
+    assert.equal(snapshot(), before, 'recall 不得改动卡片状态或边权')
+    lib.store.close()
+  })
+
+  it('重开后连续 10 次仍一致，且与重开前一致（跨进程口径）', () => {
+    // 真正的 ST-1 是「重启一致」：同一份日志，重开进程后重算，结果必须相同。
+    // 只在同一个实例上跑 10 次，测不到「重放顺序是否影响结果」。
+    const lib = richLibrary()
+    const query = '项目用什么开发'
+    const beforeRestart = lib.engine.recall(query).pack.cards.map((item) => ({
+      id: item.card.id, total: item.score.total,
+    }))
+    assert.ok(beforeRestart.length > 0, '前提：重开前必须召回出卡')
+    lib.store.close()
+
+    const reopened = openStore({ dataDir: lib.dir })
+    const engineB = new MemoryEngine({ store: reopened, config: DEFAULT_CONFIG, timeZone: TZ, clock: () => T0 })
+    for (let round = 1; round <= 10; round += 1) {
+      const after = engineB.recall(query).pack.cards.map((item) => ({
+        id: item.card.id, total: item.score.total,
+      }))
+      assert.deepEqual(after, beforeRestart, `重开后第 ${round} 次召回与重开前不一致`)
+    }
+    reopened.close()
+  })
+})

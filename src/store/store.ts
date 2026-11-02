@@ -450,14 +450,33 @@ export function openStore(options: StoreOptions = {}): MemoryStore {
 export function deriveIdempotencyKey(op: JournalOp): string {
   switch (op.op) {
     case 'put':
-      // 指纹取「版本时刻 + 文本 + 冲突列表」：这三者是 put 后可能变化的语义字段。
-      // 同一轮重复抽取会得到完全相同的卡（同 id、同 updatedAt、同内容），键相同 → 幂等。
+      // 指纹必须覆盖 **put 后可能变化的全部语义字段**。
+      //
+      // 这里曾经只取「id + updatedAt + text + conflictOf」，而注释却声称
+      // 它能防止「冲突标记回写、强度调整、状态变更」被丢弃——**注释比实现
+      // 诚实得多**。实测（`.tmp/probe-putdrop.ts`）：
+      //
+      //   首次写入 strength 0.6 → 只改 strength 再写 → written: false
+      //   读回还是 0.6，重放后仍是 0.6
+      //
+      // status / accessCount 同理，全部静默丢弃。
+      //
+      // 为什么长期没暴露：每个真实改动路径都**恰好**顺带更新了 `updatedAt`
+      // （`decayCard` 改 strength 时一并置 updatedAt = now），于是键碰巧变了。
+      // 这是**靠巧合安全**，不是靠规则安全——只要有新的调用方只改强度不改
+      // updatedAt，缺陷立刻复活。
+      //
+      // 现在把三个易变语义字段显式纳入：strength / status / accessCount。
+      // 不纳入 `lastAccessAt`：它与 `accessCount` 同步变化，纳入只是冗余。
       return buildIdempotencyKey(
         'put',
         op.card.id,
         String(op.card.updatedAt),
         op.card.text,
         op.card.conflictOf.join(','),
+        String(op.card.strength),
+        op.card.status,
+        String(op.card.accessCount),
       )
     case 'revise':
       return buildIdempotencyKey('revise', op.id, op.text, String(op.at))

@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 
 import { buildEdgeId } from '../../src/core/types.ts'
-import type { MemoryEdge } from '../../src/core/types.ts'
+import type { MemoryCard, MemoryEdge } from '../../src/core/types.ts'
 import { ConcurrentWriterError, ReadOnlyModeError } from '../../src/store/journal.ts'
 import { MemoryStore, deriveIdempotencyKey, openStore } from '../../src/store/store.ts'
 import { makeCard, makeConfig, makeSource, makeTempDir, removeDirContents } from './helpers.ts'
@@ -562,5 +562,87 @@ describe('进程内并发写入', () => {
     assert.equal(reader.count(), N, '重放后条数必须一致（无丢失）')
     assert.equal(reader.snapshot().lastSeq, N, '重放后序号水位必须一致（无重复）')
     reader.close()
+  })
+})
+
+/**
+ * put 的幂等键必须覆盖**全部易变语义字段**（FR-A2 / ST-2）。
+ *
+ * 这是 `edge` 分支那个缺陷的**同源兄弟**，而且更隐蔽：`edge` 分支当时是
+ * 从来没被要求改权重，而 `put` 分支的注释**明确写着**它防的是「冲突标记回写、
+ * 强度调整、状态变更」——注释描述的比实现做的多得多。
+ *
+ * 实测（修复前）：
+ *
+ * | 只改这个字段 | written | 读回 |
+ * |---|---|---|
+ * | `strength` 0.6 → 0.2 | **false** | 0.6 |
+ * | `status` active → archived | **false** | active |
+ * | `accessCount` 0 → 7 | **false** | 0 |
+ *
+ * 三条全部静默丢弃，重放后仍是旧值，**不报错、不告警**。
+ *
+ * 为什么长期没暴露：每个真实改动路径都**恰好**顺带更新了 `updatedAt`
+ * （`decayCard` 改 strength 时一并置 `updatedAt = now`），于是键碰巧变了。
+ * **靠巧合安全**：只要来一个只改强度不改 updatedAt 的调用方，缺陷立刻复活。
+ */
+describe('put 幂等键覆盖全部易变字段（FR-A2）', () => {
+  /** 只改一个字段时，幂等键必须变化。 */
+  function keyOf(over: Partial<MemoryCard>): string {
+    const card = makeCard({ id: 'a' })
+    return deriveIdempotencyKey({ op: 'put', card: { ...card, ...over } })
+  }
+
+  it('只改 strength 应产生新键（回归：强度调整曾被静默丢弃）', () => {
+    const card = makeCard({ id: 'a' })
+    assert.notEqual(
+      deriveIdempotencyKey({ op: 'put', card }),
+      keyOf({ strength: card.strength + 0.1 }),
+      '只改 strength 时幂等键必须变化，否则强度调整会被静默丢弃',
+    )
+  })
+
+  it('只改 status 应产生新键（回归：归档状态曾被静默丢弃）', () => {
+    const card = makeCard({ id: 'a' })
+    assert.notEqual(
+      deriveIdempotencyKey({ op: 'put', card }),
+      keyOf({ status: 'archived' }),
+      '只改 status 时幂等键必须变化，否则状态变更会被静默丢弃',
+    )
+  })
+
+  it('只改 accessCount 应产生新键（回归：访问计数曾被静默丢弃）', () => {
+    const card = makeCard({ id: 'a' })
+    assert.notEqual(
+      deriveIdempotencyKey({ op: 'put', card }),
+      keyOf({ accessCount: card.accessCount + 1 }),
+      '只改 accessCount 时幂等键必须变化',
+    )
+  })
+
+  it('只改 strength 时真的能从磁盘重放出来（端到端，不是只看键）', () => {
+    // 键变化只是手段，**重放读回新值**才是目的。幂等键影响的是「日志里有没有
+    // 这条记录」，只看内存视图可能看不出问题，必须从磁盘重放。
+    const dir = tempDir()
+    const store = openStore({ config: makeConfig(), dataDir: dir })
+    const card = makeCard({ id: 'a', strength: 0.6 })
+    assert.equal(store.putCard(card).written, true)
+
+    assert.equal(store.putCard({ ...card, strength: 0.2 }).written, true, '只改强度必须能写入')
+    store.close()
+
+    const reopened = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(reopened.getCard('a')?.strength, 0.2, '重放后必须是新强度')
+    reopened.close()
+  })
+
+  it('内容完全相同的重复提交仍然幂等（改完不能破坏 ST-2）', () => {
+    // 加字段最怕的副作用：把「重复提交」也当成「内容变了」。
+    const card = makeCard({ id: 'a' })
+    assert.equal(
+      deriveIdempotencyKey({ op: 'put', card }),
+      deriveIdempotencyKey({ op: 'put', card: { ...card } }),
+      '所有字段都相同时，键必须相同（ST-2）',
+    )
   })
 })
