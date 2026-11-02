@@ -12,6 +12,21 @@
  */
 
 /**
+ * 判断字符串里是否含汉字（CJK 统一表意文字）。
+ *
+ * 为什么需要它：文件路径与需求编号两条规则原先用 `\w` 与 `[A-Z][a-z]+`，
+ * 两者都不含汉字，于是 `docs/1-需求规格.md` 被截成 `docs/1-`、
+ * `FR-G1` 直接抽不出。这不是「少抽几个词」，是**锚点被截断成假锚点**：
+ * `docs/1-` 会让所有 `docs/1-*` 文件错误地共享同一个实体键。
+ *
+ * @param value - 待检查字符串。
+ * @returns 是否含至少一个汉字。
+ */
+function hasHan(value: string): boolean {
+  return /\p{Script=Han}/u.test(value)
+}
+
+/**
  * 中文停用词表。
  *
  * 只收录高频虚词。它们对「相关度」没有区分度，留着只会抬高所有卡的分数。
@@ -247,8 +262,12 @@ export function extractEntities(raw: string): string[] {
     found.push(trimmed)
   }
 
-  // 1) 文件路径：至少含一个分隔符且有扩展名，或明显的目录形式。
-  for (const m of raw.matchAll(/[\w.\-]+(?:[/\\][\w.\-]+)+/gu)) {
+  // 1) 文件路径：至少含一个分隔符。**路径段必须允许汉字**——
+  //    原先用 `[\w.\-]`，`\w` 不含汉字，于是 `docs/1-需求规格.md` 被截成
+  //    `docs/1-`。截断比抽不出更坏：`docs/1-` 会成为**假锚点**，让
+  //    `docs/1-需求规格.md` 与 `docs/1-架构设计.md` 错误地共享同一个实体键，
+  //    从而连出一条本该不存在的 same-entity 边。
+  for (const m of raw.matchAll(/[\w.\-\p{Script=Han}]+(?:[/\\][\w.\-\p{Script=Han}]+)+/gu)) {
     push(m[0])
   }
   // 2) URL。
@@ -265,6 +284,27 @@ export function extractEntities(raw: string): string[] {
   // 4) 引号内的专名：《》「」“”''。
   for (const m of raw.matchAll(/[《「“'']([^》」”'']{2,20})[》」”'']/gu)) {
     push(m[1] ?? '')
+  }
+  // 4.5) 编号形态的标识符：`FR-G1` / `ST-1` / `Q-06` / `D-08`。
+  //
+  // 这类串是**本仓库文档里最高频的锚点**，而原五条规则一条都抽不出来：
+  // 规则 3 要求驼峰或下划线（`FR-G1` 两者都不是），规则 5 要求
+  // `[A-Z][a-z]+`（`FR` 没有小写）。实测 `FR-G1` / `ST-1` 均返回 `[]`。
+  //
+  // 形态判据刻意收得很窄（2+ 个大写字母 + 连字符 + 数字），因为这类
+  // 形态在自然语言里几乎不会偶然出现，误抽风险接近 0。
+  for (const m of raw.matchAll(/\b[A-Z]{2,}-[A-Z]?\d+\b/gu)) {
+    push(m[0])
+  }
+  // 4.6) 小写连字符术语：`dsh-memory` / `same-topic` / `event-log`。
+  //
+  // 同样一条原规则都抽不出：规则 3 要求驼峰或下划线，规则 5 要求首字母大写。
+  // 而项目名恰恰是中文对话里最该被当成锚点的东西——实测 `dsh-memory` 返回 `[]`。
+  //
+  // 门槛：整串 ≥ 5 字符且至少两段，避开 `e-mail` / `up-to` 这类两段短词。
+  for (const m of raw.matchAll(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/gu)) {
+    if (m[0].length < 5) continue
+    push(m[0])
   }
   // 5) 裸专有名词：首字母大写 + 至少一个小写字母（或直接跟数字）。
   //    英文常用词排除表挡住英文句首的 The / This / When 之类。

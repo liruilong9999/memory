@@ -183,3 +183,53 @@ test('splitSentences 按中文句号切分', () => {
 test('splitSentences 过滤空白句', () => {
   assert.deepEqual(splitSentences('  。  '), ['。'])
 })
+
+describe('extractEntities 中文语料下的锚点（图谱连边的输入）', () => {
+  // 这一组守的是「中文场景下图谱能不能连起来」。
+  //
+  // 原实现五条规则全部抽不出下列任何一种形态，而它们恰恰是本仓库
+  // 中文文档里最高频的锚点。后果不是「少抽几个词」，而是
+  // same-entity 边恒为空 ⇒ 图谱恒为空 ⇒ 扩散激活没有边可走
+  // ⇒ 需求规格 §7.7 的 FR-G1「突触效果」在真实数据上永远不可见。
+  //
+  // 最危险的一条是中文路径被**截断**：截断会产生假锚点，
+  // 让不同文件错误地共享同一个实体键，比抽不出更容易被误信。
+
+  test('中文文件名路径不被截断（截断会造出假锚点）', () => {
+    const entities = extractEntities('见 docs/1-需求规格.md 的第 7 节')
+    assert.ok(
+      entities.includes('docs/1-需求规格.md'),
+      `必须抽出完整路径，实际得到 ${JSON.stringify(entities)}`,
+    )
+    // 反向断言：绝不能留下被截断的残片。只断言 includes 完整路径不够——
+    // 截断残片可以同时存在，那样假锚点照样会进图谱。
+    assert.ok(
+      !entities.some((e) => e === 'docs/1-'),
+      `不能出现截断残片，实际得到 ${JSON.stringify(entities)}`,
+    )
+  })
+
+  test('不同中文文件名不共享实体键（截断会让它们撞在一起）', () => {
+    const a = extractEntities('见 docs/1-需求规格.md')
+    const b = extractEntities('见 docs/1-架构设计.md')
+    assert.notDeepEqual(a, b, '两个不同文件必须抽出不同的实体')
+  })
+
+  test('小写连字符项目名能被抽出', () => {
+    assert.ok(extractEntities('项目 dsh-memory 是插件').includes('dsh-memory'))
+  })
+
+  test('需求编号能被抽出', () => {
+    const entities = extractEntities('FR-G1 要求扩散激活，对应 ST-1 确定性')
+    assert.ok(entities.includes('FR-G1'), `实际 ${JSON.stringify(entities)}`)
+    assert.ok(entities.includes('ST-1'), `实际 ${JSON.stringify(entities)}`)
+  })
+
+  test('无引号纯中文专名仍然抽不出（已知能力边界，不是缺陷）', () => {
+    // 这条测试的作用是**把边界写成契约**，而不是假装它已解决。
+    // 零依赖做中文专名抽取需要名词边界知识（分词词典），
+    // 引入词典会破坏 ST-1 确定性与 NFR-1 零依赖。
+    // 详见 docs/7 缺陷二十三。
+    assert.deepEqual(extractEntities('夜整理会在凌晨三点自动跑一次'), [])
+  })
+})
