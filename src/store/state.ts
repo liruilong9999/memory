@@ -252,8 +252,16 @@ function coerceCard(raw: unknown): MemoryCard | null {
   // FR-D3：重复方式必须穿过重放层，否则「每日提醒」重放后变成一次性。
   // 与 coerceKind 同理：**已知保留 / 未知丢弃**——未知值丢弃而不是透传，
   // 因为它会直接决定 nextDueAfter 的推进步长，错值比缺值更危险。
-  if (raw['dueRepeat'] === 'once' || raw['dueRepeat'] === 'daily' || raw['dueRepeat'] === 'weekly') {
+  if (
+    raw['dueRepeat'] === 'once' || raw['dueRepeat'] === 'daily'
+    || raw['dueRepeat'] === 'weekly' || raw['dueRepeat'] === 'cron'
+  ) {
     card.dueRepeat = raw['dueRepeat']
+  }
+  // cron 表达式必须与 dueRepeat 一起穿过重放层：'cron' 这个值本身不含
+  // 「什么时候再响」的信息，丢了表达式，重放后这张卡就再也算不出下一次。
+  if (typeof raw['cronExpression'] === 'string' && raw['cronExpression'].length > 0) {
+    card.cronExpression = raw['cronExpression']
   }
   return card
 }

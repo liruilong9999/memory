@@ -17,7 +17,16 @@
  */
 
 import type { DueRepeat } from '../core/types.ts'
-import { localDate, zonedParts } from './clock.ts'
+import { localDate, zonedParts, ymd, zonedTimeToMs } from './clock.ts'
+import { nextCronAfter, parseCron } from './cron.ts'
+
+// `ymd` / `zonedTimeToMs` 的实现在 `clock.ts`，这里重新导出以保持既有
+// 调用方不变。**它们原本定义在本文件**，但 `cron.ts` 也要用，
+// 若两边互相 import 就成环（`due.ts` → `cron.ts` → `due.ts`），
+// 而 ESM 的循环依赖在求值顺序上会给出 `undefined`，表现为
+// 运行时 `TypeError: ymd is not a function`——比编译期报错难查得多。
+// 共用的时区换算属于 `clock.ts` 的职责，下沉是正解。
+export { ymd, zonedTimeToMs } from './clock.ts'
 
 /** 重复方式：一次性 / 每日 / 每周。定义在契约层，此处仅转出。 */
 export type { DueRepeat } from '../core/types.ts'
@@ -30,6 +39,13 @@ export interface DueSpec {
   repeat: DueRepeat
   /** 命中的原文片段，便于解释「为什么认为有到期」。 */
   matched: string
+  /**
+   * cron 表达式原文，仅 `repeat === 'cron'` 时存在。
+   *
+   * 必须随 {@link DueSpec} 一起返回并落盘：`'cron'` 这个值本身不含
+   * 「什么时候再响」的信息，提醒响过之后手上只有卡片、没有原始语境。
+   */
+  cronExpression?: string
 }
 
 /** 中文数字到阿拉伯数字。 */
@@ -80,55 +96,6 @@ export function isoWeekday(at: number, timeZone: string): number {
     Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
   }
   return table[name] ?? 1
-}
-
-/**
- * 取某时刻在指定时区的年/月/日。
- *
- * @param at - 毫秒时间戳。
- * @param timeZone - IANA 时区。
- * @returns 年月日三元组。
- */
-export function ymd(at: number, timeZone: string): { year: number; month: number; day: number } {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-  })
-  const parts = fmt.formatToParts(new Date(at))
-  const get = (type: string): number => Number.parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10)
-  return { year: get('year'), month: get('month'), day: get('day') }
-}
-
-/**
- * 构造「某地某日某时某分」对应的毫秒时间戳。
- *
- * 用迭代法修正时区偏移：先按 UTC 造一个候选时刻，量出它在该时区与目标的差，
- * 补偿后重测一次。两次足够收敛（夏令时切换日可能有 ±1 小时残差，
- * 但提醒场景可接受，且不会无限循环）。
- *
- * @param year - 年。
- * @param month - 月（1..12）。
- * @param day - 日（1..31）。
- * @param hour - 时（0..23）。
- * @param minute - 分（0..59）。
- * @param timeZone - IANA 时区。
- * @returns 毫秒时间戳。
- */
-export function zonedTimeToMs(
-  year: number, month: number, day: number, hour: number, minute: number, timeZone: string,
-): number {
-  const target = Date.UTC(year, month - 1, day, hour, minute, 0, 0)
-  let candidate = target
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const actual = zonedParts(candidate, timeZone)
-    const actualDate = ymd(candidate, timeZone)
-    const actualMs = Date.UTC(
-      actualDate.year, actualDate.month - 1, actualDate.day, actual.hour, actual.minute, 0, 0,
-    )
-    const diff = target - actualMs
-    if (diff === 0) break
-    candidate += diff
-  }
-  return candidate
 }
 
 /**
@@ -281,9 +248,24 @@ export function parseDayOffset(
  * @returns 下一次到期时刻；不再重复时返回 `null`。
  */
 export function nextDueAfter(
-  dueAt: number, repeat: DueRepeat, now: number, timeZone: string, maxCatchUp = 400,
+  dueAt: number,
+  repeat: DueRepeat,
+  now: number,
+  timeZone: string,
+  options: { maxCatchUp?: number; cronExpression?: string; cronSearchDays?: number } = {},
 ): number | null {
   if (repeat === 'once') return null
+  if (repeat === 'cron') {
+    // cron 不能靠「上次 + 步长」推进：下一次命中与前一次之间没有固定间隔
+    // （`0 9 * * 1-5` 周五之后是下周一）。所以必须重新解析表达式、
+    // 从 now 起重新求下一次。
+    const expression = options.cronExpression ?? ''
+    const spec = parseCron(expression)
+    if (spec === null) return null
+    // 搜索上界默认 366 天；调用方（engine）传配置值。
+    return nextCronAfter(spec, Math.max(now, dueAt), timeZone, options.cronSearchDays ?? 366)
+  }
+  const maxCatchUp = options.maxCatchUp ?? 400
   const stepDays = repeat === 'weekly' ? 7 : 1
   const clock = zonedParts(dueAt, timeZone)
   let cursor = dueAt
@@ -301,11 +283,32 @@ export function nextDueAfter(
 }
 
 export function parseDue(
-  text: string, now: number, timeZone: string, defaultHour = 9,
+  text: string,
+  now: number,
+  timeZone: string,
+  defaultHour = 9,
+  cronSearchDays = 366,
 ): DueSpec | null {
   // 先确认这句话真的在说「未来要做的事」，否则「今天很累」也会被解析成提醒。
   if (!/(提醒|记得|别忘|不要忘|到点|到期|截止|deadline|闹钟|叫我|通知我)/u.test(text)) {
     return null
+  }
+
+  // cron 表达式优先：它是**显式**语法（`cron: 0 9 * * 1-5` 或裸写五字段），
+  // 语义由用户直接给定，比「每周」这类自然语言猜测更确定。
+  // 必须在 daily/weekly 判断之前——`0 9 * * 1-5` 里没有「每天」字样，
+  // 但含「每」字的中文句子里若同时出现 cron，cron 才是用户的本意。
+  const cronMatch = /cron\s*[:：]?\s*([^\n]+)/iu.exec(text)
+  const cronSpec = cronMatch === null ? null : parseCron(cronMatch[1] ?? '')
+  if (cronSpec !== null) {
+    // 搜索上界与 `defaultHour` 是两件事：前者是「向后找多少天」，
+    // 后者是「没说钟点时按几点算」。曾经把 defaultHour 当搜索天数传进来，
+    // 于是 `0 9 29 2 *` 只找 9 天就放弃，用户会看到「解析不出来」，
+    // 而真正的原因是搜索窗口被另一个参数顶掉了。**参数含义错位不会报错，
+    // 只会让功能在一个看似无关的场景里失效。**
+    const first = nextCronAfter(cronSpec, now, timeZone, cronSearchDays)
+    if (first === null) return null
+    return { dueAt: first, repeat: 'cron', matched: text.trim(), cronExpression: cronSpec.expression }
   }
 
   const clock = parseClockTime(text)

@@ -258,6 +258,17 @@ export interface ReminderPolicy {
    * 默认 60 秒，代价是最大 1 分钟的提醒延迟，远好于「只在用户开口时才发现已过期」。
    */
   pollMs: number
+  /**
+   * cron 表达式向后搜索的天数上限（FR-D3 的 cron 分支）。
+   *
+   * 必须有上界：`0 0 30 2 *`（2 月 30 日）永不存在，没有上界就是死循环。
+   * 默认 366 天覆盖闰年周期——「每年 2 月 29 日」这类表达式最坏要
+   * 找将近 4 年才命中一次，所以 366 只是**单次调用**的上界，
+   * 跨年搜索由调用方按需要调大。
+   *
+   * 不写死字面量：它是可标定参数，用户可能想要「只看未来 30 天」。
+   */
+  cronSearchDays: number
 }
 
 /** 完整配置。 */
@@ -464,7 +475,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 7,
+  configVersion: 8,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -556,6 +567,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
   reminder: {
     enabled: true,
     pollMs: 60 * 1000,
+    cronSearchDays: 366,
   },
   spread: {
     // 默认 `'shadow'`：**计算但不生效**。
@@ -597,7 +609,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 7
+export const MEMORY_CONFIG_VERSION = 8
 
 /** 配置校验结果。 */
 export interface ConfigValidation {

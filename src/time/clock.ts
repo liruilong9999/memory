@@ -204,3 +204,56 @@ export function zonedParts(at: number, timeZone: string): { hour: number; minute
   const minute = Number.parseInt(parts.find((p) => p.type === 'minute')?.value ?? '0', 10)
   return { hour, minute }
 }
+
+/**
+ * 取某时刻在指定时区的年/月/日。
+ *
+ * 定义在本文件而不是 `due.ts`：`due.ts` 与 `cron.ts` 都要用它，
+ * 放在任一侧都会让两个模块互相 import 成环，而 ESM 循环依赖会在
+ * 求值顺序上给出 `undefined`，表现为运行时 `TypeError`。
+ *
+ * @param at - 毫秒时间戳。
+ * @param timeZone - IANA 时区。
+ * @returns 年月日三元组。
+ */
+export function ymd(at: number, timeZone: string): { year: number; month: number; day: number } {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const parts = fmt.formatToParts(new Date(at))
+  const get = (type: string): number => Number.parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10)
+  return { year: get('year'), month: get('month'), day: get('day') }
+}
+
+/**
+ * 构造「某地某日某时某分」对应的毫秒时间戳。
+ *
+ * 用迭代法修正时区偏移：先按 UTC 造一个候选时刻，量出它在该时区与目标的差，
+ * 补偿后重测一次。两次足够收敛（夏令时切换日可能有 ±1 小时残差，
+ * 但提醒场景可接受，且不会无限循环）。
+ *
+ * @param year - 年。
+ * @param month - 月（1..12）。
+ * @param day - 日（1..31）。
+ * @param hour - 时（0..23）。
+ * @param minute - 分（0..59）。
+ * @param timeZone - IANA 时区。
+ * @returns 毫秒时间戳。
+ */
+export function zonedTimeToMs(
+  year: number, month: number, day: number, hour: number, minute: number, timeZone: string,
+): number {
+  const target = Date.UTC(year, month - 1, day, hour, minute, 0, 0)
+  let candidate = target
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const actual = zonedParts(candidate, timeZone)
+    const actualDate = ymd(candidate, timeZone)
+    const actualMs = Date.UTC(
+      actualDate.year, actualDate.month - 1, actualDate.day, actual.hour, actual.minute, 0, 0,
+    )
+    const diff = target - actualMs
+    if (diff === 0) break
+    candidate += diff
+  }
+  return candidate
+}

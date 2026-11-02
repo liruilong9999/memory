@@ -165,6 +165,18 @@ export interface MemoryCard {
    * 无法区分了——这正是 FR-D3 曾经永久静默的根因。
    */
   dueRepeat?: DueRepeat
+  /**
+   * cron 表达式（五字段：分 时 日 月 周），仅 `dueRepeat === 'cron'` 时有意义。
+   *
+   * 为什么必须和 `dueRepeat` 一起落盘：`'cron'` 这个值本身不含任何
+   * 「什么时候再响」的信息，光有它算不出下一次。而提醒响过之后手上
+   * 只有卡片、没有原始语境，无法重新解析用户那句话。
+   *
+   * 存**原文**而不是存解析后的 {@link CronSpec}：原文是人能核对的东西
+   * （用户看到 `0 9 * * 1-5` 能立刻判断对不对），而且解析器升级后
+   * 旧卡会自动按新规则解释，不必做数据迁移。
+   */
+  cronExpression?: string
 }
 
 /**
@@ -174,7 +186,7 @@ export interface MemoryCard {
  * 而依赖方向是 `time/ → core/`（`src/time/clock.ts` 就 import 了本文件）。
  * 反过来定义会让 core 依赖 time，破坏分层。
  */
-export type DueRepeat = 'once' | 'daily' | 'weekly'
+export type DueRepeat = 'once' | 'daily' | 'weekly' | 'cron'
 
 /* ------------------------------------------------------------------ *
  * 三、记忆图谱：起源「建立记忆图谱的方法，且跨层次关联」

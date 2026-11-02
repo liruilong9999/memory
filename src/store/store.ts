@@ -493,6 +493,9 @@ export function deriveIdempotencyKey(op: JournalOp): string {
         // 被走到，不再是理论风险。
         String(op.card.dueAt ?? ''),
         op.card.dueRepeat ?? '',
+        // cron 表达式也进指纹：改表达式同样是「同一张卡改语义」，
+        // 不进键就会被静默丢弃，用户改了表达式而提醒时间纹丝不动。
+        op.card.cronExpression ?? '',
       )
     case 'revise':
       return buildIdempotencyKey('revise', op.id, op.text, String(op.at))

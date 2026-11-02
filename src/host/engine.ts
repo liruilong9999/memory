@@ -155,7 +155,9 @@ export class MemoryEngine {
     // 解析在时间层（src/time/due.ts），这里只负责把结果填进卡片。
     for (const card of cards) {
       if (card.kind !== 'promise' && card.kind !== 'event') continue
-      const spec = parseDue(card.text, input.at, this.timeZone)
+      const spec = parseDue(
+        card.text, input.at, this.timeZone, 9, this.config.reminder.cronSearchDays,
+      )
       if (spec !== null) {
         card.dueAt = spec.dueAt
         // FR-D3：**只存 dueAt 是不够的**。曾经这里只取 spec.dueAt 就把
@@ -164,6 +166,9 @@ export class MemoryEngine {
         // (id, dueAt) 之后，第二天 dueNow 仍返回同一个 dueAt，被过滤掉，
         // 永久静默。探针实测：第 2 天 dueNow = 0 张，dueAt 始终停在第一天。
         card.dueRepeat = spec.repeat
+        // cron 表达式也必须落盘：'cron' 不含「什么时候再响」的信息，
+        // 提醒响过之后手上只有卡片、没有原始语境，无法重新解析用户那句话。
+        if (spec.cronExpression !== undefined) card.cronExpression = spec.cronExpression
       }
     }
     // FR-B5 / SC-4：写入时就标出冲突，而不是等到召回的渲染阶段。
@@ -558,7 +563,10 @@ export class MemoryEngine {
     // 或调用方忘了传而默认取 clock()），nextDueAfter 会原样返回 dueAt，
     // 推进变成空操作——而它「没有报错」，看起来像成功了。
     // 只用 dueAt 时，宿主停摆数天后无法一次跳到未来，会连续补发。
-    const next = nextDueAfter(card.dueAt, repeat, Math.max(now, card.dueAt), this.timeZone)
+    const next = nextDueAfter(card.dueAt, repeat, Math.max(now, card.dueAt), this.timeZone, {
+      cronExpression: card.cronExpression,
+      cronSearchDays: this.config.reminder.cronSearchDays,
+    })
     if (next === null) return
     // 只改 dueAt / updatedAt / strength 之外的到期字段。
     // updatedAt 必须一并更新：它是「这张卡最近变过」的唯一依据，
