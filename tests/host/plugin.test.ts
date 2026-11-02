@@ -644,10 +644,13 @@ describe('runMemoryCommand', () => {
   })
 
   it('explain 在没有命中时给出明确说明', async () => {
+    // 断言 ST-5 验收原话「没有相关记忆」，不是实现随手写的「没有命中」。
+    // `/memory explain` 与 CLI `query` 共用 `renderFocusPackExplain`，
+    // 所以这句文案必须两处一致——它就是 FR-B6 的可见形态。
     const host = makeHost()
     await apply(host.ctx, baseConfig(tempDir()))
     const text = host.commands[0]?.handler?.('explain 完全不相干的查询') as string
-    assert.match(text, /没有命中/u)
+    assert.match(text, /没有相关记忆/u)
   })
 
   it('未知子命令返回可用列表', async () => {

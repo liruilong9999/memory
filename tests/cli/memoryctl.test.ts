@@ -284,8 +284,22 @@ describe('query（FR-F2）', () => {
   it('空库给出明确「没有命中」而不是报错', () => {
     const result = runCli(['query', '数据库', '--data-dir', tempDir()])
     assert.equal(result.code, EXIT_OK)
-    assert.match(result.stdout, /没有命中任何记忆/u)
+    // ST-5 验收原话是「明确回答"没有相关记忆"」——断言这句，
+    // 而不是实现随手写的另一种说法。**错误文案是承诺，不是装饰。**
+    assert.match(result.stdout, /没有相关记忆/u)
     assert.equal(result.stderr, '')
+  })
+
+  it('库里有卡但话题完全无关时，也明确说「没有相关记忆」而不是硬凑', () => {
+    // ST-5 有**两个**场景：「空库」和「无关话题」。只测空库的话，
+    // 一条「有卡就随便返回一张」的实现也能全绿——而后者恰恰是 ST-5
+    // 真正要防的「臆造」形态。库里有卡，更接近真实使用现场。
+    const dir = tempDir()
+    seedStore(dir)
+    const result = runCli(['query', '烘焙面包的发酵温度', '--data-dir', dir])
+    assert.equal(result.code, EXIT_OK)
+    assert.match(result.stdout, /没有相关记忆/u)
+    assert.doesNotMatch(result.stdout, /部署/u, '无关话题下不得把不相干的卡凑进焦点包')
   })
 
   it('缺关键词返回用法错误', () => {

@@ -631,6 +631,19 @@ export function applyThresholds(scored: readonly ScoredCard[], config: MemoryCon
  * @param config - 配置。
  * @returns 焦点包。
  */
+/**
+ * 空包文案的**唯一来源**（FR-B6 / ST-5）。
+ *
+ * 为什么单独导出一个常量：`pack.note` 只有 `buildFocusPack` 会写，
+ * 而人读渲染（`render.ts`）此前把同一句话**又抄了一遍**，还抄成了
+ * 「没有命中任何记忆」——ST-5 验收的原话是「明确回答"没有相关记忆"」，
+ * 于是在终端里 grep 那句话是搜不到的。
+ *
+ * **同一件事有两份文案，就一定会有一份是错的**，而且没有任何机制会提醒。
+ * 这里给出唯一来源，`render.ts` 直接引用，不再各写一份。
+ */
+export const EMPTY_PACK_NOTE = '没有相关记忆。'
+
 export function buildFocusPack(
   scored: readonly ScoredCard[], query: RecallQuery, config: MemoryConfig,
 ): FocusPack {
@@ -672,7 +685,7 @@ export function buildFocusPack(
     query: query.text,
     builtAt: query.now,
     empty,
-    note: empty ? '没有相关记忆。' : '',
+    note: empty ? EMPTY_PACK_NOTE : '',
   }
 }
 

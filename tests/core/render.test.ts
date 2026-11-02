@@ -14,7 +14,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { renderFocusPackExplain } from '../../src/core/render.ts'
-import { formatTime, renderFocusPack } from '../../src/core/scoring.ts'
+import { EMPTY_PACK_NOTE, formatTime, renderEmptyNote, renderFocusPack } from '../../src/core/scoring.ts'
 import type { FocusPack, MemoryCard, ScoredCard, TimeState } from '../../src/core/types.ts'
 
 /**
@@ -90,7 +90,11 @@ function makePack(cards: ScoredCard[]): FocusPack {
     budgetTokens: 1200,
     maxCardChars: 200,
     empty: cards.length === 0,
-    note: cards.length === 0 ? '（本次没有相关记忆）' : '',
+    // 用生产常量而不是手写第三份文案。此前这里是 `'（本次没有相关记忆）'`
+    // ——fixture 自己编了一句，于是「渲染层的空包文案」和「pack.note」永远是
+    // 两个值，而这条 fixture 恰好让「两者同源」这个性质**无法被测出来**。
+    // **fixture 里的字面量也是真相源，它一样会腐烂。**
+    note: cards.length === 0 ? EMPTY_PACK_NOTE : '',
     query: '',
     builtAt: 0,
   }
@@ -100,11 +104,27 @@ describe('renderFocusPackExplain（FR-B4 可解释）', () => {
   it('空包给出明确说明而不是空串', () => {
     // 静默无输出会让人以为命令坏了（FR-B6 同一原则：宁可显式说明，不让人猜）。
     const text = renderFocusPackExplain(makePack([]), 0)
-    assert.equal(text, '没有命中任何记忆（候选 0 张）')
+    assert.equal(text, '没有相关记忆。（候选 0 张）')
+  })
+
+  it('空包文案与 renderEmptyNote 同源，不是抄的第二份', () => {
+    // 这条守的是 FR-B6 / ST-5 的**可检索性**：ST-5 验收原话是
+    // 「明确回答"没有相关记忆"」，而人读渲染此前写的是「没有命中任何记忆」
+    // ——两句话都在说同一件事，但在终端里 grep ST-5 那句是搜不到的。
+    //
+    // 断言用 `renderEmptyNote` 的输出做**前缀**，而不是再写一遍字面量：
+    // 字面量会变成第三份真相源，改文案时这里会跟着红、但红的原因不对。
+    const pack = makePack([])
+    const note = renderEmptyNote(pack)
+    assert.equal(note, '没有相关记忆。')
+    assert.ok(
+      renderFocusPackExplain(pack, 3).startsWith(note),
+      '空包渲染必须以 renderEmptyNote 的文案开头',
+    )
   })
 
   it('空包也报出候选数：0 张候选与 12 张候选都无命中是两回事', () => {
-    assert.equal(renderFocusPackExplain(makePack([]), 12), '没有命中任何记忆（候选 12 张）')
+    assert.equal(renderFocusPackExplain(makePack([]), 12), '没有相关记忆。（候选 12 张）')
   })
 
   it('非空包首行报出包内张数与候选数', () => {

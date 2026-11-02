@@ -25,6 +25,7 @@
  * @module src/core/render
  */
 
+import { renderEmptyNote } from './scoring.ts'
 import type { FocusPack, ScoredCard } from './types.ts'
 
 /**
@@ -79,7 +80,10 @@ function renderScoredCard(scored: ScoredCard): string[] {
  */
 export function renderFocusPackExplain(pack: FocusPack, candidates: number): string {
   if (pack.cards.length === 0) {
-    return `没有命中任何记忆（候选 ${candidates} 张）`
+    // 文案来自 `renderEmptyNote`（`pack.note` 的唯一读取口），不在这里另写一份。
+    // 候选数附在后面：它是**诊断信息**（「库是空的」还是「库有卡但都不相关」
+    // 是两种完全不同的故障），对 ST-5 的判据没有影响。
+    return `${renderEmptyNote(pack)}（候选 ${candidates} 张）`
   }
   const lines: string[] = [`焦点包 ${pack.cards.length} 张，候选 ${candidates} 张`]
   for (const scored of pack.cards) {
