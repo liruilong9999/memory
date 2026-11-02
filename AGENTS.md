@@ -402,6 +402,47 @@ if (mutated === original) {
   - [x] `feeling` 加入 `neverArchiveKinds`（起源 L11 直接冲突）
   - [x] `RecallQuery.domains` 是死字段，召回不按域过滤（起源 L13）
   - [x] `dueAt` 永远为 null，`pickDue` 恒空，FR-D3 / SC-5 不可能通过（起源 L21）
+        **这一行曾经是「已修」，而真实状态是「修了一半」**：`dueAt` 确实不再恒为
+        null，`pickDue` 也不再恒空，所以「一次性提醒」能响。但**重复提醒从来不重复**
+        —— 于是 FR-D3 的四分之三（每日 / 每周 / cron）仍然不可用，而这行写着 `[x]`。
+        **审计表上一行 `[x]` 会让人停止检查，比一个 `[ ]` 危险得多。**
+  - [x] FR-D3 重复提醒永久静默 → 真缺陷十二。
+        两个根因叠加，缺一不可：
+        ① `writeTurn` 算出 `spec.repeat = 'daily'` 后**只取了 `spec.dueAt` 就丢掉
+        `repeat`**，于是库里「每日提醒」与「一次性提醒」完全无法区分；
+        ② `markReminded` 只往**内存 Map** 记 `(id, dueAt)`，**从不推进 `dueAt`**，
+        于是第二天 `dueNow` 返回**同一个** `dueAt`，被「已提醒过」过滤掉。
+        探针实测（`.tmp/probe-fr-d3.ts`）：第 1 天 `dueNow = 1` 张、同日再问 `= 0`
+        （正确）、**第 2 天 `= 0` 张**、`dueAt` 从第 1 天起**从未变过**。
+        修法四层：`MemoryCard.dueRepeat` / `cronExpression` 落盘（`DueRepeat` 定义
+        搬到 `core/types.ts`，因为依赖方向是 `time/ → core/`，反过来会让 core 依赖
+        time）；`nextDueAfter` 纯函数按**本地自然日**推进（夏令时一天可能 23/25
+        小时，加固定毫秒数会让「每天早上九点」永久偏移）并用 `while` 而非 `if`
+        （宿主停摆数天时一次跳到未来，否则连续补发）；`markReminded` 在**投递成功
+        后**才 `advanceDue` 落盘（先推进再投递失败 = 这条提醒永远丢了），推进基准取
+        `max(now, dueAt)`（只用 `now` 时时钟回拨会让推进变空操作**且不报错**）。
+        `src/time/cron.ts` 补上第四种重复方式，零依赖五字段解析。
+        **顺带修掉幂等键缺陷的第三次重演**：`put` 指纹不含 `dueAt`，而推进只改
+        `dueAt` ⇒ 键相同 ⇒ 数据面判重复 ⇒ 静默丢弃。探针
+        `.tmp/probe-due-key.ts` 实测推进前后键完全相同（`bb59f820b1d46eff`）、
+        `written: false`、读回未变。前两次是 `edge` 漏 `weight`（`44cabd2`）、
+        `put` 漏 `strength/status/accessCount`（`7a126ce`），**形状一模一样**。
+        测试 39 条（`tests/host/reminder.test.ts` 17 + `tests/time/cron.test.ts` 22）。
+        反向验证两轮共 14 个变异全部命中，其中三个坑值得记：
+        - **M3 第一版是等价变异**（`Number.isFinite(x) && x >= 1` → `Number.isFinite(x)`，
+        `30` 两个分支走同一条路），`fail=0` 不是测试没牙。换成真去掉上界才命中。
+        - 换成真死循环后，**`node:test` 的 `timeout` 打断不了同步循环**：脚本挂住、
+        `finally` 不执行、`cron.ts` 停在改坏状态。改用**子进程硬超时**
+        （`execSync({ timeout })`）判定，被 kill 即算红。**同步死循环只能这样验。**
+        - 两条端到端测试第一轮是**装饰性的**：端到端那条分辨不出 `dueAt` 在不在
+        幂等键里（`advanceDue` 顺手改了 `updatedAt`，键碰巧变了——又是「靠巧合
+        安全」），`Math.max` 那一半正常路径下是纯防御。补了**纯函数级**「只改
+        `dueAt` 时键必须变」与「时钟回拨仍推进」两条才真的守住。**反向验证的
+        第二个用途就是暴露装饰性测试。**
+        另：写 cron 测试时把 `Date.UTC(2023,10,15,6,13)` 的上海时刻误算成 06:13
+        （实为 14:13），三条用例因此变红——**红的是我的期望值，不是实现**。
+        断言一律用 `formatTime` 输出具体时刻，就是为了让这种错立刻暴露，
+        而不是写成「落在合理范围」蒙过去。
   - [x] 召回反馈是正反馈，与「专注当前位置」的抑制语义相反（起源 L29）→ 已拆分 recall/peek/confirmRecall，见 FR-B7
   - [x] `renderFocusPack` 头尾固定开销未计入 token 预算（起源 L33）
   - [x] 无日摘要、无跨周期层级压缩（起源 L27）→ `src/consolidate/summarize.ts`，
