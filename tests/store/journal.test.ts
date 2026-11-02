@@ -410,6 +410,30 @@ describe('多写者并发（D-08）', () => {
     )
   })
 
+  it('只比字节数不够：外部多出一个空分片也必须被拒（分片序号比较单独守）', () => {
+    // 这条用例是为反向验证 M2 补的：把 assertSoleWriter 的条件改成只比 diskBytes
+    // 之后，原有 5 条用例**一条都没红**——序号那一半从来没被单独验过。
+    //
+    // 构造的状态：内存水位 index=1 / bytes=0，磁盘末片 index=2 / bytes=0。
+    // 两个字段只有一个不同，且不同的那个是**序号**。若实现只比字节数，
+    // 这里会放行；放行的后果是两个写者从不同水位各自分配 seq（ST-1 破坏）。
+    const dir = tempDir()
+    writeFileSync(join(dir, shardFileName(1)), '')
+    const b = new Journal({ dir, segmentBytes: 1 << 20, fsyncOnWrite: false, mode: 'write' })
+    b.open()
+    // 前提：b 的内存水位必须真的是 index=1 / 0 字节，否则这条测试测的是别的东西。
+    assert.deepEqual(listShardFiles(dir), [shardFileName(1)], '前提：打开时只有分片 1')
+    // 外部再建一个**空**分片 2：字节数不变（都是 0），只有序号变了。
+    writeFileSync(join(dir, shardFileName(2)), '')
+    const error = assertConcurrentWriter(() => b.append(touch('after-empty-shard')), '外部多出空分片后写入')
+    b.close()
+    // 断言指向「序号不同」这个具体成因，而不是任何并发错误都能让它绿。
+    assert.match(error.message, /分片数 2/u, '错误信息必须报出磁盘实际分片数 2')
+    assert.match(error.message, /分片数 1/u, '错误信息必须报出内存水位分片数 1')
+    // 末片字节数两方都是 0——正是「只比字节数会漏」的那个证据。
+    assert.match(error.message, /末片 0 字节/u, '前提：两方末片字节数都是 0，只比字节数必然放行')
+  })
+
   it('错误信息必须说清成因、恢复办法与长期方案', () => {
     const dir = tempDir()
     const a = new Journal({ dir, segmentBytes: 1 << 20, fsyncOnWrite: false, mode: 'write' })
