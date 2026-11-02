@@ -96,8 +96,9 @@ pnpm cli --help    # 离线命令行
 - [x] 时间状态 `src/time/`
 - [x] 巩固面 `src/consolidate/`
 - [x] 适配面 `src/host/` + `src/index.ts` + `cordis.patch.yml`
-- [ ] 离线 CLI `src/cli/`
+- [x] 离线 CLI `src/cli/`（query / export / rebuild / health / consolidate）
 - [ ] 宿主实机验证
+- [x] bundle 展示资源（`icon.svg` / `locale/zh.json` / `locale/en.json`）
 - [ ] 起源对照审查遗留项（见 `docs/5-起源对照审查.md` 第二部分）：
   - [x] `feeling` 加入 `neverArchiveKinds`（起源 L11 直接冲突）
   - [x] `RecallQuery.domains` 是死字段，召回不按域过滤（起源 L13）
@@ -108,3 +109,24 @@ pnpm cli --help    # 离线命令行
   - [ ] 无「从事件蒸馏感受」路径，`distills` 边从未产出（起源 L11）
   - [ ] `src/consolidate/graph.ts` 七种边无需求承接（AGENTS.md 判断标准）
   - [ ] `src/store/store.ts` 并发 `append` 无保护，多 agent 会损坏 `maxSeq`（D-08）
+
+### 已修复但值得记住的坑
+
+- [x] **召回查询曾用「库里最新一张卡」当查询词**：那等于拿上一次写入的记忆
+  碎片去查询记忆库，与用户本轮原话语义差异很大。现改用本轮 `user/message`
+  原文（`session/event` 累积），拿不到时才退回 `recentQuery()`。
+- [x] **`goalText` 从未被传入**：`goalScore` 恒为 0，目标匹配维度算了却不起作用。
+  现由 `src/host/adapter.ts` 的 `readGoalText` 从宿主 goal 服务取；三处必须容错
+  （`ctx.goals` 不存在 / `get` 不存在 / 宿主对非活跃 agent 抛 `GoalError`）。
+- [x] **投影层曾静默改写事实**：`coerceCard` 的 kind 白名单把未知值降级成
+  `fact`，导致日志写 A、重放得 B，破坏 ST-1 且事后无从发现。现改为「已知保留 /
+  未知字符串透传 / 缺失才兜底」，见 `docs/3-架构设计.md` §4.1。
+- [x] **CLI `query` 曾污染访问计数**：走 `engine.recall()` 会写 `touch` 日志，
+  运维查一眼等于「使用」。现走只读召回（纯函数链），并有对照测试证明
+  `engine.recall` 确实会写库（防止「没写库」的测试假绿）。
+- [x] **人读渲染曾有两份实现**：`/memory explain` 与 CLI `query` 各写一遍，
+  靠人肉同步。现收敛到 `src/core/render.ts` 的 `renderFocusPackExplain`。
+- [ ] **`state.ts` 的时间来源不一致**：`revise`/`archive`/`restore` 用
+  `record.at`，`touch` 用 `op.at`。生产路径 `store.append(op, undefined, now)`
+  给两者同一个值所以看不出问题，但测试里只给 `op.at` 会测出非真实行为。
+  暂不改（会动数据面语义），但写重放测试时必须从 `op.at` 推导 `record.at`。
