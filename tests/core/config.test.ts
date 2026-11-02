@@ -193,3 +193,133 @@ describe('validateConfig', () => {
     assert.ok(result.errors.length >= 3, `应收集全部错误，实际 ${result.errors.length} 条`)
   })
 })
+/**
+ * 此前零测试的校验分支（补齐 docs/6 P0-3 缺口）。
+ *
+ * 这些分支在 `validateConfig` 里真实存在，但没有任何测试触发过。零测试的
+ * 校验等于**装饰**：它写在代码里让人以为有防线，实际拦不拦得住没人知道。
+ * 更糟的是它给了错误的安全感——看到 `validateConfig` 就以为配置一定被查过。
+ *
+ * ## 为什么断言「恰好一条错误」而不是「有错误」
+ *
+ * 只断言 `ok === false` 的话，**任何一个别的校验分支报错也能让它变绿**——
+ * 这条测试就绿在错误的原因上，等于没测。这是本仓库反复出现的「靠运气绿」。
+ * 断言「恰好 1 条且提到该字段」能证明：**是我要测的那条分支在报错**。
+ */
+describe('validateConfig 未覆盖分支', () => {
+  /** 造一份合法配置，供各用例按需破坏单个字段。 */
+  function base(): typeof DEFAULT_CONFIG {
+    return mergeConfig(DEFAULT_CONFIG)
+  }
+
+  /**
+   * 破坏单个字段后校验，断言**恰好**产生一条提到该字段的错误。
+   *
+   * @param patch - 破坏配置的写操作。
+   * @param field - 期望错误信息里出现的字段名。
+   */
+  function expectSingleError(patch: (config: typeof DEFAULT_CONFIG) => void, field: string): void {
+    const config = base()
+    patch(config)
+    const result = validateConfig(config)
+    assert.equal(result.ok, false, `期望校验失败，实际通过（字段 ${field}）`)
+    assert.equal(
+      result.errors.length, 1,
+      `期望恰好 1 条错误（证明是 ${field} 这条分支报的），实际 ${result.errors.length} 条：${result.errors.join(' / ')}`,
+    )
+    assert.ok(
+      result.errors[0]!.includes(field),
+      `错误信息应提到 ${field}，实际：${result.errors[0]}`,
+    )
+  }
+
+  /**
+   * 破坏单个字段后校验，断言**通过**（边界值合法的反向验证）。
+   *
+   * @param patch - 修改配置的写操作。
+   */
+  function expectOk(patch: (config: typeof DEFAULT_CONFIG) => void): void {
+    const config = base()
+    patch(config)
+    const result = validateConfig(config)
+    assert.equal(result.ok, true, `期望通过，实际错误：${result.errors.join(' / ')}`)
+  }
+
+  it('candidateLimit 小于 maxCards 时报错', () => {
+    // 候选池比卡片上限还小，等于「想选 7 张但只看得到 3 张」，
+    // 阈值再宽松也选不满——这是配置自相矛盾，不是性能问题。
+    expectSingleError((c) => { c.recall.candidateLimit = c.recall.maxCards - 1 }, 'candidateLimit')
+  })
+
+  it('candidateLimit 等于 maxCards 时通过（边界合法）', () => {
+    expectOk((c) => { c.recall.candidateLimit = c.recall.maxCards })
+  })
+
+  it('halfLifeMs 为 0 时报错', () => {
+    // 半衰期为 0 意味着「一写入就死」，任何卡都召不回来。
+    expectSingleError((c) => { c.forgetting.halfLifeMs = 0 }, 'halfLifeMs')
+  })
+
+  it('halfLifeMs 为负数时报错', () => {
+    expectSingleError((c) => { c.forgetting.halfLifeMs = -1 }, 'halfLifeMs')
+  })
+
+  it('relatedSimilarity 大于 duplicateSimilarity 时报错', () => {
+    // 两个阈值方向必须一致：重复判定比相关判定更严格。
+    // 反过来写会让「相关但不算重复」这个区间消失，去重直接失效。
+    expectSingleError((c) => {
+      c.dedup.relatedSimilarity = 0.9
+      c.dedup.duplicateSimilarity = 0.5
+    }, 'relatedSimilarity')
+  })
+
+  it('relatedSimilarity 等于 duplicateSimilarity 时通过', () => {
+    expectOk((c) => {
+      c.dedup.relatedSimilarity = 0.8
+      c.dedup.duplicateSimilarity = 0.8
+    })
+  })
+
+  it('extraction.domains 为空时报错', () => {
+    // 空域列表会让写入路径没有任何域可归属（起源 L13·三模块按域划分）。
+    expectSingleError((c) => { c.extraction.domains = [] }, 'domains')
+  })
+
+  it('journalSegmentBytes 小于 4096 时报错', () => {
+    expectSingleError((c) => { c.storage.journalSegmentBytes = 4096 - 1 }, 'journalSegmentBytes')
+  })
+
+  it('journalSegmentBytes 为小数时报错（必须整数）', () => {
+    expectSingleError((c) => { c.storage.journalSegmentBytes = 8192.5 }, 'journalSegmentBytes')
+  })
+
+  it('journalSegmentBytes 等于 4096 时通过（边界合法）', () => {
+    expectOk((c) => { c.storage.journalSegmentBytes = 4096 })
+  })
+
+  it('正向权重之和为 0 时报错', () => {
+    // 归一化分母为 0 会让所有分数变成 NaN 或 Infinity。
+    // 注意 conflict 不在求和里：它是惩罚项，不参与正向归一化。
+    expectSingleError((c) => {
+      c.weights.semantic = 0
+      c.weights.importance = 0
+      c.weights.recency = 0
+      c.weights.goal = 0
+      c.weights.confidence = 0
+    }, '正向权重')
+  })
+
+  it('conflict 权重为 0 不触发「正向权重之和」报错', () => {
+    // 反向验证：证明求和确实排除了 conflict。
+    // 若实现里误把 conflict 计入，这条会红。
+    expectOk((c) => { c.weights.conflict = 0 })
+  })
+
+  it('权重为 NaN 时报错（有限数检查）', () => {
+    expectSingleError((c) => { c.weights.semantic = Number.NaN }, 'weights.semantic')
+  })
+
+  it('权重为 Infinity 时报错', () => {
+    expectSingleError((c) => { c.weights.recency = Number.POSITIVE_INFINITY }, 'weights.recency')
+  })
+})
