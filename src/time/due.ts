@@ -16,10 +16,11 @@
  * @module dsh-memory/time/due
  */
 
+import type { DueRepeat } from '../core/types.ts'
 import { localDate, zonedParts } from './clock.ts'
 
-/** 重复方式：一次性 / 每日 / 每周。 */
-export type DueRepeat = 'once' | 'daily' | 'weekly'
+/** 重复方式：一次性 / 每日 / 每周。定义在契约层，此处仅转出。 */
+export type { DueRepeat } from '../core/types.ts'
 
 /** 一次解析出的到期信息。 */
 export interface DueSpec {
@@ -248,6 +249,57 @@ export function parseDayOffset(
  * @param defaultHour - 只说了日期没说钟点时使用的默认小时，通常取配置值。
  * @returns 到期信息；无到期线索为 `null`。
  */
+/**
+ * 算出「下一次」到期时刻（FR-D3）。
+ *
+ * 提醒响过之后必须把 `dueAt` 推进到下一次，否则第二天的 `dueNow` 仍然
+ * 返回**同一个** `dueAt`，被「已提醒过」的记忆过滤掉 —— 每日提醒
+ * 在响过一次之后就永久静默。这正是 FR-D3 的验收原文
+ * 「到点无需用户输入自行接力」在重复场景下的真实形态。
+ *
+ * 只在 `repeat` 为 `'daily'` / `'weekly'` 时有意义：
+ * 一次性提醒响完就该结束，返回 `null` 表示「不再有下一次」。
+ *
+ * ## 为什么按本地自然日推进，而不是简单 +86400000
+ *
+ * 夏令时切换日一天可能是 23 或 25 小时。加固定毫秒数会让
+ * 「每天早上九点」在切换后变成八点或十点，且此后永久偏移。
+ * 所以按「本地日期 + N 天 + 原钟点」重建时刻。
+ *
+ * ## 为什么用 while 而不是 if
+ *
+ * 宿主可能停摆数天，重新上线时 `dueAt` 已经落后好几轮。
+ * 用 `if` 只推进一天，于是接下来几天会**连续补发**同一批提醒；
+ * 用 `while` 一次跳到「严格晚于 now」的下一次，只提醒一次。
+ * 上限 `maxCatchUp` 防止时钟异常（例如 now 是 1970 年）时无限循环。
+ *
+ * @param dueAt - 当前到期时刻。
+ * @param repeat - 重复方式。
+ * @param now - 当前时刻；推进目标必须严格晚于它。
+ * @param timeZone - IANA 时区。
+ * @param maxCatchUp - 最多补推多少轮，超出则返回 `null`（当作放弃）。
+ * @returns 下一次到期时刻；不再重复时返回 `null`。
+ */
+export function nextDueAfter(
+  dueAt: number, repeat: DueRepeat, now: number, timeZone: string, maxCatchUp = 400,
+): number | null {
+  if (repeat === 'once') return null
+  const stepDays = repeat === 'weekly' ? 7 : 1
+  const clock = zonedParts(dueAt, timeZone)
+  let cursor = dueAt
+  let rounds = 0
+  while (cursor <= now) {
+    if (rounds >= maxCatchUp) return null
+    const base = ymd(cursor, timeZone)
+    // 按「本地日期 + stepDays + 原钟点」重建，避免夏令时把钟点推歪。
+    const shifted = zonedTimeToMs(base.year, base.month, base.day + stepDays, clock.hour, clock.minute, timeZone)
+    // 夏令时回拨可能让重建结果不变（极罕见），兜底加一天防止死循环。
+    cursor = shifted > cursor ? shifted : cursor + stepDays * 24 * 60 * 60 * 1000
+    rounds += 1
+  }
+  return cursor
+}
+
 export function parseDue(
   text: string, now: number, timeZone: string, defaultHour = 9,
 ): DueSpec | null {

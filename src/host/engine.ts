@@ -32,7 +32,7 @@ import type { MemoryStore } from '../store/store.ts'
 import {
   buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
 } from '../time/clock.ts'
-import { parseDue } from '../time/due.ts'
+import { nextDueAfter, parseDue } from '../time/due.ts'
 
 /** 引擎参数。 */
 export interface EngineOptions {
@@ -156,7 +156,15 @@ export class MemoryEngine {
     for (const card of cards) {
       if (card.kind !== 'promise' && card.kind !== 'event') continue
       const spec = parseDue(card.text, input.at, this.timeZone)
-      if (spec !== null) card.dueAt = spec.dueAt
+      if (spec !== null) {
+        card.dueAt = spec.dueAt
+        // FR-D3：**只存 dueAt 是不够的**。曾经这里只取 spec.dueAt 就把
+        // spec.repeat 丢掉，于是「每天早上九点提醒我喝水」在库里与
+        // 「一次性提醒」完全无法区分——提醒响过一次、markReminded 记下
+        // (id, dueAt) 之后，第二天 dueNow 仍返回同一个 dueAt，被过滤掉，
+        // 永久静默。探针实测：第 2 天 dueNow = 0 张，dueAt 始终停在第一天。
+        card.dueRepeat = spec.repeat
+      }
     }
     // FR-B5 / SC-4：写入时就标出冲突，而不是等到召回的渲染阶段。
     // 只算不写等于没做——`looksConflicting` 此前零调用点，`conflictOf` 恒为空，
@@ -506,11 +514,56 @@ export class MemoryEngine {
    *
    * @param cards - 已提醒的卡片。
    */
-  markReminded(cards: readonly MemoryCard[]): void {
+  markReminded(cards: readonly MemoryCard[], now = this.clock()): void {
     for (const card of cards) {
       // dueAt 是可选属性，undefined 与 null 都表示「没有到期时刻」。
-      if (typeof card.dueAt === 'number') this.remindedDueAt.set(card.id, card.dueAt)
+      if (typeof card.dueAt !== 'number') continue
+      this.remindedDueAt.set(card.id, card.dueAt)
+      this.advanceDue(card, now)
     }
+  }
+
+  /**
+   * 提醒投递成功后，把重复提醒的 `dueAt` 推进到下一次（FR-D3）。
+   *
+   * ## 为什么必须在**投递之后**推进
+   *
+   * 推进是一次真实写入。若在投递前推进、投递又失败了，这条提醒就
+   * 永远丢了——下次轮询 `dueNow` 看到的是新时刻，还没到。
+   * 所以顺序是「先投递成功，再推进」，与 {@link markReminded} 的
+   * 调用约定一致。
+   *
+   * ## 为什么不只依赖内存里的 remindedDueAt
+   *
+   * `remindedDueAt` 是**内存 Map**，进程重启即清空。只靠它的话：
+   * 重启后同一个 `dueAt` 会被当成「没提醒过」再提醒一次（重复打扰）；
+   * 而 `dueAt` 永远不推进，跨天之后仍然只有那一个时刻。
+   * 把新时刻**落盘**才让「每日提醒」在重启后依然正确。
+   *
+   * ## 一次性提醒不推进
+   *
+   * `repeat` 为 `'once'` / 缺省时 {@link nextDueAfter} 返回 `null`，
+   * 这里只清掉内存标记，`dueAt` 保持不变——由夜整理的
+   * `releaseExpiredDue` 负责把它置 null，让卡片能正常参与衰减归档。
+   *
+   * @param card - 刚投递过提醒的卡片。
+   * @param now - 投递时刻。
+   */
+  private advanceDue(card: MemoryCard, now: number): void {
+    const repeat = card.dueRepeat ?? 'once'
+    if (repeat === 'once') return
+    if (typeof card.dueAt !== 'number') return
+    // 推进基准取 max(now, dueAt)：下一次必须**同时**晚于当前到期时刻和
+    // 投递时刻。只用 now 时，若调用方传的 now 早于 dueAt（时钟回拨、
+    // 或调用方忘了传而默认取 clock()），nextDueAfter 会原样返回 dueAt，
+    // 推进变成空操作——而它「没有报错」，看起来像成功了。
+    // 只用 dueAt 时，宿主停摆数天后无法一次跳到未来，会连续补发。
+    const next = nextDueAfter(card.dueAt, repeat, Math.max(now, card.dueAt), this.timeZone)
+    if (next === null) return
+    // 只改 dueAt / updatedAt / strength 之外的到期字段。
+    // updatedAt 必须一并更新：它是「这张卡最近变过」的唯一依据，
+    // 不改会让 ST-1 之外的地方（最近活动、排序）看到过期信息。
+    this.store.putCard({ ...card, dueAt: next, updatedAt: now })
   }
 
   /**

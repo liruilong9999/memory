@@ -156,7 +156,25 @@ export interface MemoryCard {
   mergeOf?: string[]
   /** 到期时刻，承诺/提醒类使用（FR-D3）。 */
   dueAt?: number | null
+  /**
+   * 重复方式（FR-D3）。`'once'` / 缺省表示一次性。
+   *
+   * 为什么必须落在这张卡上而不是每次重新解析文本：提醒响过之后
+   * 要能算出**下一次**到期时刻，而那一刻手上只有卡片、没有原始语境。
+   * 只存 `dueAt` 的话，「每日提醒」在响过一次之后就与「一次性提醒」
+   * 无法区分了——这正是 FR-D3 曾经永久静默的根因。
+   */
+  dueRepeat?: DueRepeat
 }
+
+/**
+ * 到期提醒的重复方式（FR-D3）。
+ *
+ * 定义在契约层而不是 `src/time/due.ts`，因为 {@link MemoryCard} 要引用它，
+ * 而依赖方向是 `time/ → core/`（`src/time/clock.ts` 就 import 了本文件）。
+ * 反过来定义会让 core 依赖 time，破坏分层。
+ */
+export type DueRepeat = 'once' | 'daily' | 'weekly'
 
 /* ------------------------------------------------------------------ *
  * 三、记忆图谱：起源「建立记忆图谱的方法，且跨层次关联」

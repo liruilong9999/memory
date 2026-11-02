@@ -475,7 +475,9 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
       try {
         lastAgent.followup(makeWakeMessage(text))
         // 投递成功后才标记，失败时下次轮询还能重试。
-        engine.markReminded(cards)
+        // 传 now 而不是让它默认取 clock()：推进基准必须是**本次投递时刻**，
+        // 否则时钟回拨或注入时钟时推进变空操作（且不报错）。
+        engine.markReminded(cards, now)
         logger.info(`到期提醒已投递：${cards.length} 项`)
       } catch (error) {
         logger.error(`投递到期提醒失败：${error instanceof Error ? error.message : String(error)}`)

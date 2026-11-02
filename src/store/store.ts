@@ -477,6 +477,22 @@ export function deriveIdempotencyKey(op: JournalOp): string {
         String(op.card.strength),
         op.card.status,
         String(op.card.accessCount),
+        // FR-D3：到期时刻与重复方式必须进指纹。
+        //
+        // 这是同一个幂等键缺陷的**第三次**重演（前两次：edge 漏 weight、
+        // put 漏 strength/status/accessCount）。形状完全一样：
+        // 推进「下一次到期」时只改 dueAt，其它字段全不变 ⇒ 键相同 ⇒
+        // 数据面判重复 ⇒ **静默丢弃**，读回来还是旧时刻，
+        // 于是每日提醒永远停在第 N 天。
+        //
+        // 探针实测（.tmp/probe-due-key.ts）：推进前后派生出的键完全相同
+        // （bb59f820b1d46eff），putCard 返回 written: false，读回 dueAt 未变。
+        //
+        // 又一次「靠巧合安全」的检验：现在没有任何路径只改 dueAt 而不改
+        // updatedAt 吗？有——推进重复提醒正是这样一条路径，所以缺陷会真的
+        // 被走到，不再是理论风险。
+        String(op.card.dueAt ?? ''),
+        op.card.dueRepeat ?? '',
       )
     case 'revise':
       return buildIdempotencyKey('revise', op.id, op.text, String(op.at))

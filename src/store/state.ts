@@ -249,6 +249,12 @@ function coerceCard(raw: unknown): MemoryCard | null {
   if (mergeOf.length > 0) card.mergeOf = mergeOf
   if (raw['dueAt'] === null) card.dueAt = null
   else if (typeof raw['dueAt'] === 'number' && Number.isFinite(raw['dueAt'])) card.dueAt = raw['dueAt']
+  // FR-D3：重复方式必须穿过重放层，否则「每日提醒」重放后变成一次性。
+  // 与 coerceKind 同理：**已知保留 / 未知丢弃**——未知值丢弃而不是透传，
+  // 因为它会直接决定 nextDueAfter 的推进步长，错值比缺值更危险。
+  if (raw['dueRepeat'] === 'once' || raw['dueRepeat'] === 'daily' || raw['dueRepeat'] === 'weekly') {
+    card.dueRepeat = raw['dueRepeat']
+  }
   return card
 }
 
