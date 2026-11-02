@@ -18,6 +18,7 @@ import { DEFAULT_CONFIG } from '../core/config.ts'
 import { buildCardId, buildEdgeId } from '../core/types.ts'
 import type { JournalOp, JournalRecord, MemoryCard, MemoryEdge, SourcePointer, MemoryKind } from '../core/types.ts'
 import { Journal, buildIdempotencyKey } from './journal.ts'
+import type { JournalMode } from './journal.ts'
 import type { MemoryState, MemoryFilter } from './state.ts'
 import {
   applyRecord, countCards, createEmptyState, edgesOf, filterCards, getCard, rebuildState,
@@ -41,6 +42,29 @@ export interface StoreOptions {
   fsyncOnWrite?: boolean
   /** 打开时是否立即从日志重放状态；默认 `true`。 */
   replayOnOpen?: boolean
+  /**
+   * 打开模式（三态，见 {@link JournalMode}）；**默认 `'write'`**。
+   *
+   * ## 为什么这里是可选的，而 `JournalOptions.mode` 是必填的（刻意不对称）
+   *
+   * `Journal` 是底层原语，三态在那里真正生效，且它的调用点全部在 `src/store/`
+   * 与 `tests/store/` 内，改成必填不波及范围外文件——所以必填，不留默认值。
+   *
+   * `Store` 是上层门面，调用点跨 `src/index.ts`（宿主）、`src/cli/`、
+   * `tests/host/`、`tests/cli/`。把它改成必填，这些**不在本模块写范围内**的
+   * 文件会立刻编译不过；按「提交点必须自洽」的规矩就得一起改，反而制造跨范围
+   * 冲突——这正是 `cc68878` 那类事故的结构。
+   *
+   * ## 默认值选 `'write'` 的理由：看漏传的后果，而不是看「显不显式」
+   *
+   * 默认 `'readonly'`：宿主漏传就**静默失去写能力**，记忆不再入库且没有任何
+   * 报错——灾难。默认 `'write'`：等于今天的行为，零回归。
+   *
+   * 更关键的是：真正防损坏的不是「mode 有没有传」，而是日志写入前的第二写者
+   * 检查（D-08）。CLI 漏传 mode 最坏结果是「CLI 仍可能写」，而那道检查会在
+   * 它真正写坏数据之前抛错。**防线不在默认值上。**
+   */
+  mode?: JournalMode
 }
 
 /** 一次写入的结果。 */
@@ -64,6 +88,8 @@ export class MemoryStore {
   readonly config: MemoryConfig
   /** 数据目录绝对路径。 */
   readonly dir: string
+  /** 打开模式（三态）；只读模式下所有写方法都会抛 `ReadOnlyModeError`。 */
+  readonly mode: JournalMode
 
   private readonly journal: Journal
   private readonly replayOnOpen: boolean
@@ -80,10 +106,12 @@ export class MemoryStore {
     const dataDir = options.dataDir ?? this.config.storage.dataDir
     this.dir = resolve(dataDir)
     this.replayOnOpen = options.replayOnOpen ?? true
+    this.mode = options.mode ?? 'write'
     this.journal = new Journal({
       dir: this.dir,
       segmentBytes: options.segmentBytes ?? this.config.storage.journalSegmentBytes,
       fsyncOnWrite: options.fsyncOnWrite ?? this.config.storage.fsyncOnWrite,
+      mode: this.mode,
     })
   }
 

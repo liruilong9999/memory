@@ -8,9 +8,10 @@
  */
 
 export {
-  Journal, buildIdempotencyKey, decodeRecord, encodeRecord, listShardFiles, shardFileName,
+  ConcurrentWriterError, Journal, ReadOnlyModeError, buildIdempotencyKey, decodeRecord,
+  encodeRecord, listShardFiles, shardFileName,
 } from './journal.ts'
-export type { AppendOutcome, JournalOptions } from './journal.ts'
+export type { AppendOutcome, JournalMode, JournalOptions } from './journal.ts'
 
 export {
   EMPTY_STATE, applyRecord, applyRecordPure, cloneState, countCards, createEmptyState,
