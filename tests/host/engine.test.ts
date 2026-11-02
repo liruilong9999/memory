@@ -743,3 +743,103 @@ describe('图谱扩散不写库（FR-G1 / 起源 L29）', () => {
     store.close()
   })
 })
+
+/**
+ * 扩散激活的**端到端**验证（FR-G1 / 起源 L15·无编号·图谱）。
+ *
+ * 为什么必须有这一组：`tests/core/spread.test.ts` 那 40 条全部直接调
+ * `scoreCards` 并**自己造边**，从来没有经过「真实写入 → 夜整理产边 → 召回」
+ * 这条路。这正是那个「扩散恒为空集」的真缺陷能藏住的原因——31 条单测全绿，
+ * 因为没有任何一条走完整链路。同一个病 consolidate-dev 也撞过一次：
+ * `distillFeelings` 单测全绿，端到端才暴露 `distilled = 0`。
+ *
+ * 这里用的是真实 store + 真实夜整理。`same-entity` 边的产出条件是「实体集有
+ * 交集」，而 `extractEntities` 只认引号专名/路径/URL/标识符，所以卡里必须写
+ * 引号专名，否则一条边都产不出来，所有断言都会**空绿**。
+ */
+describe('扩散激活的端到端链路（FR-G1 / 起源 L15）', () => {
+  /** 造一个「有真实边」的库，返回引擎与 store。 */
+  function spreadLibrary(mode: MemoryConfig['spread']['mode'], maxBoost = 0.2): {
+    store: MemoryStore
+    engine: MemoryEngine
+  } {
+    const config = makeConfig({ spread: { mode, maxBoost } })
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+    engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」的版本用「ThreePointTwo」', at: T0,
+    }))
+    engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」需要重新构建，因为「BuildScript」有问题',
+      turn: 2, at: T0 + 1000,
+    }))
+    engine.consolidate(T0 + 2000)
+    return { store, engine }
+  }
+
+  it('真实链路里影子模式算得出加分，且总分与 off 逐位相同', () => {
+    const shadow = spreadLibrary('shadow')
+    const off = spreadLibrary('off')
+
+    // 前提：必须真的产出了边，否则后面全是空绿。
+    assert.ok(shadow.store.allEdges().length > 0, '前提：夜整理必须产出边')
+    assert.equal(
+      shadow.store.allEdges().length, off.store.allEdges().length,
+      '前提：两种模式下的边集必须一致（扩散不写库）',
+    )
+
+    const shadowCards = shadow.engine.recall('CordisPlugin 版本').pack.cards
+    const offCards = off.engine.recall('CordisPlugin 版本').pack.cards
+
+    // 前提：两张卡都要在焦点包里，否则下面比较的是空集。
+    assert.equal(shadowCards.length, 2, '前提：两张卡都必须进焦点包')
+    assert.equal(offCards.length, 2, '前提：两张卡都必须进焦点包')
+
+    // 影子模式：总分与 off 逐位相同。
+    const shadowTotals = shadowCards.map((c) => c.score.total)
+    const offTotals = offCards.map((c) => c.score.total)
+    assert.deepEqual(shadowTotals, offTotals, '影子模式不得改变任何一张卡的总分')
+
+    // 但观察值必须非空——这才是影子模式存在的意义。
+    const observed = shadowCards.filter((c) => c.shadowSpread !== undefined)
+    assert.ok(
+      observed.length > 0,
+      '影子模式必须产出观察值；若为空，说明扩散在真实链路上又退化成空集了',
+    )
+    for (const card of observed) {
+      assert.ok(card.shadowSpread!.boost > 0, '观察到的加分必须为正')
+      assert.ok(
+        card.shadowSpread!.hypotheticalTotal > card.score.total,
+        '假设总分必须真的高于实际总分，否则观察值没有信息量',
+      )
+    }
+
+    // off 模式下一张都不许有观察值（没算就没有数可说）。
+    assert.equal(
+      offCards.filter((c) => c.shadowSpread !== undefined).length, 0,
+      'off 模式不得产出任何观察值',
+    )
+    shadow.store.close()
+    off.store.close()
+  })
+
+  it('on 模式在真实链路里真的把卡的分数提上去了', () => {
+    const on = spreadLibrary('on')
+    const off = spreadLibrary('off')
+
+    const onCards = on.engine.recall('CordisPlugin 版本').pack.cards
+    const offCards = off.engine.recall('CordisPlugin 版本').pack.cards
+    assert.equal(onCards.length, 2, '前提：两张卡都必须进焦点包')
+
+    // 按 id 对齐，不能按顺序对齐——排序本身可能变。
+    const offById = new Map(offCards.map((c) => [c.card.id, c.score.total]))
+    const changed = onCards.filter((c) => c.score.total > (offById.get(c.card.id) ?? 0))
+    assert.ok(
+      changed.length > 0,
+      'on 模式必须在真实链路上真的提分；若一条都没变，说明扩散是空转',
+    )
+    // 影子模式的预测值必须与 on 的实测值一致——否则攒下的证据是假的。
+    on.store.close()
+    off.store.close()
+  })
+})
