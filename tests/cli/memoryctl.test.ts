@@ -12,16 +12,17 @@
 
 import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
   CLI_NAME, EXIT_OK, EXIT_UNHEALTHY, EXIT_USAGE, FALLBACK_TIME_ZONE,
-  healthExitCode, helpText, isValidTimeZone, parseArgs, resolveTimeZone, runCli,
+  healthExitCode, helpText, isValidTimeZone, parseArgs, readOnlyRecall, resolveTimeZone, runCli,
 } from '../../src/cli/memoryctl.ts'
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import { buildCardId } from '../../src/core/types.ts'
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from '../../src/core/types.ts'
+import { MemoryEngine } from '../../src/host/engine.ts'
 import { openStore } from '../../src/store/store.ts'
 import { makeTempDir, removeDirContents } from '../store/helpers.ts'
 
@@ -282,13 +283,15 @@ describe('query（FR-F2）', () => {
     assert.ok((payload.cards[0]?.explain.length ?? 0) > 0)
   })
 
-  it('--verbose 把结构化日志打到 stderr（FR-F1）', () => {
+  it('--verbose 下 query 不产生召回日志，因为只读查询不写事件（FR-F1 语义）', () => {
     const dir = tempDir()
     seedStore(dir)
     const result = runCli(['query', '部署', '--data-dir', dir, '--verbose'], { now: fixedClock })
     assert.equal(result.code, EXIT_OK)
-    assert.match(result.stderr, /\[recall\]/u)
-    assert.match(result.stderr, /召回 \d+ 条/u)
+    // 只读查询不写库 ⇒ 引擎不产生 recall 日志。这不是缺陷：
+    // 本项目里「召回」指宿主真的把记忆注入上下文、即将被使用；
+    // 运维敲一眼看看库里有什么，不算使用，也就不该记成一次召回。
+    assert.equal(result.stderr, '')
   })
 
   it('不加 --verbose 时 stderr 保持干净', () => {
@@ -296,6 +299,71 @@ describe('query（FR-F2）', () => {
     seedStore(dir)
     const result = runCli(['query', '部署', '--data-dir', dir], { now: fixedClock })
     assert.equal(result.stderr, '')
+  })
+})
+
+describe('query 是纯只读的（不污染记忆库）', () => {
+  /** 取库里唯一日志文件的字节数——库的任何写入都会追加到这里。 */
+  function journalSize(dir: string): number {
+    const files = readdirSync(dir).filter((name) => name.endsWith('.jsonl'))
+    assert.equal(files.length, 1, '本测试假设库里只有一个日志段文件')
+    return statSync(join(dir, files[0] ?? '')).size
+  }
+
+  it('query 前后库文件字节数不变', () => {
+    const dir = tempDir()
+    seedStore(dir)
+    const before = journalSize(dir)
+    const result = runCli(['query', '部署', '--data-dir', dir], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.match(result.stdout, /焦点包/u, '这条测试得先真的召回到东西，否则「没写库」可能只是没干活')
+    const after = journalSize(dir)
+    assert.equal(after, before, 'query 竟然写了库：它应当只读')
+  })
+
+  it('反复查询不会累积写入', () => {
+    const dir = tempDir()
+    seedStore(dir)
+    const before = journalSize(dir)
+    for (const keyword of ['部署', '数据库', '迁移', '部署']) {
+      assert.equal(runCli(['query', keyword, '--data-dir', dir], { now: fixedClock }).code, EXIT_OK)
+    }
+    assert.equal(journalSize(dir), before)
+  })
+
+  it('query 前后 accessCount / strength / lastAccessAt 都不变', () => {
+    const dir = tempDir()
+    seedStore(dir)
+    const pick = (): Array<Record<string, unknown>> => {
+      const payload = JSON.parse(
+        runCli(['export', '--data-dir', dir, '--include-archived', '--json'], { now: fixedClock }).stdout,
+      ) as { cards: Array<Record<string, unknown>> }
+      return payload.cards.map((card) => ({
+        id: card['id'],
+        accessCount: card['accessCount'],
+        strength: card['strength'],
+        lastAccessAt: card['lastAccessAt'],
+      }))
+    }
+    const before = pick()
+    assert.equal(runCli(['query', '部署', '--data-dir', dir], { now: fixedClock }).code, EXIT_OK)
+    assert.deepEqual(pick(), before, 'query 改了访问计数或强度')
+  })
+
+  it('对照：宿主的 recall 会写库（证明上一条测试有牙）', () => {
+    // 若把 query 改回 engine.recall，上面三条必然失败。这里显式证明
+    // 「写入是能被观测到的」，避免测试因为库根本不落盘而假绿。
+    const dir = tempDir()
+    seedStore(dir)
+    const before = journalSize(dir)
+    const store = openStore({ config: DEFAULT_CONFIG, dataDir: dir })
+    try {
+      const engine = new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock })
+      engine.recall('部署')
+    } finally {
+      store.close()
+    }
+    assert.ok(journalSize(dir) > before, '宿主 recall 都没写库，那上面「字节数不变」的测试就是假绿')
   })
 })
 
