@@ -37,7 +37,7 @@ export function apply(ctx: Context) {
 | `ctx.systemPrompt.context({ name, order, text })` | 渲染成带来源的 user 快照，追加在历史之后 | 仅追加，cache-safe |
 
 - `text` 可以是函数，每个模型步骤都重新求值。
-- 排序：sections 按 order 升序 + name 次序；contexts 只按 order 升序。第一方 context 占用 110/115/120，本系统取 130 之后。
+- 排序：sections 按 order 升序 + name 次序；contexts 只按 order 升序。第一方 context 占用 100/110/115/120/125 与 200/210，本系统取 300（落在 200 之后的动态尾部）。
 - 作用域：注册落在调用方 ctx 的 scope 层；scoped 遮蔽 global；scope 的 key 就是 Agent 对象，因此 agent-scoped 注册天然按 agent 隔离。
 - 另一条正交路径：`agent/pre-step` 里往本次 step 的 messages 追加 `UserMessage`（时间上下文插件就是这么做的）。
 - 证据：`packages/core/system-prompt/src/index.ts`、`docs/subsystems/system-prompt.zh.md`、`packages/core/agent-loop/src/runtime-context.ts`。

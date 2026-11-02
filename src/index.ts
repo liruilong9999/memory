@@ -39,8 +39,17 @@ import { shouldRunDaily } from './time/clock.ts'
  */
 export type Config = MemoryConfig
 
-/** 动态上下文在系统提示词里的排序值。 */
-const CONTEXT_ORDER = 130
+/**
+ * 动态上下文在系统提示词里的排序值。
+ *
+ * 取 300 而不是 130：宿主 `CONTEXT_ORDERS`（`packages/core/system-prompt/src/index.ts:177`）
+ * 实际是 100 工作目录 / 110 沙箱 / 115 审批 / 120 子代理 / 125 团队身份 /
+ * 200 宿主源码路径 / 210 Web 表面。130 会**夹在团队身份与宿主源码之间**，
+ * 既不靠前也不靠后；而宿主注释明确说 200 之后是「进程相关路径与端点，
+ * 不进缓存系统提示词」（同文件 :182），所以排在 200 之后才落在动态尾部。
+ * 记忆每轮都在变，放在缓存区里会不断打断前缀缓存。
+ */
+const CONTEXT_ORDER = 300
 
 /** 夜整理巡检周期：每小时看一次「今天该不该整理」。 */
 const CONSOLIDATION_POLL_MS = 60 * 60 * 1000
@@ -507,7 +516,7 @@ export function consolidationPollMs(): number {
 }
 
 /**
- * 动态上下文排序值的导出，便于测试断言（C7 要求 ≥ 130）。
+ * 动态上下文排序值的导出，便于测试断言（C7 要求排在动态尾部）。
  *
  * @returns 排序值。
  */

@@ -176,13 +176,13 @@ export function probeCapabilities(ctx: HostContext): HostCapabilities {
  * 三条硬约束：
  * 1. **只走 `context()`，不走 `section()`** —— 后者改写系统提示词头部，
  *    会让 KV 前缀缓存从第一个变化 token 起全部失效（C7）。
- * 2. **order 取 130 之后** —— 第一方 context 占用 110/115/120，
+ * 2. **order 取 300** —— 第一方 context 占用 100/110/115/120/125 与 200/210，
  *    本系统排在它们之后，不抢位置（宿主文档第 2 节）。
  * 3. **`text` 传函数** —— 每轮重新求值，压缩后自动重新物化（FR-E4 / V-1）。
  *
  * @param ctx - 宿主上下文。
  * @param name - 注册名，必须唯一。
- * @param order - 排序值，建议 ≥ 130。
+ * @param order - 排序值，建议 ≥ 300（排在宿主源码路径之后，落在动态尾部）。
  * @param render - 每轮求值的渲染函数；返回空串表示本轮不注入。
  * @returns 是否注册成功。
  */

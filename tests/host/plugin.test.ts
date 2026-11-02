@@ -2,7 +2,7 @@
  * 插件入口单测：`apply()` 真的把记忆系统接到宿主上了吗。
  *
  * 覆盖目标：
- * - FR-E2 / C4：注入只走 `systemPrompt.context()`，order ≥ 130，`text` 是函数。
+ * - FR-E2 / C4：注入只走 `systemPrompt.context()`，order ≥ 300，`text` 是函数。
  * - FR-A1：`agent/turn-stopping` 事件真的写卡。
  * - FR-F2：`/memory` 命令能查状态。
  * - FR-C1：夜整理定时器真的注册。
@@ -235,8 +235,10 @@ describe('插件元信息', () => {
     assert.equal(name, 'memory')
   })
 
-  it('动态上下文排序值 ≥ 130（C7：排在第一方 context 之后）', () => {
-    assert.ok(contextOrder() >= 130)
+  it('动态上下文排序值 ≥ 300（C7：排在动态尾部，不打断前缀缓存）', () => {
+    // 宿主 CONTEXT_ORDERS 最高到 210（WEB_SURFACE），且 200 之后才是不进缓存的
+    // 动态区（system-prompt:182）。记忆每轮都变，必须落在这个区里。
+    assert.ok(contextOrder() >= 300)
   })
 
   it('夜整理巡检周期是 1 小时', () => {
@@ -264,10 +266,11 @@ describe('apply 的注入接线（FR-E2 / C4 / C7）', () => {
     assert.equal(typeof host.contexts[0]?.text, 'function')
   })
 
-  it('order 是 130', async () => {
+  it('order 是 300', async () => {
     const host = makeHost()
     await apply(host.ctx, baseConfig(tempDir()))
-    assert.equal(host.contexts[0]?.order, 130)
+    // 300 落在宿主 200（宿主源码路径）之后的动态尾部，不进前缀缓存区。
+    assert.equal(host.contexts[0]?.order, 300)
   })
 
   it('渲染函数可重复调用且不抛错（空库时返回时间读数）', async () => {
