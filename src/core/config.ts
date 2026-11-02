@@ -40,6 +40,14 @@ export interface RecallPolicy {
   tokenBudget: number
   /** 单条卡片摘要字符上限，超出截断（Q-09）。 */
   maxCardChars: number
+  /**
+   * 注入块的固定开销预留（token）：标题、当前时间、空行、免责尾注。
+   *
+   * 起源 L33（第 7 条·有限上下文）要求「利用有限的上下文」，
+   * FR-E3 要求每轮记忆注入有硬上限。若只把卡片本身计入预算、
+   * 不预留头尾固定文本，实际注入必然超出 `tokenBudget`——上限就是假的。
+   */
+  overheadTokens: number
   /** 候选池上限，限制打分规模以保 NFR-1（万级记忆 <50ms）。 */
   candidateLimit: number
 }
@@ -158,6 +166,8 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     minCards: 1,
     tokenBudget: 900,
     maxCardChars: 160,
+    // 两行标题 + 当前时间行 + 两处空行 + 一行免责尾注，中文约 90 字。
+    overheadTokens: 100,
     candidateLimit: 400,
   },
   forgetting: {

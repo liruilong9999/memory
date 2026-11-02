@@ -335,6 +335,10 @@ export function buildFocusPack(
 ): FocusPack {
   const picked = applyThresholds(scored, config)
   const budget = config.recall.tokenBudget
+  // 头尾固定文本（标题/当前时间/免责尾注）也占上下文，必须先扣掉再分配卡片。
+  // 不扣的话 pack.tokens 只统计卡片部分，实际注入必然超出 tokenBudget（FR-E3 失真）。
+  const overhead = Math.max(0, config.recall.overheadTokens)
+  const cardBudget = Math.max(0, budget - overhead)
   const kept: ScoredCard[] = []
   let used = 0
 
@@ -343,12 +347,12 @@ export function buildFocusPack(
     const line = formatCardLine(item.card, text)
     const cost = estimateTokens(line)
     // 至少留一条，否则预算太小时焦点包会永远为空；其余按预算硬截断。
-    if (kept.length > 0 && used + cost > budget) continue
-    if (used + cost > budget && kept.length === 0) {
+    if (kept.length > 0 && used + cost > cardBudget) continue
+    if (used + cost > cardBudget && kept.length === 0) {
       // 单条就超预算：截断文本再试，仍超则放弃。
       const shrunk = truncate(item.card.text, Math.max(8, Math.floor(config.recall.maxCardChars / 2)))
       const shrunkCost = estimateTokens(formatCardLine(item.card, shrunk))
-      if (shrunkCost > budget) continue
+      if (shrunkCost > cardBudget) continue
       kept.push(item)
       used += shrunkCost
       continue
@@ -360,8 +364,10 @@ export function buildFocusPack(
   const empty = kept.length === 0
   return {
     cards: kept,
-    tokens: used,
+    // tokens 报「卡片 + 头尾固定开销」的真实占用，调用方据此判断是否超预算。
+    tokens: empty ? 0 : used + overhead,
     budgetTokens: budget,
+    maxCardChars: config.recall.maxCardChars,
     query: query.text,
     builtAt: query.now,
     empty,
@@ -418,7 +424,8 @@ export function renderFocusPack(pack: FocusPack, time: TimeState): string {
   lines.push(`当前时间：${formatTime(time.now, time.timeZone)}`)
   lines.push('')
   for (const item of pack.cards) {
-    const text = truncate(item.card.text, 200)
+    // 截断长度必须来自配置，不能硬编码：硬编码会让实际注入长度与 pack.tokens 的估算脱钩。
+    const text = truncate(item.card.text, pack.maxCardChars)
     lines.push(formatCardLine(item.card, text))
     if (item.conflict) {
       lines.push('  ⚠ 这条记忆与另一条存在冲突，使用时请说明不确定。')

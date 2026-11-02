@@ -248,10 +248,17 @@ export interface ScoredCard {
 export interface FocusPack {
   /** 选中的卡片，按总分降序。 */
   cards: ScoredCard[]
-  /** 估算的注入 token 数。 */
+  /** 估算的注入 token 数（含头尾固定开销）。 */
   tokens: number
   /** 本轮 token 预算上限。 */
   budgetTokens: number
+  /**
+   * 单条卡片的截断字符上限，随包一起带上。
+   *
+   * 渲染时必须用这个值而不是硬编码字面量，否则「预算按 160 算、渲染按 200 截」
+   * 会让 `tokens` 与实际注入长度脱钩（FR-E3 上限失真）。
+   */
+  maxCardChars: number
   /** 触发本次预取的查询文本（通常是用户最新一条消息）。 */
   query: string
   /** 构建时刻。 */

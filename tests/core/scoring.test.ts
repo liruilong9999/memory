@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import {
   applyThresholds, buildFocusPack, clamp01, effectiveHalfLife, filterByDomain, formatDuration,
-  formatTime, goalScore, importanceScore, makeQuery, recencyScore, scoreCard,
+  formatTime, goalScore, importanceScore, makeQuery, recencyScore, renderFocusPack, scoreCard,
   scoreCards, semanticScore,
 } from '../../src/core/scoring.ts'
 import { tokenSet } from '../../src/core/text.ts'
@@ -218,6 +218,52 @@ test('buildFocusPack token 不超预算', () => {
   const cards = Array.from({ length: 10 }, (_, i) => makeCard({ id: `c${i}`, text: `这个项目用 Qt5 开发 第 ${i} 条记录`, createdAt: now }))
   const pack = buildFocusPack(scoreCards(cards, query, config), query, config)
   assert.ok(pack.tokens <= pack.budgetTokens)
+})
+
+test('buildFocusPack 头尾固定开销计入 tokens（FR-E3 上限不能是假的）', () => {
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目', config, now)
+  const cards = [makeCard({ id: 'c0', text: '这个项目用 Qt5 开发', createdAt: now })]
+  const pack = buildFocusPack(scoreCards(cards, query, config), query, config)
+  assert.equal(pack.empty, false)
+  // tokens 必须包含 overheadTokens，否则渲染出的实际长度会超过 budgetTokens。
+  assert.ok(
+    pack.tokens >= config.recall.overheadTokens,
+    `tokens=${pack.tokens} 应 ≥ overhead=${config.recall.overheadTokens}`,
+  )
+})
+
+test('buildFocusPack 空包 tokens 为 0', () => {
+  const query = makeQuery('无关查询', config, 1_700_000_000_000)
+  const pack = buildFocusPack([], query, config)
+  assert.equal(pack.tokens, 0)
+})
+
+test('buildFocusPack 带上 maxCardChars 供渲染使用', () => {
+  const query = makeQuery('Qt5', config, 1_700_000_000_000)
+  const pack = buildFocusPack([], query, config)
+  assert.equal(pack.maxCardChars, config.recall.maxCardChars)
+})
+
+test('renderFocusPack 按 pack.maxCardChars 截断，不硬编码', () => {
+  const now = 1_700_000_000_000
+  const longText = '这个项目用 Qt5 开发'.repeat(40)
+  const query = makeQuery('Qt5 项目', config, now)
+  const cards = [makeCard({ id: 'c0', text: longText, createdAt: now })]
+  const pack = buildFocusPack(scoreCards(cards, query, config), query, config)
+  const time = {
+    now, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+    sinceLastSession: null, sinceLastTurn: null,
+    sessionStartedAt: null, due: [],
+  }
+  const rendered = renderFocusPack(pack, time)
+  const cardLine = rendered.split('\n').find((line) => line.startsWith('- ['))
+  assert.ok(cardLine !== undefined)
+  const body = cardLine.slice(cardLine.indexOf('] ') + 2)
+  assert.ok(
+    [...body].length <= config.recall.maxCardChars,
+    `正文 ${[...body].length} 字超过 ${config.recall.maxCardChars}`,
+  )
 })
 
 test('clamp01 边界', () => {
