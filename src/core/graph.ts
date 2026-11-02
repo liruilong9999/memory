@@ -28,10 +28,66 @@ import { buildEdgeId } from './types.ts'
 import type { EdgeRelation, MemoryEdge } from './types.ts'
 
 /**
+ * 边权量化格：边权的最小可表示变化量（两位小数）。
+ *
+ * ## 为什么它必须是一个导出的常量（缺陷二十）
+ *
+ * 边权原本在 `makeEdge` 里就地写 `Math.round(w * 100) / 100`，这个「两位小数」
+ * 的粒度只存在于那一行代码里，**没有任何名字**。于是可塑性层（`src/core/spread.ts`）
+ * 各自又写了同样的一行，三处互不知道对方的存在。
+ *
+ * 后果不是「精度不一致」这种审美问题，而是**机制在数学上停摆**：
+ * `decayFactor = 0.98` 时，权重 `w` 的每步衰减量是 `0.02 × w`；当 `w ≤ 0.25` 时
+ * 这个量小于量化格的一半（0.005），四舍五入后**原地不动**。实测 `0.30 → 0.25`
+ * 走 11 夜后冻结 500 夜不变，`prunableEdges` 一次都没触发过——整个「遗忘」机制
+ * 一行都没真正执行过，而它不报错、不崩溃、日志正常、测试全绿。
+ *
+ * 把粒度提成常量，是为了让「每步至少变化一格」这条规则有地方可写。
+ */
+export const EDGE_WEIGHT_STEP = 0.01
+
+/**
+ * 把边权对齐到量化格。
+ *
+ * 实现刻意写成 `Math.round(w * 100) / 100` 而**不是** `Math.round(w / 0.01) * 0.01`：
+ * 后者会算出 `0.30000000000000004` 这种尾数，让「边权是否等于 0.3」重新变成
+ * 不可断言的事——那正是引入量化格要解决的问题。乘除同一个十进制数才能保证
+ * 结果与源码里的字面量 `0.3` 逐位相同。
+ *
+ * @param weight - 任意权重（不做 0..1 夹取，夹取是 `makeEdge` 的事）。
+ * @returns 对齐到格点的权重。
+ */
+export function quantizeWeight(weight: number): number {
+  return Math.round(weight * 100) / 100
+}
+
+/**
+ * 权重降一格。
+ *
+ * 用于「必须变弱」的场合：当按比例算出的衰减量不足一格时，直接减一格，
+ * 保证衰减**永远**真的发生（缺陷二十）。
+ *
+ * @param weight - 当前权重。
+ * @returns 比输入严格小一格的权重；已在下限时返回 0。
+ */
+export function stepDownWeight(weight: number): number {
+  return quantizeWeight(Math.max(0, weight - EDGE_WEIGHT_STEP))
+}
+
+/**
+ * 权重升一格。
+ *
+ * @param weight - 当前权重。
+ * @returns 比输入严格大一格的权重；已在上限时返回 1。
+ */
+export function stepUpWeight(weight: number): number {
+  return quantizeWeight(Math.min(1, weight + EDGE_WEIGHT_STEP))
+}
+
+/**
  * 造一条边。
  *
- * 权重会被夹到 0..1 并保留两位小数：边权参与扩散打分，浮点尾数没有任何信息量，
- * 却会让「同一条边在两次整理里权重是否相等」这种断言变得不可写。
+ * 权重会被夹到 0..1 并保留两位小数（见 `quantizeWeight`）。
  *
  * @param from - 起点卡 id。
  * @param to - 终点卡 id。
@@ -49,7 +105,7 @@ export function makeEdge(
     from,
     to,
     relation,
-    weight: Math.round(bounded * 100) / 100,
+    weight: quantizeWeight(bounded),
     createdAt: at,
   }
 }

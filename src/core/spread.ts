@@ -56,6 +56,7 @@
 
 import type { EdgeRelation, MemoryEdge, MemoryCard } from './types.ts'
 import type { MemoryConfig } from './config.ts'
+import { quantizeWeight, stepDownWeight } from './graph.ts'
 
 /**
  * 把数值夹到 0..1。
@@ -388,7 +389,7 @@ export function reinforceEdges(
     const next = Math.min(sp.maxEdgeWeight, edge.weight + sp.reinforceDelta)
     // 权重没变（已在上限）时不产生更新，避免日志里堆积无意义的记录。
     if (next === edge.weight) continue
-    updated.push({ ...edge, weight: Math.round(next * 100) / 100 })
+    updated.push({ ...edge, weight: quantizeWeight(next) })
   }
   return updated
 }
@@ -400,6 +401,36 @@ export function reinforceEdges(
  * @param config - 配置。
  * @returns 需要更新的边。
  */
+/**
+ * 算出衰减一步后的边权，保证**严格小于**输入。
+ *
+ * ## 为什么不能只写 `Math.round(w * decayFactor * 100) / 100`（缺陷二十）
+ *
+ * 边权落在两位小数的格点上（`EDGE_WEIGHT_STEP`）。当按比例算出的衰减量
+ * 小于半格时，四舍五入会把它**舍回原值**——衰减原地不动。
+ *
+ * `decayFactor = 0.98` 时每步衰减量是 `0.02 × w`，令它小于半格（0.005）
+ * 得 `w ≤ 0.25`。也就是说**只要权重掉到 0.25 以下，遗忘机制就永久停摆**：
+ * 实测 `0.30 → 0.25` 走 11 夜后冻结 500 夜不变，`prunableEdges` 一次都没触发。
+ * 它不报错、不崩溃、日志正常、单测全绿（因为单测只走了一步）。
+ *
+ * 修法不是调大 `decayFactor`（那只是把停摆点挪到别处），而是承认
+ * 「衰减必须真的发生」是机制的定义，而不是浮点数的副作用：比例衰减
+ * 不足一格时，强制降一格。这样任何 `decayFactor ∈ (0, 1)` 都不可能停摆。
+ *
+ * @param weight - 当前权重。
+ * @param decayFactor - 衰减系数，`(0, 1)` 区间。
+ * @returns 衰减后的权重，严格小于 `weight`（`weight` 为 0 时返回 0）。
+ */
+export function nextDecayedWeight(weight: number, decayFactor: number): number {
+  if (weight <= 0) return 0
+  const scaled = quantizeWeight(weight * decayFactor)
+  // 比例衰减已经跨过一格就照它走；否则强制降一格。
+  // 分支写成这样而不是 `Math.max(scaled, stepDownWeight(weight))`，是因为后者
+  // 在 `decayFactor` 接近 1 时会把衰减量锁死成一格，丢掉真实的衰减速度。
+  return scaled < weight ? scaled : stepDownWeight(weight)
+}
+
 export function decayEdges(
   edges: readonly MemoryEdge[], config: MemoryConfig,
 ): MemoryEdge[] {
@@ -408,7 +439,7 @@ export function decayEdges(
   const updated: MemoryEdge[] = []
   const sorted = [...edges].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   for (const edge of sorted) {
-    const next = Math.round(edge.weight * sp.decayFactor * 100) / 100
+    const next = nextDecayedWeight(edge.weight, sp.decayFactor)
     if (next === edge.weight) continue
     updated.push({ ...edge, weight: next })
   }

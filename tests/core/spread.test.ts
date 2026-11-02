@@ -16,7 +16,7 @@ import { makeCard, makeConfig } from '../consolidate/fixtures.ts'
 import { makeEdge } from '../../src/core/graph.ts'
 import {
   applySpread, buildAdjacency, canTraverse, decayEdges, isDiffusible,
-  isSymmetricRelation, prunableEdges, reinforceEdges, spreadActivation,
+  isSymmetricRelation, nextDecayedWeight, prunableEdges, reinforceEdges, spreadActivation,
 } from '../../src/core/spread.ts'
 import type { SpreadSeed } from '../../src/core/spread.ts'
 import { buildFocusPack, renderFocusPack, scoreCards } from '../../src/core/scoring.ts'
@@ -570,6 +570,58 @@ describe('突触可塑性（FR-G1）', () => {
     const forward = decayEdges([e1, e2], config).map((x) => [x.id, x.weight])
     const reversed = decayEdges([e2, e1], config).map((x) => [x.id, x.weight])
     assert.deepEqual(forward, reversed, '顺序无关')
+  })
+
+  it('衰减在任意权重上都不会停摆（缺陷二十：量化格比步长还粗）', () => {
+    // 这条测试是**缺陷二十**的守卫，也是它为什么长期全绿的答案。
+    //
+    // 上面那条「衰减按 decayFactor 缩小边权」只走**一步**：`0.5 × 0.98 = 0.49`。
+    // 一步跨了整整两格（0.01 粒度下），所以它绿得毫无问题。但衰减真正要
+    // 发生的地方不是第一步，是**第二十步、第五百步**——而那里它早就停了。
+    //
+    // 旧实现 `Math.round(w * 0.98 * 100) / 100` 的每步衰减量是 `0.02 × w`。
+    // 令它小于半格（0.005）得 `w ≤ 0.25`：**权重一旦掉到 0.25 以下，
+    // 每步衰减都被四舍五入回原值，永久冻结**。实测 500 夜不变，
+    // `prunableEdges` 一次都没触发——整个「遗忘」机制一行都没真正执行过。
+    //
+    // 只测一步的测试永远不会发现这件事，因为它测的那一步恰好不在停摆区。
+    const config = spreadConfig({ decayFactor: 0.98 })
+
+    // 覆盖停摆区（≤ 0.25）、停摆区上方、以及几乎不衰减的极端参数。
+    for (const start of [0.9, 0.5, 0.3, 0.25, 0.24, 0.1, 0.05]) {
+      let weight = start
+      let nights = 0
+      while (weight > 0 && nights < 1000) {
+        const next = nextDecayedWeight(weight, config.spread.decayFactor)
+        assert.ok(
+          next < weight,
+          `起点 ${start}：第 ${nights + 1} 夜权重 ${weight} 没有变弱（得到 ${next}）` +
+          '——衰减一旦原地不动，剪枝永远不会触发，遗忘机制整体失效',
+        )
+        weight = next
+        nights += 1
+      }
+      assert.equal(weight, 0, `起点 ${start}：必须在有限夜内衰减到 0，实际停在 ${weight}`)
+    }
+
+    // 停摆区的具体证据：0.25 在旧实现下是 25 个不动点之一，必须真的降。
+    assert.equal(nextDecayedWeight(0.25, 0.98), 0.24, '0.25 是旧实现的不动点，必须降')
+    assert.equal(nextDecayedWeight(0.24, 0.98), 0.23, '0.24 同样是不动点')
+
+    // 比例衰减足够大时，必须走真实比例而不是「一格保底」——
+    // 否则修缺陷二十会顺手把衰减速度锁死成一格，那是另一个静默错误。
+    assert.equal(nextDecayedWeight(1, 0.5), 0.5, '大比例衰减必须走真实比例')
+    assert.equal(nextDecayedWeight(0.8, 0.5), 0.4, '大比例衰减必须走真实比例')
+
+    // 这个修法有一个**已知代价**，必须写出来而不是藏着：极慢的衰减系数
+    // （如 0.999）本来意图是「几乎不衰减」，但为了不停摆，它被抬到了
+    // 「每夜至少一格」，也就是比参数声明得更快。
+    // 接受这个代价，是因为反过来（忠实于参数、允许停摆）会让「遗忘」
+    // 变成一个有时会静默关闭的机制——那比「忘得快一点」坏得多。
+    assert.equal(
+      nextDecayedWeight(0.5, 0.999), 0.49,
+      '慢衰减系数也必须真的降（代价：比参数声明的略快）',
+    )
   })
 })
 
