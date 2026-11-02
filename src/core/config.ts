@@ -98,6 +98,16 @@ export interface ExtractionPolicy {
   minAssistantChars: number
   /** 触发写入的关键词（承诺、决策、偏好、踩坑）。 */
   signalKeywords: string[]
+  /**
+   * 触发写入的到期类关键词（FR-D3 / 起源 L21）。
+   *
+   * 单列一组而不并进 `signalKeywords`，是因为它们有**额外语义**：
+   * 命中不仅要放行门控，还要去解析 `dueAt`。
+   * 早期版本把「明天/下周/提醒」混进普通信号词，导致
+   * 「明天下午三点提醒我交周报」这种句子反而因为一个词都没命中而不入库，
+   * FR-D3 从根上不可能通过。
+   */
+  dueKeywords: string[]
   /** 是否把助手回复也纳入抽取。 */
   includeAssistant: boolean
 }
@@ -195,6 +205,11 @@ export const DEFAULT_CONFIG: MemoryConfig = {
       '决定', '结论', '记住', '以后', '下次', '不要再', '偏好', '习惯',
       '承诺', '答应', '务必', '注意', '踩坑', '坑', '报错', '失败', '原因',
       '方案', '选择', '替代', '部署', '架构', '约定',
+    ],
+    // 到期类：命中即放行门控，并由 time/due.ts 解析具体时刻（FR-D3）。
+    dueKeywords: [
+      '提醒', '记得', '别忘', '不要忘', '到点', '到期', '截止', 'deadline',
+      '闹钟', '叫我', '通知我', '明天', '后天', '下周', '每天', '每周',
     ],
     includeAssistant: true,
   },

@@ -83,15 +83,21 @@ export function gateTurn(
   input: TurnInput, config: MemoryConfig,
 ): { pass: boolean; signals: string[] } {
   const userSignals = matchSignals(input.userText, config.extraction.signalKeywords)
+  // 到期类关键词单独匹配：它们命中就说明这句话要记（FR-D3 / 起源 L21）。
+  // 不并进 signalKeywords 是因为它们在抽取阶段还要触发 dueAt 解析。
+  const userDue = matchSignals(input.userText, config.extraction.dueKeywords)
   const userLong = [...input.userText].length >= config.extraction.minTextChars
   const assistantLong = config.extraction.includeAssistant
     && [...input.assistantText].length >= config.extraction.minAssistantChars
   const assistantSignals = assistantLong
     ? matchSignals(input.assistantText, config.extraction.signalKeywords)
     : []
+  const assistantDue = assistantLong
+    ? matchSignals(input.assistantText, config.extraction.dueKeywords)
+    : []
 
-  const signals = [...new Set([...userSignals, ...assistantSignals])]
-  // 三选一：用户侧有信号、助手侧有信号、或双方都足够长（信息量够）。
+  const signals = [...new Set([...userSignals, ...userDue, ...assistantSignals, ...assistantDue])]
+  // 四选一：用户侧有信号、用户侧有到期词、助手侧有信号、或双方都足够长（信息量够）。
   const pass = signals.length > 0 || (userLong && assistantLong)
   return { pass, signals }
 }
@@ -209,11 +215,17 @@ export function extractCards(input: TurnInput, config: MemoryConfig): CardDraft[
       if (chars < config.extraction.minTextChars) continue
       const entities = extractEntities(sentence)
       const signals = matchSignals(sentence, config.extraction.signalKeywords)
+      // 到期词也算有效信号：否则「明天下午三点提醒我交周报」会因为
+      // 没有任何普通信号词 + 无实体 + 不足 40 字而被丢弃（FR-D3 从根上失效）。
+      const dueSignals = matchSignals(sentence, config.extraction.dueKeywords)
       // 无信号且无实体的长句通常是寒暄或复述，跳过。
-      if (signals.length === 0 && entities.length === 0 && chars < 40) continue
+      if (signals.length === 0 && dueSignals.length === 0 && entities.length === 0 && chars < 40) continue
 
       const kind = classifySentence(sentence)
-      const salience = computeSalience(sentence, signals, entities)
+      // 显著性必须把到期词一起算进去：只传普通信号会让「明天下午三点提醒我交周报」
+      // 这类句子的显著性只剩长度项（0.5×0.42=0.21 < 0.25），直接被阈值丢掉。
+      const allSignals = [...new Set([...signals, ...dueSignals])]
+      const salience = computeSalience(sentence, allSignals, entities)
       // 显著性太低的不写，防止噪声入库。
       if (salience < 0.25) continue
 
@@ -229,9 +241,9 @@ export function extractCards(input: TurnInput, config: MemoryConfig): CardDraft[
         salience,
         emotional: computeEmotional(sentence),
         confidence: computeConfidence(sentence, fromUser),
-        tags: signals,
+        tags: allSignals,
         entities,
-        signals,
+        signals: allSignals,
         source: {
           sessionId: input.sessionId,
           turn: input.turn,

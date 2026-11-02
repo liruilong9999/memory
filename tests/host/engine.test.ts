@@ -21,6 +21,7 @@ import { openStore } from '../../src/store/store.ts'
 import type { MemoryStore } from '../../src/store/store.ts'
 import { makeCard, makeTempDir, removeDirContents } from '../store/helpers.ts'
 import { makeConfig } from '../consolidate/fixtures.ts'
+import { pickDue } from '../../src/time/clock.ts'
 
 const TZ = 'Asia/Shanghai'
 const T0 = 1_700_000_000_000
@@ -449,5 +450,101 @@ describe('MemoryEngine 重启一致（ST-1）', () => {
     const second = openStore({ dataDir: dir })
     for (const card of beforeCards) assert.deepEqual(second.getCard(card.id), card)
     second.close()
+  })
+})
+
+/**
+ * FR-D3 / SC-5 / 起源 L21：到期提醒必须真的能到期。
+ *
+ * 这组用例锁住一条曾经彻底断裂的链路：早期 `draftToCard` 硬编码
+ * `dueAt: null`，`pickDue` 永远返回空数组，FR-D3 在实现层不可能通过。
+ * 光测 `parseDue` 不够——必须端到端断言「写入的卡带 dueAt、到点能被捡起」。
+ */
+describe('到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
+  // 2024-01-15 10:00 上海（周一）。
+  const MON = Date.UTC(2024, 0, 15, 2, 0, 0)
+
+  function engineAt(dir: string, clock: () => number): { engine: MemoryEngine; store: MemoryStore } {
+    const store = openStore({ dataDir: dir })
+    return { engine: new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock }), store }
+  }
+
+  it('承诺句写入后 dueAt 非空', () => {
+    const dir = tempDir()
+    const { engine, store } = engineAt(dir, () => MON)
+    const summary = engine.writeTurn(turnInput({
+      userText: '明天下午三点提醒我交周报，别忘了', at: MON,
+    }))
+    assert.ok(summary.written > 0, '到期句必须入库，否则 FR-D3 从根上失效')
+    const withDue = summary.cards.filter((card) => card.dueAt !== null)
+    assert.equal(withDue.length, 1, '应有一张卡带到期时刻')
+    store.close()
+  })
+
+  it('dueAt 解析到明天 15:00（不是随便一个未来时刻）', () => {
+    const dir = tempDir()
+    const { engine, store } = engineAt(dir, () => MON)
+    const summary = engine.writeTurn(turnInput({
+      userText: '明天下午三点提醒我交周报，别忘了', at: MON,
+    }))
+    const card = summary.cards.find((item) => item.dueAt !== null)!
+    const local = new Intl.DateTimeFormat('en-GB', {
+      timeZone: TZ, dateStyle: 'short', timeStyle: 'short', hour12: false,
+    }).format(new Date(card.dueAt!))
+    assert.equal(local, '16/01/2024, 15:00')
+    store.close()
+  })
+
+  it('到期前不提醒、到点后提醒（pickDue 边界）', () => {
+    const dir = tempDir()
+    let now = MON
+    const { engine, store } = engineAt(dir, () => now)
+    engine.writeTurn(turnInput({ userText: '明天下午三点提醒我交周报，别忘了', at: MON }))
+    const dueAt = store.listCards({ status: 'active' }).find((card) => card.dueAt !== null)!.dueAt!
+
+    assert.equal(pickDue(store.listCards({ status: 'active' }), dueAt - 1000).length, 0)
+    assert.equal(pickDue(store.listCards({ status: 'active' }), dueAt).length, 1)
+    assert.equal(pickDue(store.listCards({ status: 'active' }), dueAt + 3600_000).length, 1)
+    store.close()
+  })
+
+  it('时间读数渲染出「到期事项」块', () => {
+    const dir = tempDir()
+    let now = MON
+    const { engine, store } = engineAt(dir, () => now)
+    engine.writeTurn(turnInput({ userText: '明天下午三点提醒我交周报，别忘了', at: MON }))
+    const dueAt = store.listCards({ status: 'active' }).find((card) => card.dueAt !== null)!.dueAt!
+
+    // 到期前：不该有到期块。
+    assert.ok(!engine.renderTime().includes('到期事项'), '未到期时不应出现到期块')
+    // 拨到到期之后：必须出现。
+    now = dueAt + 60_000
+    const rendered = engine.renderTime()
+    assert.ok(rendered.includes('到期事项'), '到期后必须渲染到期块')
+    assert.ok(rendered.includes('交周报'), '到期块里要带上原事项')
+    store.close()
+  })
+
+  it('没有到期线索的句子不产生 dueAt（不编造）', () => {
+    const dir = tempDir()
+    const { engine, store } = engineAt(dir, () => MON)
+    const summary = engine.writeTurn(turnInput({
+      userText: '决定这个项目用 Qt5 开发，沿用现有 cmake 配置', at: MON,
+    }))
+    assert.ok(summary.written > 0)
+    assert.equal(summary.cards.filter((card) => card.dueAt !== null).length, 0)
+    store.close()
+  })
+
+  it('每天提醒的 dueAt 在未来且可重复命中', () => {
+    const dir = tempDir()
+    const { engine, store } = engineAt(dir, () => MON)
+    const summary = engine.writeTurn(turnInput({
+      userText: '每天早上八点提醒我喝水，记得', at: MON,
+    }))
+    const card = summary.cards.find((item) => item.dueAt !== null)
+    assert.ok(card !== undefined, '每日提醒必须入库')
+    assert.ok(card.dueAt! > MON, '每日提醒的下一次应在未来')
+    store.close()
   })
 })

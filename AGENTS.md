@@ -99,9 +99,12 @@ pnpm cli --help    # 离线命令行
 - [ ] 离线 CLI `src/cli/`
 - [ ] 宿主实机验证
 - [ ] 起源对照审查遗留项（见 `docs/5-起源对照审查.md` 第二部分）：
-  - [ ] `feeling` 加入 `neverArchiveKinds`（起源 L11 直接冲突）
-  - [ ] `RecallQuery.domains` 是死字段，召回不按域过滤（起源 L13）
-  - [ ] `dueAt` 永远为 null，`pickDue` 恒空，FR-D3 / SC-5 不可能通过（起源 L21）
+  - [x] `feeling` 加入 `neverArchiveKinds`（起源 L11 直接冲突）
+  - [x] `RecallQuery.domains` 是死字段，召回不按域过滤（起源 L13）
+  - [x] `dueAt` 永远为 null，`pickDue` 恒空，FR-D3 / SC-5 不可能通过（起源 L21）
   - [ ] 召回反馈是正反馈，与「专注当前位置」的抑制语义相反（起源 L29）
-  - [ ] `renderFocusPack` 头尾固定开销未计入 token 预算（起源 L33）
+  - [x] `renderFocusPack` 头尾固定开销未计入 token 预算（起源 L33）
   - [ ] 无日摘要、无跨周期层级压缩（起源 L27）
+  - [ ] 无「从事件蒸馏感受」路径，`distills` 边从未产出（起源 L11）
+  - [ ] `src/consolidate/graph.ts` 七种边无需求承接（AGENTS.md 判断标准）
+  - [ ] `src/store/store.ts` 并发 `append` 无保护，多 agent 会损坏 `maxSeq`（D-08）

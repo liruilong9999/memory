@@ -26,6 +26,7 @@ import type { MemoryStore } from '../store/store.ts'
 import {
   buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
 } from '../time/clock.ts'
+import { parseDue } from '../time/due.ts'
 
 /** 引擎参数。 */
 export interface EngineOptions {
@@ -111,6 +112,13 @@ export class MemoryEngine {
    */
   writeTurn(input: TurnInput): WriteSummary {
     const cards = extractMemoryCards(input, this.config)
+    // FR-D3 / 起源 L21：把「明天下午三点提醒我」这类句子解析成确定的到期时刻。
+    // 解析在时间层（src/time/due.ts），这里只负责把结果填进卡片。
+    for (const card of cards) {
+      if (card.kind !== 'promise' && card.kind !== 'event') continue
+      const spec = parseDue(card.text, input.at, this.timeZone)
+      if (spec !== null) card.dueAt = spec.dueAt
+    }
     const written: MemoryCard[] = []
     let skipped = 0
     for (const card of cards) {
