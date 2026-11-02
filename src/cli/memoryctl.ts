@@ -32,8 +32,8 @@
  * @module dsh-memory/cli/memoryctl
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 
@@ -84,7 +84,7 @@ export const CLI_NAME = 'memoryctl'
 export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
-const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'help'] as const
+const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'help'] as const
 
 /** 子命令名。 */
 type Command = (typeof COMMANDS)[number]
@@ -115,6 +115,9 @@ export interface CliOptions {
 
   /** `revise` 的修正原因（FR-A5：要能回答「为什么改」）。 */
   readonly reason: string
+
+  /** `logs` 读取条数上限；0 表示全部。 */
+  readonly limit: number
 }
 
 /** 参数解析结果。失败时只带一条人可读信息，不带异常。 */
@@ -253,6 +256,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let json = false
   let verbose = false
   let includeArchived = false
+  let limit = 50
   let reason = ''
   let helpRequested = false
   let onlyPositionals = false
@@ -312,6 +316,14 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     const equals = arg.indexOf('=')
     const name = equals >= 0 ? arg.slice(0, equals) : arg
     const inline = equals >= 0 ? arg.slice(equals + 1) : undefined
+    if (name === '--limit') {
+      const value = takeValue(name, inline)
+      if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
+      const parsed = Number.parseInt(value, 10)
+      if (!Number.isInteger(parsed) || parsed < 0) return { ok: false, message: `选项 ${name} 需要非负整数` }
+      limit = parsed
+      continue
+    }
     if (name === '--data-dir' || name === '--tz' || name === '--out' || name === '--reason') {
       const value = takeValue(name, inline)
       if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
@@ -329,7 +341,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     return {
       ok: true,
       options: {
-        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason,
+        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit,
       },
     }
   }
@@ -341,7 +353,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     options: {
       command: first,
       positionals: positionals.slice(1),
-      dataDir, timeZone, json, verbose, out, includeArchived, reason,
+      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit,
     },
   }
 }
@@ -478,6 +490,7 @@ export function helpText(): string {
     '  consolidate               手动执行一次夜整理（去重、合并、降权、归档）',
     '  restore <id>              把一张归档卡恢复成活跃（FR-C2：归档必须可逆）',
     '  revise <id> <新正文>      修正卡片正文并保留旧版本（FR-A5：可查改过什么）',
+    '  logs                      读回落盘的诊断日志（FR-F1：最近 N 次操作可回溯）',
     '  help                      显示本帮助（等同 -h / --help / 无参数）',
     '',
     '全局选项：',
@@ -493,6 +506,9 @@ export function helpText(): string {
     '',
     'revise 专用选项：',
     '  --reason <原因>           写进修正历史，供日后回答「为什么改」（默认空）',
+    '',
+    'logs 专用选项：',
+    '  --limit <条数>            只读最后 N 条，默认 50，0 表示全部',
     '',
     '退出码：',
     '  0  正常',
@@ -718,6 +734,55 @@ function runRevise(options: CliOptions, engine: MemoryEngine): CliResult {
   return { code: EXIT_OK, stdout: `已修正：${id}\n`, stderr: '' }
 }
 
+/**
+ * `logs` 子命令：读回落盘的诊断日志（FR-F1）。
+ *
+ * ## 为什么必须有这个子命令
+ *
+ * 日志落盘之后，如果没人能把它读回来，那和没落盘没有区别——
+ * 用户仍然查不到「上一次运行发生了什么」，而这正是 FR-F1 的目的。
+ * 只写不读是「算了没人看得见」的同一种病。
+ *
+ * 直接读文件而不是走 engine：日志是**旁路数据**，不是记忆状态。
+ * 为读日志去开一个完整引擎（重放全库）代价过高，而且读日志本来
+ * 就不该有副作用。
+ *
+ * @param options - 解析后的参数；`--limit` 控制条数。
+ * @returns 命令结果。
+ */
+function runLogs(options: CliOptions, resolved: ResolvedCliConfig, storeDir: string, timeZone: string): CliResult {
+  const file = resolved.config.storage.logFile
+  if (file.length === 0) {
+    return { code: EXIT_OK, stdout: '', stderr: '诊断日志落盘已关闭（storage.logFile 为空串）\n' }
+  }
+  // 必须用 store.dir，与 engine 落盘位置保持同一来源。
+  // 用 config.storage.dataDir 会在相对路径下拼出另一个位置——
+  // 两边都「成功」，事后无从判断该看哪个。
+  const path = join(storeDir, file)
+  if (!existsSync(path)) {
+    // 文件不存在不是错误：可能是刚装好还没跑过，或日志被清理了。
+    return { code: EXIT_OK, stdout: options.json ? jsonText([]) : '', stderr: '还没有诊断日志\n' }
+  }
+  const limit = options.limit
+  const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.length > 0)
+  // 取**最后** limit 条：运维要看的永远是「最近发生了什么」。
+  const tail = limit > 0 ? lines.slice(-limit) : lines
+  const entries: MemoryLogEntry[] = []
+  for (const line of tail) {
+    try {
+      entries.push(JSON.parse(line) as MemoryLogEntry)
+    } catch {
+      // 单行损坏不能让整条命令失败：日志是旁路数据，
+      // 一行写了一半（进程被杀）不该让人看不到其余记录。
+      continue
+    }
+  }
+  if (options.json) return { code: EXIT_OK, stdout: jsonText(entries), stderr: '' }
+  if (entries.length === 0) return { code: EXIT_OK, stdout: '', stderr: '诊断日志为空\n' }
+  const text = entries.map((entry) => renderLog(entry, timeZone)).join('\n')
+  return { code: EXIT_OK, stdout: `${text}\n`, stderr: '' }
+}
+
 function runRebuild(options: CliOptions, engine: MemoryEngine): CliResult {
   const report = engine.rebuild()
   if (options.json) {
@@ -903,6 +968,9 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
         break
       case 'revise':
         result = runRevise(options, engine)
+        break
+      case 'logs':
+        result = runLogs(options, resolved, store.dir, timeZone)
         break
       default:
         // `help` 已在前面提前返回，这里是穷尽性兜底。

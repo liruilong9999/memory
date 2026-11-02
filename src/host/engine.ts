@@ -24,6 +24,8 @@ import type {
 } from '../core/types.ts'
 import { cardSimilarity } from '../consolidate/dedupe.ts'
 import { normalizeText } from '../core/text.ts'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import { readLastConsolidationAt, writeLastConsolidationAt } from '../store/meta.ts'
 import type { MemoryStore } from '../store/store.ts'
@@ -81,6 +83,9 @@ export class MemoryEngine {
   private readonly timeZone: string
   private readonly clock: () => number
   private readonly onLog: ((entry: MemoryLogEntry) => void) | undefined
+
+  /** 诊断日志落盘路径（FR-F1）；`null` 表示不落盘。 */
+  private readonly logFilePath: string | null
   /** 上一轮的时刻，用于计算 `sinceLastTurn`。 */
   private lastTurnAt: number | null = null
   /** 上次会话结束时刻（本次启动时为上次写入的最后时刻）。 */
@@ -118,6 +123,16 @@ export class MemoryEngine {
     this.timeZone = options.timeZone
     this.clock = options.clock ?? ((): number => Date.now())
     this.onLog = options.onLog
+    // FR-F1：诊断日志落盘路径。设空串表示不落盘（用户显式关闭）。
+    // 为什么放在 dataDir 下而不是日志目录：记忆库是自包含的，
+    // 搬走 dataDir 就等于搬走全部状态，运维不用记两个位置。
+    // 必须用 store.dir（已 resolve 成绝对路径）而不是 config.storage.dataDir：
+    // 后者可能是相对路径，而相对谁取决于进程 cwd——同一个库在宿主与 CLI 里
+    // 会写到两个不同位置，且两边都「成功」，事后无从判断该看哪个。
+    this.logFilePath =
+      options.config.storage.logFile.length === 0
+        ? null
+        : join(options.store.dir, options.config.storage.logFile)
     this.sessionStartedAt = this.clock()
     this.lastSessionEndAt = this.detectLastActivity()
     // 从磁盘恢复：进程重启后不应把「上次整理」忘成 null，否则夜整理每次
@@ -770,5 +785,70 @@ export class MemoryEngine {
    */
   private log(entry: MemoryLogEntry): void {
     this.onLog?.(entry)
+    this.persistLog(entry)
+  }
+
+  /**
+   * 把一条诊断日志追加到磁盘（FR-F1），并按 `logMaxEntries` 做环形截断。
+   *
+   * ## 为什么必须落盘
+   *
+   * 在此之前 `onLog` 是**唯一**出口，而它只在 CLI 里被接成「攒进数组、
+   * `--verbose` 时打印」。也就是说：宿主跑一整天，`write` / `recall` /
+   * `consolidate` 这些记录**一条都没留下**，重启即清零。
+   * FR-F1 要的是「最近 N 次操作可回溯」，一个只在当次进程内存在的数组
+   * 满足不了它——出问题时恰恰是「上一次运行发生了什么」查不到。
+   *
+   * ## 为什么不进事件日志
+   *
+   * journal 是唯一真相源（P2），诊断日志是**可丢弃**的旁路数据。
+   * 混进去会让重放依赖一堆只用于观测的记录，也让日志体积失控。
+   *
+   * ## 写失败不能影响主流程
+   *
+   * 观测能力坏掉（磁盘满、权限不足）不该让召回失败。但**也不能静默**：
+   * 通过 `onLog` 发一条 `error` 记录说明落盘失败。
+   * 这里不抛异常，因为日志是旁路。
+   *
+   * @param entry - 日志条目。
+   */
+  private persistLog(entry: MemoryLogEntry): void {
+    const path = this.logFilePath
+    if (path === null) return
+    try {
+      const dir = path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')))
+      if (dir.length > 0 && !existsSync(dir)) mkdirSync(dir, { recursive: true })
+      appendFileSync(path, `${JSON.stringify(entry)}\n`, 'utf8')
+      this.trimLog(path)
+    } catch {
+      // 落盘失败：只在**内存回调**里报，不再尝试落盘（否则递归）。
+      this.onLog?.({
+        kind: 'error',
+        at: entry.at,
+        summary: '诊断日志落盘失败，本次记录只存在于内存',
+        detail: { path },
+      })
+    }
+  }
+
+  /**
+   * 环形截断：只保留最后 `logMaxEntries` 条。
+   *
+   * `logMaxEntries <= 0` 表示不限制。**不建议**：长期运行的记忆库会攒出
+   * 几百 MB 的旁路文件，而 FR-F1 要的是「最近 N 次」。
+   *
+   * 实现上「先读全部再写回」在这个规模下是可接受的（默认 500 条），
+   * 不值得为它引入游标或分片——那是 journal 才需要的复杂度。
+   *
+   * @param path - 日志文件路径。
+   */
+  private trimLog(path: string): void {
+    const limit = this.config.storage.logMaxEntries
+    if (limit <= 0) return
+    const text = readFileSync(path, 'utf8')
+    const lines = text.split('\n').filter((line) => line.length > 0)
+    if (lines.length <= limit) return
+    // 保留最后 limit 条：最早的那些是「已经没人会看」的记录。
+    writeFileSync(path, `${lines.slice(-limit).join('\n')}\n`, 'utf8')
   }
 }

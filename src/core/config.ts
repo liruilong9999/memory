@@ -120,6 +120,31 @@ export interface StoragePolicy {
   fsyncOnWrite: boolean
   /** 索引重建阈值：日志新增条数达到该值后自动重建倒排索引。 */
   reindexEveryRecords: number
+  /**
+   * 诊断日志文件名（FR-F1）；相对 `dataDir`。设空串表示**不落盘**。
+   *
+   * ## 必须放在子目录里，不能与事件日志同层
+   *
+   * 事件日志分片形如 `journal-000001.jsonl`。诊断日志若也叫
+   * `dataDir/*.jsonl`，两者在**目录层面就分不开**：任何按 `*.jsonl`
+   * 扫描 `dataDir` 的东西（备份脚本、日志采集器、用户自己 `ls *.jsonl`）
+   * 都会把旁路诊断记录当成事件日志。
+   *
+   * 这不是假设——加上落盘之后 `tests/cli/memoryctl.test.ts` 的
+   * `journalSize` 辅助函数立刻红了（它按后缀扫顶层、断言恰好一个文件）。
+   * 那条断言守的是真实不变量，**该改的是实现不是测试**。
+   *
+   * 生产代码本身没被污染（`listShardFiles` 用 `journal-` 前缀 + 数字校验），
+   * 但这只说明「本仓库的读法安全」，管不了目录外面的人怎么读。
+   */
+  logFile: string
+  /**
+   * 诊断日志最多保留多少条（环形缓冲）。
+   *
+   * 设 0 表示不限制——**不建议**：FR-F1 要的是「最近 N 次」，
+   * 无限增长会让一个长期运行的记忆库攒出几百 MB 的旁路文件。
+   */
+  logMaxEntries: number
 }
 
 /** 巩固（夜整理）参数。 */
@@ -439,7 +464,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 6,
+  configVersion: 7,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -496,6 +521,8 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     journalSegmentBytes: 4 * 1024 * 1024,
     fsyncOnWrite: true,
     reindexEveryRecords: 2000,
+    logFile: 'logs/diagnostics.jsonl',
+    logMaxEntries: 500,
   },
   consolidation: {
     enabled: true,
@@ -570,7 +597,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 6
+export const MEMORY_CONFIG_VERSION = 7
 
 /** 配置校验结果。 */
 export interface ConfigValidation {

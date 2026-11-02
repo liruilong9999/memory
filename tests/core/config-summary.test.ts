@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=6',
+  'configVersion=7',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -156,6 +156,8 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'storage.dataDir=.dsh-memory',
   'storage.fsyncOnWrite=true',
   'storage.journalSegmentBytes=4194304',
+  'storage.logFile=logs/diagnostics.jsonl',
+  'storage.logMaxEntries=500',
   'storage.reindexEveryRecords=2000',
   'weights.confidence=0.1',
   'weights.conflict=0.25',
@@ -184,7 +186,8 @@ describe('摘要配置的默认值与版本', () => {
     //   4 → 图谱扩散与突触可塑性参数（FR-G1）
     //   5 → 扩散从布尔开关改成三态 mode（off / shadow / on），默认 shadow
     //   6 → spread.explainSourceChars（「因为想起了谁」的来源文本长度）
-    assert.equal(MEMORY_CONFIG_VERSION, 6, '新增 explainSourceChars 后版本应为 6')
+    //   7 → storage.logFile / storage.logMaxEntries（FR-F1 诊断日志落盘）
+    assert.equal(MEMORY_CONFIG_VERSION, 7, '新增诊断日志落盘参数后版本应为 7')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
