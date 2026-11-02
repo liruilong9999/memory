@@ -200,15 +200,76 @@ describe('MemoryEngine 召回（FR-B1..B6 / FR-E1 / FR-E3）', () => {
     assert.ok(result.pack.tokens <= 60)
   })
 
-  it('召回后刷新访问计数与强度（记忆因使用而牢固）', () => {
+  // 下面三条是一组，缺一不可（FR-B7「看到与使用分离」，起源 L29·第 5 条·专注当前位置）。
+  //
+  // 为什么必须是三条而不是一条：只证明「recall 不写」的话，把 recall 整个删掉
+  // 也能变绿——那是「测试替实现打掩护」。只证明「confirmRecall 写」的话，
+  // 无法发现有人又把 touch 塞回 recall 里。两条只读入口 + 一条写入口，
+  // 才能同时钉住「正反馈被拆走了」和「正反馈还在」。
+  it('recall 是只读的：访问计数、强度、最近访问时间都不变（看到 ≠ 使用）', () => {
     const { store, engine } = openEngine()
     const written = engine.writeTurn(turnInput())
     const targetId = written.cards[0]!.id
     const before = store.getCard(targetId)!
-    engine.recall('项目用什么开发')
+    const seqBefore = store.snapshot().lastSeq
+    const result = engine.recall('项目用什么开发')
+    assert.ok(result.pack.cards.length > 0, '前提：确实召回到了东西，否则本条测试无意义')
     const after = store.getCard(targetId)!
-    assert.ok(after.accessCount > before.accessCount)
-    assert.ok(after.strength >= before.strength)
+    assert.equal(after.accessCount, before.accessCount, '召回不得改变访问计数')
+    assert.equal(after.strength, before.strength, '召回不得改变强度')
+    assert.equal(after.lastAccessAt, before.lastAccessAt, '召回不得改变最近访问时间')
+    assert.equal(store.snapshot().lastSeq, seqBefore, '召回不得写日志')
+  })
+
+  it('peek 是只读的：既不写库也不计数（CLI query 走的就是这条）', () => {
+    const { store, engine } = openEngine()
+    const written = engine.writeTurn(turnInput())
+    const targetId = written.cards[0]!.id
+    const before = store.getCard(targetId)!
+    const seqBefore = store.snapshot().lastSeq
+    const recallsBefore = engine.metrics().recalls
+    const result = engine.peek('项目用什么开发')
+    assert.ok(result.pack.cards.length > 0, '前提：peek 要真的能召回到东西')
+    const after = store.getCard(targetId)!
+    assert.equal(after.accessCount, before.accessCount)
+    assert.equal(after.strength, before.strength)
+    assert.equal(store.snapshot().lastSeq, seqBefore, 'peek 不得写日志')
+    // peek 连「召回次数」都不该动：它不进可观测指标，否则运维查一眼就污染 F3。
+    assert.equal(engine.metrics().recalls, recallsBefore, 'peek 不得增加召回计数')
+  })
+
+  it('confirmRecall 才加深记忆：访问计数 +1、强度上升、最近访问时间更新', () => {
+    const { store, engine } = openEngine()
+    const written = engine.writeTurn(turnInput())
+    const targetId = written.cards[0]!.id
+    const before = store.getCard(targetId)!
+    const confirmedAt = T0 + 5000
+    const count = engine.confirmRecall([targetId], confirmedAt)
+    assert.equal(count, 1)
+    const after = store.getCard(targetId)!
+    assert.equal(after.accessCount, before.accessCount + 1, '确认后访问计数 +1')
+    assert.ok(after.strength > before.strength, '确认后强度必须上升')
+    assert.equal(after.lastAccessAt, confirmedAt, '确认后最近访问时间应更新')
+  })
+
+  it('confirmRecall 幂等去重、忽略未知与归档卡片、强度封顶 1', () => {
+    const { store, engine } = openEngine()
+    const written = engine.writeTurn(turnInput())
+    const targetId = written.cards[0]!.id
+    // 同一个 id 传三次只算一次：否则调用方重复上报就能刷强度。
+    assert.equal(engine.confirmRecall([targetId, targetId, targetId], T0 + 1), 1)
+    // 未知 id 静默跳过：调用方拿到的可能是过期焦点包，不该因此抛错。
+    assert.equal(engine.confirmRecall(['no-such-card'], T0 + 2), 0)
+    // 归档卡不确认：给归档卡加强度等于让遗忘失效（FR-C2）。
+    const archived = store.getCard(targetId)!
+    store.append({ op: 'archive', id: archived.id, at: T0 + 3, reason: '测试：归档后不得被确认' }, undefined, T0 + 3)
+    assert.equal(engine.confirmRecall([targetId], T0 + 4), 0, '归档卡不得被确认')
+    // 强度封顶 1：反复确认不能把强度刷过上限。
+    const { store: store2, engine: engine2 } = openEngine()
+    const w2 = engine2.writeTurn(turnInput())
+    const id2 = w2.cards[0]!.id
+    for (let index = 0; index < 50; index += 1) engine2.confirmRecall([id2], T0 + 100 + index)
+    assert.ok(store2.getCard(id2)!.strength <= 1, '强度必须封顶 1')
   })
 
   it('召回记录结构化日志与指标（FR-F1 / FR-F3）', () => {

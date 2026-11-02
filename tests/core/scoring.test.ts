@@ -125,6 +125,58 @@ test('scoreCard 冲突卡带惩罚', () => {
   assert.equal(conflicted.conflict, true)
 })
 
+test('冲突只降排序、不淘汰：双方互相冲突时仍至少有一条进包（FR-B5）', () => {
+  // 这是 FR-B5「冲突不隐藏」的核心回归。原来的实现把 penalty × w.conflict
+  // （0.25）直接从总分里减掉，而它比 absoluteThreshold（0.18）还大，
+  // 于是**互相冲突的两张卡一起掉出包外**——最坏的隐藏：模型连「这里有矛盾」
+  // 都不知道，更别提看到双方。封顶后冲突最多把卡压到阈值边上，不能压穿。
+  const now = 1_700_000_000_000
+  // 阈值调到很紧，逼出「本来就勉强够格」的情形，让冲突惩罚有机会致命。
+  const tight = { ...config, recall: { ...config.recall, absoluteThreshold: 0.17 } }
+  const query = makeQuery('数据库选型', tight, now)
+  const a = makeCard({
+    id: 'c-a', text: '数据库用 PostgreSQL，JSONB 支持最好', normalized: '数据库用 postgresql jsonb 支持最好',
+    createdAt: now, conflictOf: ['c-b'],
+  })
+  const b = makeCard({
+    id: 'c-b', text: '数据库改用 MySQL，PostgreSQL 太慢', normalized: '数据库改用 mysql postgresql 太慢',
+    createdAt: now, conflictOf: ['c-a'],
+  })
+  const scored = scoreCards([a, b], query, tight)
+  // 前提校验：冲突惩罚确实生效了，否则这条测试证明不了「不淘汰」。
+  assert.ok(scored.every((item) => item.conflict), '前提：两张卡都必须被判为冲突')
+  const pack = buildFocusPack(scored, query, tight)
+  assert.ok(pack.cards.length >= 1, `冲突不得让双方一起消失，实际包内 ${pack.cards.length} 条`)
+  const time = {
+    now, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+    sinceLastSession: null, sinceLastTurn: null,
+    sessionStartedAt: null, due: [],
+  }
+  const rendered = renderFocusPack(pack, time)
+  assert.match(rendered, /CONFLICT/u)
+  // 同时暴露双方：要么对方也在包里，要么明说它不在。
+  assert.match(rendered, /PostgreSQL|MySQL|不在本次焦点包内|不在活跃记忆中/u)
+})
+
+test('冲突惩罚封顶：扣分不会把卡从阈值上方打到下方', () => {
+  // 直接验封顶的数学性质，不经过渲染。三个区间的行为都必须钉住：
+  // 1) 无冲突 → 0；2) 在阈值下方 → 0（本来就没得淘汰，报 0 免得 explain 误导）；
+  // 3) 在阈值上方 → 最多扣到阈值边上，绝不压穿。
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目', config, now)
+  const clean = scoreCard(makeCard({ id: 'clean' }), query, config)
+  const conflicted = scoreCard(makeCard({ id: 'cf', conflictOf: ['x', 'y', 'z'] }), query, config)
+  assert.equal(clean.score.conflictPenalty, 0, '无冲突时惩罚为 0')
+  assert.ok(conflicted.score.conflictPenalty > 0, '有冲突时惩罚为正')
+  // 封顶的实质：扣掉的分数 ≤ 距绝对阈值的余量。
+  const normalizedOfConflicted = conflicted.score.total + conflicted.score.conflictPenalty * config.weights.conflict
+  assert.ok(
+    conflicted.score.total >= config.recall.absoluteThreshold - 1e-9
+      || normalizedOfConflicted <= config.recall.absoluteThreshold,
+    `冲突不得把本来够格的卡压到阈值下方，实际总分 ${conflicted.score.total}`,
+  )
+})
+
 test('scoreCards 按总分降序且同分按 id 升序', () => {
   const now = 1_700_000_000_000
   const query = makeQuery('Qt5 项目', config, now)
@@ -190,10 +242,44 @@ test('scoreCards 域全关时返回空（可插拔的另一半语义）', () => 
 })
 
 test('applyThresholds 低于绝对阈值被丢弃', () => {
+  // 这条测试守的是「已经死掉的卡不该被召回」。断言不许放宽：
+  // 它是唯一在守这条线的用例，放宽等于让阈值失效没人发现。
+  //
+  // 构造要**离阈值足够远**，不能靠「刚好越过」：原版用的是
+  // 「100 个半衰期 + 语义不相关」，实测总分 0.168，对 0.18 的余量只有 0.012。
+  // 归一化分母一动（哪怕是修 bug）它就会翻绿变红——这种测试是「靠运气绿」，
+  // 绿的时候说明不了任何事。现在把该给零的分项都压到零，让结论由规则决定：
+  // 语义 0（查询词与卡片无交集）、时间 0（100 个半衰期）、置信度 0、重要性压到最低。
   const now = 1_700_000_000_000
   const query = makeQuery('完全无关的查询词', config, now)
-  const scored = scoreCards([makeCard({ createdAt: now - 100 * config.forgetting.halfLifeMs })], query, config)
+  const dead = makeCard({
+    text: '完全无关的内容',
+    normalized: '完全无关的内容',
+    createdAt: now - 100 * config.forgetting.halfLifeMs,
+    confidence: 0,
+    salience: 0,
+    emotional: 0,
+  })
+  const scored = scoreCards([dead], query, config)
+  assert.ok(
+    scored[0]!.score.total < config.recall.absoluteThreshold,
+    `前提：这张卡的总分必须真的低于绝对阈值，实际 ${scored[0]!.score.total}`,
+  )
   assert.equal(applyThresholds(scored, config).length, 0)
+})
+
+test('applyThresholds 阈值刻度不随「是否提供目标」漂移（分母恒含 goal 权重）', () => {
+  // 这条守的是分数刻度的稳定性。若有人把 w.goal 从分母里摘掉（我曾这么干过），
+  // 所有卡的归一化分会整体上浮 1/(1-w.goal) 倍，绝对阈值的实际严苛程度被悄悄改掉。
+  // 同一张卡、同一个时刻，有没有目标只应改变 goal 这一项的贡献，不应改变分母基准。
+  const now = 1_700_000_000_000
+  const card = makeCard({ id: 'same-card' })
+  const noGoal = scoreCard(card, makeQuery('Qt5', config, now), config)
+  const withGoal = scoreCard(card, makeQuery('Qt5', config, now, 'Qt5 项目'), config)
+  // 无目标时 goal 项为 0，有目标且命中时 goal 项 > 0，故总分只会更高或相等。
+  assert.equal(noGoal.score.goal, 0)
+  assert.ok(withGoal.score.goal > 0)
+  assert.ok(withGoal.score.total >= noGoal.score.total)
 })
 
 test('applyThresholds 不超过 maxCards', () => {

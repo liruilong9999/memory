@@ -18,6 +18,7 @@ import type { TurnInput } from '../core/extraction.ts'
 import {
   buildFocusPack, formatDuration, formatTime, makeQuery, renderFocusPack, scoreCards,
 } from '../core/scoring.ts'
+import type { RecallQuery } from '../core/scoring.ts'
 import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
 } from '../core/types.ts'
@@ -214,6 +215,122 @@ export class MemoryEngine {
   recall(queryText: string, goalText = ''): RecallResult {
     const at = this.clock()
     const query = makeQuery(queryText, this.config, at, goalText)
+    const result = this.buildRecall(at, query)
+    this.recallCount += 1
+    this.log({
+      kind: 'recall',
+      at,
+      summary: `召回 ${result.pack.cards.length} 条（候选 ${result.candidates}，token ${result.pack.tokens}）`,
+      detail: {
+        query: queryText,
+        candidates: result.candidates,
+        picked: result.pack.cards.map((c) => ({ id: c.card.id, total: c.score.total })),
+        tokens: result.pack.tokens,
+        empty: result.pack.empty,
+      },
+    })
+    return result
+  }
+
+  /**
+   * 纯查询式召回：只读，不改任何记忆状态。
+   *
+   * 与 `recall` 的区别只有一处——**不写库、不计指标、不写日志**。
+   * 存在的理由是 CLI 的 `query` 与宿主的 `/memory explain` 都需要「看一眼」，
+   * 而「看一眼」不能算「用过」（起源 L29·第 5 条·专注当前位置）。
+   *
+   * @param queryText - 查询文本。
+   * @param goalText - 当前目标文本，可选。
+   * @param at - 查询时刻；省略时取当前时钟。
+   * @returns 召回结果。
+   */
+  peek(queryText: string, goalText = '', at = this.clock()): RecallResult {
+    return this.buildRecall(at, makeQuery(queryText, this.config, at, goalText))
+  }
+
+  /**
+   * 确认「这些记忆被真正用上了」，这是**唯一**会加深记忆强度的入口。
+   *
+   * 为什么必须与召回分开（起源 L29·第 5 条·专注当前位置）：
+   * 「被召回」只是**看见**——系统觉得这条可能与当前话题相关，于是摆到台面上；
+   * 「被使用」才是**参与**——模型真的拿它做了判断或回答。二者混为一谈会造成
+   * 马太效应：一次偶然召回让这张卡强度上升，下次更容易被召回，再上升……
+   * 结果是强者恒强、库里绝大多数卡永远沉底，与起源 L29 要求的
+   * 「不代入其它记忆、专注当前位置」正好相反——它把历史噪音越推越前。
+   *
+   * 现在的语义：
+   * - `recall` / `peek`：**只读**，强度、访问计数一律不动（可重复调用，ST-1）。
+   * - `confirmRecall`：显式确认，写 `touch` 日志，强度与访问计数上升。
+   *
+   * 只有确认才加分，且加成来自配置（`forgetting.accessBoost`），不写死。
+   *
+   * ## 当前无调用方：这是**机制预留**，不是已完成的功能
+   *
+   * 截至本次改动，`src/` 下没有任何地方调用 `confirmRecall`。实际运行行为是：
+   * 召回永不加深记忆，`accessCount` 恒不增长，`importanceScore` 里的访问频次项
+   * 恒为 0。也就是说正反馈**已被堵死，但新入口尚未接上**。
+   *
+   * 为什么先不接（三种候选路径及否决理由）：
+   * 1. **给模型一个 tool 让它自报**（如 `memory_confirm`）：模型可能乱调，
+   *    而且「我用了这条」的自我报告本身不可靠——它会倾向于把所有注入内容
+   *    都报成用过，等于把马太效应从系统侧搬到了模型侧。
+   * 2. **宿主侧文本匹配**：注入后看模型输出是否引用了某张卡。这是启发式，
+   *    命中判据无法稳定定义（改写、同义、间接引用算不算？），
+   *    误判会让错误的正反馈重新出现，且事后无从审计。
+   * 3. **暂时不接**（当前选择）：承认调用时机取决于宿主的注入语义，
+   *    而那个语义现在还没定。宁可不动，也不要错误地动。
+   *
+   * 接入前必须清楚：**「正反馈已生效」目前是假的**。这与 `restore` / `revise`
+   * 无生产者是同一类问题——机制在、路径缺，不能让它悄悄躺着。
+   * 未来接入时，唯一硬约束是：确认信号必须来自「这条记忆真的影响了输出」
+   * 的**可审计证据**，而不是「这条记忆被展示过」。
+   *
+   * @param cardIds - 被确认使用的卡片 id 列表；空列表为无操作。
+   * @param now - 确认时刻；省略时取当前时钟。
+   * @returns 实际写下的确认条数（重复 id 会去重）。
+   */
+  confirmRecall(cardIds: readonly string[], now = this.clock()): number {
+    const boost = this.config.forgetting.accessBoost
+    let written = 0
+    const seen = new Set<string>()
+    for (const id of cardIds) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const card = this.store.getCard(id)
+      // 不存在或已归档的卡不确认：给归档卡加强度等于让遗忘失效（FR-C2）。
+      if (card === undefined || card.status !== 'active') continue
+      this.store.append({
+        op: 'touch',
+        id: card.id,
+        at: now,
+        strength: Math.min(1, card.strength + boost),
+      }, undefined, now)
+      written += 1
+    }
+    if (written > 0) {
+      this.log({
+        kind: 'recall',
+        at: now,
+        summary: `确认使用 ${written} 条记忆（强度 +${boost}）`,
+        detail: { confirmed: written, ids: [...seen] },
+      })
+    }
+    return written
+  }
+
+  /**
+   * 召回流水线的纯计算部分：候选池 → 打分 → 阈值 → 装包 → 渲染。
+   *
+   * 抽出来是为了让「看见」与「使用」共享同一套候选与打分规则——
+   * 两边规则一旦分叉，`peek` 看到的就不是 `recall` 会给出的东西。
+   * 本方法**不写库、不写日志、不改计数器**，因此天然满足 ST-1。
+   *
+   * @param queryText - 查询文本（仅用于回填焦点包）。
+   * @param at - 查询时刻。
+   * @param query - 已构造的查询上下文。
+   * @returns 召回结果。
+   */
+  private buildRecall(at: number, query: RecallQuery): RecallResult {
     // 候选池：倒排命中 + 已到期事项 + 钉住的承诺，保证「该想起的不会因为检索没命中而漏掉」。
     const hitIds = new Set(this.store.search(query.tokens).map((hit) => hit.id))
     const cards: MemoryCard[] = []
@@ -235,29 +352,8 @@ export class MemoryEngine {
     const time = this.buildTime(at)
     const text = renderFocusPack(pack, time)
 
-    // 召回后刷新访问计数与强度（记忆因被使用而更牢固）。
-    for (const item of pack.cards) {
-      this.store.append({
-        op: 'touch',
-        id: item.card.id,
-        at,
-        strength: Math.min(1, item.card.strength + this.config.forgetting.accessBoost),
-      })
-    }
-
-    this.recallCount += 1
-    this.log({
-      kind: 'recall',
-      at,
-      summary: `召回 ${pack.cards.length} 条（候选 ${cards.length}，token ${pack.tokens}）`,
-      detail: {
-        query: queryText,
-        candidates: cards.length,
-        picked: pack.cards.map((c) => ({ id: c.card.id, total: c.score.total })),
-        tokens: pack.tokens,
-        empty: pack.empty,
-      },
-    })
+    // 这里**刻意不写 touch**：召回只是「看见」，不是「使用」（起源 L29·第 5 条·专注当前位置）。
+    // 加深强度只发生在 confirmRecall 里，且必须由调用方显式确认。
     return { pack, text, time, candidates: cards.length }
   }
 
