@@ -18,9 +18,10 @@
 import type { ConsolidationReport, JournalOp, MemoryCard, MemoryEdge } from '../core/types.ts'
 import type { MemoryConfig } from '../core/config.ts'
 import { truncate } from '../core/text.ts'
+import { applyRecord, createEmptyState } from '../store/state.ts'
 import { decayCard } from './decay.ts'
 import { findDuplicateGroups, mergeGroup, sortByAge } from './dedupe.ts'
-import { applyArchiveRatio, archiveCard, releaseExpiredDue, shouldArchive } from './archive.ts'
+import { applyArchiveRatio, releaseExpiredDue, shouldArchive } from './archive.ts'
 import { buildEdges } from './graph.ts'
 
 /** 夜整理需要的输入状态。卡片与边都接受数组或 Map，便于直接接数据面的 MemoryState。 */
@@ -114,6 +115,15 @@ function mergeNote(merged: MemoryCard, absorbed: readonly MemoryCard[]): string 
  * 确定性：全程无随机、无时钟读取、所有排序都有完整的决胜键，
  * 因此同样的 `(state, config, now)` 永远得到同样的 `ops` 与 `report`（ST-1）。
  *
+ * **整理后的状态由重放得到，不手工维护第二份。** 早期版本在产出 `ops` 的同时
+ * 另外维护一个 `Map` 当作「整理后的卡片视图」，两处各写一遍字段，很快就漂了：
+ * 合并时 nightly 只写 `mergedInto`，而数据面（`src/store/state.ts`）还会写
+ * `status: 'archived'` 与 `updatedAt`；数据面合并还会自动建 `supersedes` 边，
+ * 而 nightly 的 `edges` 里没有。结果是「返回的 cards」与「重放 ops 得到的 cards」
+ * 是两份不同的真相——违反原则 P2「事件日志是唯一真相源」。
+ * 现在改为把每条 op 直接喂给 {@link applyRecord}，返回的就是重放结果，
+ * 两份真相合并成一份，字段语义只由数据面定义。
+ *
  * @param state - 输入状态。
  * @param config - 完整配置。
  * @param now - 整理时刻（毫秒时间戳），由调用方传入。
@@ -129,8 +139,29 @@ export function runConsolidation(
   const priorEdges = toArray(state.edges)
   const beforeActive = allCards.filter(isLive).length
 
-  const next = new Map<string, MemoryCard>()
-  for (const card of allCards) next.set(card.id, card)
+  // 重放容器：以输入状态为底，之后每条 op 都经由数据面语义落地。
+  // 它既是「整理后状态」的唯一来源，也让 nightly 内部能查到中间状态
+  // （例如归档候选要看到合并之后的样子）。
+  const replayed = createEmptyState()
+  for (const card of allCards) replayed.cards.set(card.id, card)
+  for (const edge of priorEdges) replayed.edges.set(edge.id, edge)
+
+  /**
+   * 记录一条操作，并立即按数据面语义应用到重放容器。
+   *
+   * @param op - 待写入的操作。
+   */
+  const emit = (op: JournalOp): void => {
+    ops.push(op)
+    applyRecord(replayed, {
+      v: 1,
+      seq: ops.length,
+      at: now,
+      // 重放容器是本次调用的临时对象，幂等键只需唯一，不参与落库去重。
+      idempotencyKey: `nightly:${ops.length}`,
+      op,
+    })
+  }
 
   // 开关关闭时不做任何变更，但仍返回一份可读报告（FR-F1：整理要留痕）。
   if (!config.consolidation.enabled) {
@@ -148,7 +179,7 @@ export function runConsolidation(
         notes,
       },
       ops,
-      cards: allCards,
+      cards: [...replayed.cards.values()],
       edges: priorEdges,
     }
   }
@@ -165,8 +196,7 @@ export function runConsolidation(
   for (const card of working) {
     const settled = decayCard(releaseExpiredDue(card, now), now, config)
     if (settled !== card) {
-      next.set(card.id, settled)
-      ops.push({ op: 'put', card: settled })
+      emit({ op: 'put', card: settled })
       if (settled.strength < card.strength) decayed += 1
     }
     decayedCards.push(settled)
@@ -178,13 +208,11 @@ export function runConsolidation(
   for (const group of groups) {
     const merged = mergeGroup(group.cards, config)
     const absorbed = group.cards.filter((card) => card.id !== merged.id)
-    for (const card of absorbed) {
-      absorbedIds.add(card.id)
-      // 被并入的卡：作废但保留溯源，随时能追回原始事件（FR-A4）。
-      next.set(card.id, { ...card, mergedInto: merged.id })
-    }
-    next.set(merged.id, merged)
-    ops.push({ op: 'merge', ids: group.cards.map((card) => card.id), into: merged, at: now })
+    for (const card of absorbed) absorbedIds.add(card.id)
+    // 被并入的卡如何标记作废（`status`、`mergedInto`、`updatedAt`）、
+    // 合并会自动建哪些 `supersedes` 边，全部由数据面的 merge 分支决定，
+    // 这里只产出操作，不再自己拼一遍字段（否则就是两份真相）。
+    emit({ op: 'merge', ids: group.cards.map((card) => card.id), into: merged, at: now })
     notes.push(mergeNote(merged, absorbed))
   }
 
@@ -192,7 +220,8 @@ export function runConsolidation(
   const archiveCandidates: MemoryCard[] = []
   for (const card of decayedCards) {
     if (absorbedIds.has(card.id)) continue
-    const current = next.get(card.id)
+    // 读重放容器而不是本地推算：合并之后的真实状态只有重放知道。
+    const current = replayed.cards.get(card.id)
     if (current === undefined) continue
     if (!shouldArchive(current, config)) continue
     archiveCandidates.push(current)
@@ -201,17 +230,15 @@ export function runConsolidation(
     archiveCandidates, config.consolidation.maxArchiveRatio, beforeActive,
   )
   for (const card of toArchive) {
-    const archived = archiveCard(card, now, config)
-    next.set(archived.id, archived)
-    ops.push({ op: 'archive', id: archived.id, at: now, reason: '强度低于归档阈值（夜整理自动归档）' })
+    emit({ op: 'archive', id: card.id, at: now, reason: '强度低于归档阈值（夜整理自动归档）' })
   }
 
   // 五、连边：基于整理后的活跃卡重建图谱，只补尚不存在的边。
-  const activeAfter = [...next.values()].filter(isLive)
-  const knownEdgeIds = new Set(priorEdges.map((edge) => edge.id))
+  const activeAfter = [...replayed.cards.values()].filter(isLive)
+  const knownEdgeIds = new Set(replayed.edges.keys())
   const freshEdges = buildEdges(activeAfter, config, now).filter((edge) => !knownEdgeIds.has(edge.id))
-  for (const edge of freshEdges) ops.push({ op: 'edge', edge })
-  const edges = [...priorEdges, ...freshEdges]
+  for (const edge of freshEdges) emit({ op: 'edge', edge })
+  const edges = [...replayed.edges.values()]
 
   // 六、汇总报告（FR-C1：每次整理必须有一份可读报告）。
   const afterActive = activeAfter.length
@@ -239,5 +266,5 @@ export function runConsolidation(
     notes,
   }
 
-  return { report, ops, cards: [...next.values()], edges }
+  return { report, ops, cards: [...replayed.cards.values()], edges }
 }

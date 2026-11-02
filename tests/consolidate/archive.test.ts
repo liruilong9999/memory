@@ -11,12 +11,39 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  applyArchiveRatio, archiveCard, hasOpenDue, isNeverArchiveKind,
-  releaseExpiredDue, shouldArchive,
+  applyArchiveRatio, hasOpenDue, isNeverArchiveKind, releaseExpiredDue, shouldArchive,
 } from '../../src/consolidate/archive.ts'
+import { applyRecord, createEmptyState } from '../../src/store/state.ts'
+import type { JournalOp, MemoryCard } from '../../src/core/types.ts'
 import { DAY_MS, makeCard, makeConfig } from './fixtures.ts'
 
 const T0 = 1_700_000_000_000
+
+/**
+ * 把操作序列重放到卡片表上，复用数据面的真实语义。
+ *
+ * 为什么不在测试里手写「归档之后卡长什么样」：那等于让测试自己维护一份
+ * 字段约定，实现漏写时测试照样是绿的——测的是帮手，不是实现。
+ *
+ * @param cards - 初始卡片。
+ * @param ops - 操作序列。
+ * @returns 重放后的卡片表。
+ */
+function replayOps(
+  cards: readonly MemoryCard[], ops: readonly JournalOp[],
+): Map<string, MemoryCard> {
+  const state = createEmptyState()
+  for (const card of cards) state.cards.set(card.id, card)
+  ops.forEach((op, index) => {
+    // 记录的 `at` 必须与操作自带的 `at` 一致：数据面的 archive/restore 分支
+    // 用的是 `record.at`（落库时刻），不是 `op.at`。真实写入路径里两者相同
+    // （`store.append(op, undefined, now)` 把 now 同时给了两者），测试也要还原这一点，
+    // 否则测出来的是「记录时刻」与「操作时刻」不一致时的行为，不是真实行为。
+    const at = 'at' in op && typeof op.at === 'number' ? op.at : T0
+    applyRecord(state, { v: 1, seq: index + 1, at, idempotencyKey: `t:${index}`, op })
+  })
+  return state.cards
+}
 
 describe('isNeverArchiveKind 永不归档类别（FR-C3）', () => {
   it('默认配置保护承诺、概念、经验', () => {
@@ -214,50 +241,65 @@ describe('applyArchiveRatio 归档比例上限（P8 成本有界）', () => {
   })
 })
 
-describe('archiveCard 归档动作（FR-C2 / ST-7）', () => {
-  it('状态变为 archived', () => {
-    const archived = archiveCard(makeCard({ id: 'a', strength: 0.1 }), T0, makeConfig())
-    assert.equal(archived.status, 'archived')
+describe('归档与恢复的重放语义（FR-C2 / ST-7）', () => {
+  it('归档后状态变为 archived', () => {
+    const state = replayOps([makeCard({ id: 'a', strength: 0.1 })], [
+      { op: 'archive', id: 'a', at: T0, reason: '测试' },
+    ])
+    assert.equal(state.get('a')?.status, 'archived')
   })
 
-  it('按 archiveRetention 保留部分强度（恢复后能召回）', () => {
-    const config = makeConfig({ forgetting: { archiveRetention: 0.6 } })
-    const archived = archiveCard(makeCard({ id: 'a', strength: 0.5 }), T0, config)
-    assert.ok(Math.abs(archived.strength - 0.3) < 1e-9)
+  it('归档不改强度：动作与时间流逝是两件事', () => {
+    // 早期归档会乘一个 archiveRetention 打折强度，导致「同一动作做两次结果不同」，
+    // 且 archive 操作不带强度、重放永远算不出这个乘法（见 archive.ts 尾注）。
+    const state = replayOps([makeCard({ id: 'a', strength: 0.5 })], [
+      { op: 'archive', id: 'a', at: T0, reason: '测试' },
+    ])
+    assert.equal(state.get('a')?.strength, 0.5)
   })
 
   it('归档后强度仍大于 0，不是清零', () => {
-    const archived = archiveCard(makeCard({ id: 'a', strength: 0.1 }), T0, makeConfig())
-    assert.ok(archived.strength > 0)
+    const state = replayOps([makeCard({ id: 'a', strength: 0.1 })], [
+      { op: 'archive', id: 'a', at: T0, reason: '测试' },
+    ])
+    assert.ok((state.get('a')?.strength ?? 0) > 0)
   })
 
   it('updatedAt 置为归档时刻', () => {
-    const archived = archiveCard(makeCard({ id: 'a', createdAt: T0 }), T0 + 5 * DAY_MS, makeConfig())
-    assert.equal(archived.updatedAt, T0 + 5 * DAY_MS)
+    const state = replayOps([makeCard({ id: 'a', createdAt: T0, updatedAt: T0 })], [
+      { op: 'archive', id: 'a', at: T0 + 5 * DAY_MS, reason: '测试' },
+    ])
+    assert.equal(state.get('a')?.updatedAt, T0 + 5 * DAY_MS)
   })
 
-  it('保留 retention 之外的字段不变', () => {
+  it('除状态与 updatedAt 外字段一律不变', () => {
     const card = makeCard({ id: 'a', text: '部署走 CI', tags: ['部署'], strength: 0.5 })
-    const archived = archiveCard(card, T0, makeConfig())
-    assert.equal(archived.id, card.id)
-    assert.equal(archived.text, card.text)
-    assert.deepEqual(archived.tags, card.tags)
+    const state = replayOps([card], [{ op: 'archive', id: 'a', at: T0, reason: '测试' }])
+    const archived = state.get('a')
+    assert.equal(archived?.id, card.id)
+    assert.equal(archived?.text, card.text)
+    assert.equal(archived?.strength, card.strength)
+    assert.deepEqual(archived?.tags, card.tags)
   })
 
-  it('不修改入参（纯函数）', () => {
-    const card = makeCard({ id: 'a', strength: 0.5, status: 'active' })
-    archiveCard(card, T0, makeConfig())
-    assert.equal(card.status, 'active')
-    assert.equal(card.strength, 0.5)
+  it('归档 → 恢复往返后强度严格相等（FR-C2 遗忘可逆的直接证据）', () => {
+    // 这条是「可逆」的本体：不是近似、不是打折后仍大于零，而是**一模一样**。
+    const before = makeCard({ id: 'a', strength: 0.37, status: 'active' })
+    const state = replayOps([before], [
+      { op: 'archive', id: 'a', at: T0 + DAY_MS, reason: '测试' },
+      { op: 'restore', id: 'a', at: T0 + 2 * DAY_MS },
+    ])
+    const restored = state.get('a')
+    assert.equal(restored?.status, 'active')
+    assert.equal(restored?.strength, before.strength)
   })
 
-  it('retention 越界被夹到 0..1', () => {
-    const config = makeConfig({ forgetting: { archiveRetention: 5 } })
-    assert.equal(archiveCard(makeCard({ id: 'a', strength: 0.5 }), T0, config).strength, 0.5)
-  })
-
-  it('强度非有限时归零', () => {
-    const card = makeCard({ id: 'a', strength: Number.NaN })
-    assert.equal(archiveCard(card, T0, makeConfig()).strength, 0)
+  it('归档 → 恢复 → 再归档，强度仍不变（同一动作可重复）', () => {
+    const state = replayOps([makeCard({ id: 'a', strength: 0.37 })], [
+      { op: 'archive', id: 'a', at: T0, reason: '测试' },
+      { op: 'restore', id: 'a', at: T0 + DAY_MS },
+      { op: 'archive', id: 'a', at: T0 + 2 * DAY_MS, reason: '测试' },
+    ])
+    assert.equal(state.get('a')?.strength, 0.37)
   })
 })

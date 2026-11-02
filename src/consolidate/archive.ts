@@ -127,18 +127,18 @@ export function applyArchiveRatio(
 }
 
 /**
- * 归档一张卡：把状态改为 `archived` 并按 `archiveRetention` 保留部分强度。
+ * 归档动作**不在这里实现**，原因见下。
  *
- * 为什么保留而不是清零：FR-C2 要求归档可恢复，恢复后要能正常召回（ST-7）。
- * 强度保留 `config.forgetting.archiveRetention` 比例，恢复时不会从零开始。
+ * 早期本文件有 `archiveCard(card, now, config)`，做两件事：改状态、乘一个
+ * `archiveRetention` 打折强度。后来发现打折那一半根本无法重放（`archive` 操作
+ * 只携带 `{op, id, at, reason}`，不带强度），于是把打折去掉——去掉之后剩下的
+ * 「改状态 + 置 updatedAt」与数据面 `src/store/state.ts` 的 `archive` 分支
+ * 是同一行逻辑。再留一份就是**两份真相**，而「两份真相各自漂移」正是本次
+ * 缺陷的成因。所以这里不再提供归档投影函数，归档语义唯一定义在数据面：
  *
- * @param card - 记忆卡。
- * @param now - 当前时刻（毫秒时间戳）。
- * @param config - 完整配置。
- * @returns 归档后的新卡。
+ * - 归档：`status → 'archived'`，`updatedAt → max(updatedAt, at)`，强度不动；
+ * - 恢复：`status → 'active'`，`updatedAt → max(updatedAt, at)`，强度不动。
+ *
+ * 由此 FR-C2「遗忘可逆」才成立：归档 → 恢复往返后强度**严格相等**，
+ * 不是「近似」也不是「打折后仍大于零」。衰减只由 `decay.ts` 按时间结算。
  */
-export function archiveCard(card: MemoryCard, now: number, config: MemoryConfig): MemoryCard {
-  const retention = Math.min(1, Math.max(0, config.forgetting.archiveRetention))
-  const strength = card.strength * retention
-  return { ...card, status: 'archived', strength: Number.isFinite(strength) ? strength : 0, updatedAt: now }
-}

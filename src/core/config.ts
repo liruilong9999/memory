@@ -60,8 +60,6 @@ export interface ForgettingPolicy {
   accessBoost: number
   /** 强度低于该值才允许自动归档（FR-C4）。 */
   archiveThreshold: number
-  /** 归档后强度保留比例，便于恢复（FR-C2）。 */
-  archiveRetention: number
   /** 情绪强度对半衰期的放大系数上限：强烈的感受忘得更慢（起源 L3·激素是关键）。 */
   emotionalHalfLifeBoost: number
   /**
@@ -180,7 +178,7 @@ export interface MemoryConfig {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 1,
+  configVersion: 2,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -204,7 +202,6 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     halfLifeMs: 14 * 24 * 60 * 60 * 1000,
     accessBoost: 0.18,
     archiveThreshold: 0.08,
-    archiveRetention: 0.6,
     emotionalHalfLifeBoost: 2.0,
     // `feeling` 在列的依据见 ForgettingPolicy.neverArchiveKinds 注释：
     // 起源 L11 要求「只留下感受」，感受不该被自动归档。
@@ -253,7 +250,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 1
+export const MEMORY_CONFIG_VERSION = 2
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -297,7 +294,6 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (config.forgetting.halfLifeMs <= 0) errors.push('forgetting.halfLifeMs 必须 > 0')
   inUnit('forgetting.accessBoost', config.forgetting.accessBoost)
   inUnit('forgetting.archiveThreshold', config.forgetting.archiveThreshold)
-  inUnit('forgetting.archiveRetention', config.forgetting.archiveRetention)
 
   inUnit('dedup.duplicateSimilarity', config.dedup.duplicateSimilarity)
   inUnit('dedup.relatedSimilarity', config.dedup.relatedSimilarity)

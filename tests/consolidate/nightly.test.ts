@@ -12,32 +12,46 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { runConsolidation } from '../../src/consolidate/nightly.ts'
-import type { JournalOp } from '../../src/core/types.ts'
+import { applyRecord, createEmptyState } from '../../src/store/state.ts'
+import type { JournalOp, MemoryCard } from '../../src/core/types.ts'
 import { DAY_MS, makeCard, makeConfig } from './fixtures.ts'
 
 const T0 = 1_700_000_000_000
 
-/** 把操作序列应用到卡片数组上，模拟数据面重放。 */
-function replay(cards: readonly ReturnType<typeof makeCard>[], ops: readonly JournalOp[]) {
-  const map = new Map(cards.map((card) => [card.id, card]))
-  for (const op of ops) {
-    if (op.op === 'put') map.set(op.card.id, op.card)
-    else if (op.op === 'merge') {
-      // 与 src/store/state.ts 的 merge 重放语义保持一致：
-      // 被并入的卡不删除，标记 archived + mergedInto 保留溯源（FR-A4）。
-      for (const id of op.ids) {
-        if (id === op.into.id) continue
-        const victim = map.get(id)
-        if (victim === undefined) continue
-        map.set(id, { ...victim, status: 'archived', mergedInto: op.into.id })
-      }
-      map.set(op.into.id, op.into)
-    } else if (op.op === 'archive') {
-      const card = map.get(op.id)
-      if (card !== undefined) map.set(op.id, { ...card, status: 'archived' })
-    }
-  }
-  return map
+/**
+ * 把操作序列应用到卡片数组上，模拟数据面重放。
+ *
+ * **这里必须走真实的 `applyRecord`，不许自己手写字段语义。**
+ * 早期版本在本文件里手抄了一遍「merge 之后被并入的卡变成什么样」，
+ * 于是测试和生产代码各自维护一套字段约定：生产代码漏写 `status: 'archived'`，
+ * 测试帮手自己补上了，断言永远是绿的——测的是帮手，不是实现。
+ * 现在直接调数据面，两边共用同一份语义，实现漂了测试就会红。
+ *
+ * @param cards - 初始卡片。
+ * @param ops - 待重放的操作序列。
+ * @returns 重放后的卡片表。
+ */
+function replay(cards: readonly MemoryCard[], ops: readonly JournalOp[]): Map<string, MemoryCard> {
+  return replayState(cards, ops).cards
+}
+
+/**
+ * 把操作序列重放成完整状态（卡片 + 边）。
+ *
+ * @param cards - 初始卡片。
+ * @param ops - 待重放的操作序列。
+ * @returns 重放后的状态。
+ */
+function replayState(cards: readonly MemoryCard[], ops: readonly JournalOp[]) {
+  const state = createEmptyState()
+  for (const card of cards) state.cards.set(card.id, card)
+  ops.forEach((op, index) => {
+    // 记录时刻取操作自带的 `at`：真实写入路径 `store.append(op, undefined, now)`
+    // 把同一个 now 同时给了记录与操作，重放时两处必须一致。
+    const at = 'at' in op && typeof op.at === 'number' ? op.at : 0
+    applyRecord(state, { v: 1, seq: index + 1, at, idempotencyKey: `test:${index}`, op })
+  })
+  return state
 }
 
 describe('runConsolidation 开关与空输入', () => {
@@ -218,9 +232,9 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
     assert.equal(result.report.archived, 2)
   })
 
-  it('归档后的卡强度保留一部分，可恢复（ST-7）', () => {
+  it('归档不改强度，恢复后与归档前严格相等（FR-C2 / ST-7）', () => {
     const config = makeConfig({
-      forgetting: { archiveThreshold: 0.5, archiveRetention: 0.6 },
+      forgetting: { archiveThreshold: 0.5 },
       consolidation: { maxArchiveRatio: 1 },
     })
     const cards = [makeCard({
@@ -230,6 +244,8 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
     const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
     const archived = replay(cards, result.ops).get('a')
     assert.equal(archived?.status, 'archived')
+    // 归档动作本身不打折；归档前的那点强度是衰减算出来的，与归档无关。
+    assert.equal(archived?.strength, archived?.strength)
     assert.ok((archived?.strength ?? 0) > 0)
   })
 
@@ -331,5 +347,73 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
     const snapshot = { ...cards[0]! }
     runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS)
     assert.deepEqual(cards[0], snapshot)
+  })
+})
+
+describe('runConsolidation 返回值与重放一致（P2 事件日志是唯一真相源）', () => {
+  it('返回的 cards 与重放 ops 得到的 cards 逐字段一致', () => {
+    // 这是本文件最重要的断言：`cards` 曾被手工维护成第二份真相，
+    // 与数据面重放结果漂移（合并时漏写 status/updatedAt）。
+    // 这条一旦红，说明整理层又在自作主张定义字段语义。
+    const config = makeConfig({
+      forgetting: { archiveThreshold: 0.5 },
+      consolidation: { maxArchiveRatio: 1 },
+    })
+    const cards = [
+      makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0, updatedAt: T0, strength: 0.1, lastAccessAt: null }),
+      makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS, strength: 0.1, lastAccessAt: null }),
+      makeCard({ id: 'c', text: '数据库迁移用 Alembic', createdAt: T0, updatedAt: T0, strength: 1, lastAccessAt: null }),
+    ]
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const replayed = replayState(cards, result.ops)
+    const returned = new Map(result.cards.map((card) => [card.id, card]))
+    assert.deepEqual([...returned.keys()].sort(), [...replayed.cards.keys()].sort())
+    for (const [id, card] of replayed.cards) {
+      assert.deepEqual(returned.get(id), card, `卡片 ${id} 与重放结果不一致`)
+    }
+  })
+
+  it('被合并掉的卡在返回值里也是 archived + mergedInto（不是只有 mergedInto）', () => {
+    const cards = [
+      makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0, updatedAt: T0 }),
+      makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS }),
+    ]
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const victim = result.cards.find((card) => card.id === 'b')
+    assert.equal(victim?.mergedInto, 'a')
+    assert.equal(victim?.status, 'archived', '被合并的卡必须作废，否则它还会被召回')
+    assert.equal(victim?.updatedAt, T0 + DAY_MS, 'updatedAt 应推进到合并时刻')
+  })
+
+  it('合并产生的 supersedes 边出现在返回的 edges 里', () => {
+    // 数据面 merge 分支会自动建 supersedes 边；整理层返回的 edges 必须包含它，
+    // 否则调用方拿到的图谱视图缺边，而重放日志又有一条——两份真相。
+    const cards = [
+      makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0, updatedAt: T0 }),
+      makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS, updatedAt: T0 + DAY_MS }),
+    ]
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS)
+    const replayed = replayState(cards, result.ops)
+    assert.deepEqual(
+      result.edges.map((edge) => edge.id).sort(),
+      [...replayed.edges.keys()].sort(),
+    )
+    assert.ok(result.edges.some((edge) => edge.relation === 'supersedes'))
+  })
+
+  it('归档不改强度：返回值与重放一致且强度未被额外打折', () => {
+    const config = makeConfig({
+      forgetting: { archiveThreshold: 0.5 },
+      consolidation: { maxArchiveRatio: 1 },
+    })
+    const cards = [makeCard({
+      id: 'a', kind: 'event', createdAt: T0, updatedAt: T0, lastAccessAt: null,
+      strength: 0.1, emotional: 0, accessCount: 0,
+    })]
+    const result = runConsolidation({ cards }, config, T0 + 30 * DAY_MS)
+    const archived = result.cards.find((card) => card.id === 'a')
+    assert.equal(archived?.status, 'archived')
+    // 强度只由衰减决定（decay 之后的值），归档动作不再乘任何系数。
+    assert.deepEqual(archived, replayState(cards, result.ops).cards.get('a'))
   })
 })
