@@ -81,6 +81,64 @@ export interface HostContext {
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 /**
+ * 安全读取宿主上下文成员（服务或核心方法）。
+ *
+ * 真实 Cordis 的 `ctx` 是 Proxy：读取**未在 `inject` 里声明**的服务名会抛
+ * `cannot get property "x" without inject`。`?.` 只能防 `undefined`，防不住抛错
+ * ——这是本仓库宿主实机验证才暴露的缺陷（假宿主是普通对象，永远不抛）。
+ *
+ * 三级回落，缺一不可：
+ * 1. `ctx.reflect.get(name, false)` —— Cordis 文档指定的安全读入口，
+ *    服务不存在时返回 `undefined` 而不抛错；
+ * 2. 直接属性读 —— **核心方法走这条**（`on`/`effect`/`logger` 不是服务，
+ *    `reflect.get` 对它们恒返回 `undefined`，只靠第 1 步会把它们全判成缺失）；
+ * 3. 直接读抛错时返回 `undefined` —— 未 inject 的服务走这条。
+ *
+ * **它防的是「抛错」，不是「服务晚到」**：`apply` 执行时服务若尚未就绪，
+ * 这里读到 `undefined` 并就此定局。需要「等就绪」的依赖必须写进 `inject`
+ * （Cordis 会在服务齐备后才跑 `apply`），见 `src/index.ts`。
+ *
+ * @param ctx - 宿主上下文。
+ * @param name - 成员名（服务名或核心方法名）。
+ * @returns 成员值；不可用时为 `undefined`。
+ */
+export function readService(ctx: HostContext, name: string): unknown {
+  const reflect = (ctx as { reflect?: { get?: (key: string, strict?: boolean) => unknown } }).reflect
+  if (typeof reflect?.get === 'function') {
+    try {
+      const viaReflect = reflect.get(name, false)
+      if (viaReflect !== undefined) return viaReflect
+    } catch {
+      // 上下文已销毁等情形；继续尝试直接读。
+    }
+  }
+  try {
+    return (ctx as unknown as Record<string, unknown>)[name]
+  } catch {
+    // 未 inject 的服务：Proxy 的 get 陷阱抛错，按「取不到」处理（C8 降级）。
+    return undefined
+  }
+}
+
+/**
+ * 读一个服务上的方法，取不到时返回 `undefined`。
+ *
+ * @param ctx - 宿主上下文。
+ * @param service - 服务名。
+ * @param method - 方法名。
+ * @returns 绑定好的方法；不可用时为 `undefined`。
+ */
+function serviceMethod(
+  ctx: HostContext, service: string, method: string,
+): ((...args: unknown[]) => unknown) | undefined {
+  const impl = readService(ctx, service)
+  if (impl === null || typeof impl !== 'object') return undefined
+  const fn = (impl as Record<string, unknown>)[method]
+  if (typeof fn !== 'function') return undefined
+  return (...args: unknown[]): unknown => (fn as (...a: unknown[]) => unknown).apply(impl, args)
+}
+
+/**
  * 宿主无关的日志器。
  *
  * 上层只认这个接口，不认 `ctx.logger`，这样换宿主只需改本文件。
@@ -104,7 +162,7 @@ export interface Logger {
  * @returns 日志器。
  */
 export function createLogger(ctx: HostContext, prefix = '[memory]'): Logger {
-  const host = ctx.logger
+  const host = readService(ctx, 'logger') as HostContext['logger']
   const wrap = (level: LogLevel): ((message: string) => void) => (message: string) => {
     const line = `${prefix} ${message}`
     const fn = host?.[level]
@@ -188,13 +246,16 @@ export interface HostCapabilities {
  */
 export function probeCapabilities(ctx: HostContext): HostCapabilities {
   const missing: string[] = []
-  const canInjectContext = typeof ctx.systemPrompt?.context === 'function'
+  // 四项都走安全读取：真实宿主的 ctx 是 Proxy，未 inject 的服务名会抛错。
+  const canInjectContext = serviceMethod(ctx, 'systemPrompt', 'context') !== undefined
   if (!canInjectContext) missing.push('systemPrompt.context')
-  const canRegisterCommand = typeof ctx.commands?.register === 'function'
+  const canRegisterCommand = serviceMethod(ctx, 'commands', 'register') !== undefined
   if (!canRegisterCommand) missing.push('commands.register')
-  const canSubscribeEvents = typeof ctx.on === 'function'
+  const canSubscribeEvents = typeof readService(ctx, 'on') === 'function'
   if (!canSubscribeEvents) missing.push('on')
-  const canSchedule = typeof ctx.interval === 'function'
+  // `ctx.interval` 是 `timer` 服务 mixin 到 Context 上的**方法**，
+  // 所以读的是 ctx 的 `interval` 成员，不是 `timer` 服务对象本身。
+  const canSchedule = typeof readService(ctx, 'interval') === 'function'
   if (!canSchedule) missing.push('interval')
   return { canInjectContext, canRegisterCommand, canSubscribeEvents, canSchedule, missing }
 }
@@ -218,9 +279,9 @@ export function probeCapabilities(ctx: HostContext): HostCapabilities {
 export function registerDynamicContext(
   ctx: HostContext, name: string, order: number, render: () => string,
 ): boolean {
-  const register = ctx.systemPrompt?.context
-  if (typeof register !== 'function') return false
-  register.call(ctx.systemPrompt, {
+  const register = serviceMethod(ctx, 'systemPrompt', 'context')
+  if (register === undefined) return false
+  register({
     name,
     order,
     // 包一层：宿主可能同步求值也可能异步求值，这里保证异常不会冒到宿主循环里。
@@ -251,9 +312,9 @@ export function registerDynamicContext(
 export function subscribe(
   ctx: HostContext, event: string, listener: (...args: unknown[]) => unknown,
 ): boolean {
-  const on = ctx.on
+  const on = readService(ctx, 'on')
   if (typeof on !== 'function') return false
-  on.call(ctx, event, listener)
+  ;(on as (...a: unknown[]) => unknown).call(ctx, event, listener)
   return true
 }
 
@@ -272,9 +333,9 @@ export function subscribe(
 export function registerCommand(
   ctx: HostContext, name: string, description: string, handler: (args: string) => string,
 ): boolean {
-  const register = ctx.commands?.register
-  if (typeof register !== 'function') return false
-  register.call(ctx.commands, { name, description, run: handler, handler })
+  const register = serviceMethod(ctx, 'commands', 'register')
+  if (register === undefined) return false
+  register({ name, description, run: handler, handler })
   return true
 }
 
@@ -290,8 +351,12 @@ export function registerCommand(
  * @returns 清理函数。
  */
 export function setRepeating(ctx: HostContext, callback: () => void, ms: number): () => void {
-  if (typeof ctx.interval === 'function') {
-    ctx.interval(callback, ms)
+  // `ctx.interval` 是 `timer` 服务 mixin 到 Context 上的**方法**。
+  // 读 `timer` 服务对象拿不到可调用函数，会静默退回全局 setInterval，
+  // 于是插件卸载后定时器仍活着——所以要读 `interval` 这个成员。
+  const interval = readService(ctx, 'interval')
+  if (typeof interval === 'function') {
+    ;(interval as (cb: () => void, delay: number) => unknown).call(ctx, callback, ms)
     return () => {
       /* 宿主负责清理 */
     }
@@ -302,7 +367,8 @@ export function setRepeating(ctx: HostContext, callback: () => void, ms: number)
     (handle as { unref: () => void }).unref()
   }
   const dispose = (): void => clearInterval(handle)
-  if (typeof ctx.effect === 'function') ctx.effect(dispose)
+  const effect = readService(ctx, 'effect')
+  if (typeof effect === 'function') (effect as (fn: () => void) => unknown).call(ctx, dispose)
   return dispose
 }
 
@@ -354,10 +420,10 @@ export function resolveTimeZone(): string {
  */
 export function readGoalText(ctx: HostContext, agent: unknown): string {
   if (agent === undefined || agent === null) return ''
-  const goals = ctx.goals
-  if (goals === undefined || typeof goals.get !== 'function') return ''
+  const get = serviceMethod(ctx, 'goals', 'get')
+  if (get === undefined) return ''
   try {
-    const goal = goals.get(agent)
+    const goal = get(agent)
     if (typeof goal !== 'object' || goal === null) return ''
     // 只取 active 目标：已完成/已阻塞的目标不该再牵引召回，
     // 否则「上一个任务的记忆」会一直干扰当前任务（起源 L29）。

@@ -4,3 +4,4 @@ lib/
 .tmp/
 data/
 *.log
+.dsh-memory/
