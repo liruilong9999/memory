@@ -438,8 +438,8 @@ export function helpText(): string {
     '',
     '说明：',
     '  query 与 export 都是只读的：不改访问计数、不改强度、不写事件日志，',
-    '  反复查询不会让某几张卡越来越容易被召回。需要「使用并强化」时由宿主',
-    '  在真正注入上下文后显式确认，那才是「使用」的定义。',
+    '  反复查询不会让某几张卡越来越容易被召回。需要「使用并强化」时由宿主侧',
+    '  显式确认（该能力在实现中）。',
     '',
     '示例：',
     `  ${CLI_NAME} health`,
@@ -533,8 +533,8 @@ function renderRecall(pack: FocusPack, candidates: number): string {
  * `query` 子命令（FR-F2）。
  *
  * 纯只读：不改 `accessCount`、不改 `strength`、不写事件日志，因此
- * 「查一下看看」不会污染记忆库。需要「使用并强化」请由宿主在真正注入
- * 上下文后走 `confirmRecall`，那才是「使用」的定义。
+ * 「查一下看看」不会污染记忆库。「使用并强化」需要宿主侧显式确认，
+ * 该能力在实现中，CLI 不提供、也不该提供。
  *
  * @param options - 解析后的参数。
  * @param store - 记忆库。
