@@ -1,0 +1,358 @@
+/**
+ * 事件日志（Journal）：唯一真相源的持久化载体。
+ *
+ * 设计依据：
+ * - 原则 P2「事件日志是唯一真相源，卡片是派生视图」：库里只追加记录，永不改写历史。
+ * - FR-A3 原子性：一条记录一行 JSONL，写完立即 fsync；崩溃最多留下尾部半行，
+ *   重启时 {@link Journal.open} 会把残缺尾行截断，绝不会出现「写了一半的卡片」。
+ * - FR-A2 幂等：日志自己维护已见幂等键集合，重复键直接丢弃，不落盘。
+ * - 分片：单文件超过 `segmentBytes` 后滚动到 `journal-000002.jsonl`，
+ *   避免单文件无限增长拖慢重放与备份。
+ *
+ * 本模块只依赖 `node:` 内置模块，禁止 import 任何宿主包。
+ *
+ * @module dsh-memory/store/journal
+ */
+
+import {
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync,
+  statSync, truncateSync, writeSync,
+} from 'node:fs'
+import { join } from 'node:path'
+
+import { fnv1a64 } from '../core/types.ts'
+import type { JournalRecord } from '../core/types.ts'
+
+/** 日志分片文件名前缀。 */
+export const JOURNAL_FILE_PREFIX = 'journal-'
+
+/** 日志分片文件名后缀。 */
+export const JOURNAL_FILE_SUFFIX = '.jsonl'
+
+/** 分片序号宽度，补零后便于字典序排序。 */
+const SHARD_INDEX_WIDTH = 6
+
+/** 日志里允许出现的全部操作标签，用于反序列化时做结构校验。 */
+const KNOWN_OPS: ReadonlySet<string> = new Set([
+  'put', 'revise', 'touch', 'archive', 'restore', 'merge', 'edge', 'purge',
+])
+
+/**
+ * 派生幂等键。
+ *
+ * 需求 FR-A2 要求「同一事件重复处理不产生重复卡」。把参与判定的要素拼起来
+ * 做 FNV-1a，得到稳定且可复现的键——同样的输入永远得到同样的键，重放才能幂等。
+ *
+ * @param parts - 参与判定的要素，按固定顺序传入。
+ * @returns 16 位十六进制幂等键。
+ */
+export function buildIdempotencyKey(...parts: string[]): string {
+  return fnv1a64(parts.join('\u0003'))
+}
+
+/**
+ * 分片文件名。
+ *
+ * @param index - 从 1 开始的分片序号。
+ * @returns 形如 `journal-000001.jsonl` 的文件名。
+ */
+export function shardFileName(index: number): string {
+  return `${JOURNAL_FILE_PREFIX}${String(index).padStart(SHARD_INDEX_WIDTH, '0')}${JOURNAL_FILE_SUFFIX}`
+}
+
+/**
+ * 从文件名解析分片序号。
+ *
+ * @param fileName - 文件名（不含目录）。
+ * @returns 序号；不是日志分片时返回 `null`。
+ */
+function shardIndexOf(fileName: string): number | null {
+  if (!fileName.startsWith(JOURNAL_FILE_PREFIX) || !fileName.endsWith(JOURNAL_FILE_SUFFIX)) {
+    return null
+  }
+  const body = fileName.slice(JOURNAL_FILE_PREFIX.length, fileName.length - JOURNAL_FILE_SUFFIX.length)
+  if (!/^\d+$/u.test(body)) return null
+  const index = Number.parseInt(body, 10)
+  return Number.isFinite(index) && index > 0 ? index : null
+}
+
+/**
+ * 列出目录下全部分片文件名，按分片序号升序。
+ *
+ * 目录不存在时返回空数组（首次打开库的正常情况）。
+ *
+ * @param dir - 数据目录。
+ * @returns 文件名数组，不含目录前缀。
+ */
+export function listShardFiles(dir: string): string[] {
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return []
+  }
+  const indexed: Array<{ index: number; name: string }> = []
+  for (const name of names) {
+    const index = shardIndexOf(name)
+    if (index === null) continue
+    indexed.push({ index, name })
+  }
+  indexed.sort((a, b) => a.index - b.index)
+  return indexed.map((item) => item.name)
+}
+
+/**
+ * 序列化一条记录为一行 JSONL（含行尾换行）。
+ *
+ * @param record - 日志记录。
+ * @returns 可直接追加写入的字符串。
+ */
+export function encodeRecord(record: JournalRecord): string {
+  return `${JSON.stringify(record)}\n`
+}
+
+/** 判断值是否为普通对象（排除 null 与数组）。 */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * 反序列化一行 JSONL。
+ *
+ * 只做结构校验，不做业务校验：读日志时宁可丢掉一条坏行，也不能让整个库打不开
+ * （FR-A3 崩溃恢复要求重启后可用）。
+ *
+ * @param line - 一行文本（可含行尾空白）。
+ * @returns 日志记录；空行或结构不合法时返回 `null`。
+ */
+export function decodeRecord(line: string): JournalRecord | null {
+  const trimmed = line.trim()
+  if (trimmed.length === 0) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+  if (!isPlainObject(parsed)) return null
+  if (parsed['v'] !== 1) return null
+  const seq = parsed['seq']
+  if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) return null
+  const at = parsed['at']
+  if (typeof at !== 'number' || !Number.isFinite(at)) return null
+  const key = parsed['idempotencyKey']
+  if (typeof key !== 'string' || key.length === 0) return null
+  const op = parsed['op']
+  if (!isPlainObject(op)) return null
+  const tag = op['op']
+  if (typeof tag !== 'string' || !KNOWN_OPS.has(tag)) return null
+  return parsed as unknown as JournalRecord
+}
+
+/** 日志打开参数。 */
+export interface JournalOptions {
+  /** 数据目录（绝对路径）。 */
+  dir: string
+  /** 单片大小上限（字节），超过后滚动。 */
+  segmentBytes: number
+  /** 每次写入是否 fsync（FR-A3）。 */
+  fsyncOnWrite: boolean
+}
+
+/** 一次追加的结果。 */
+export interface AppendOutcome {
+  /** 是否真正落盘；`false` 表示幂等键重复被丢弃。 */
+  appended: boolean
+  /** 落盘后的记录（被丢弃时是入参原样返回）。 */
+  record: JournalRecord
+  /** 重复时给出首次落盘的序号，便于调用方对齐。 */
+  duplicateOfSeq?: number
+}
+
+/**
+ * 事件日志。
+ *
+ * 只追加、不修改：任何「状态变更」都必须表达成一条新记录。
+ * 序号由日志统一分配，保证严格单调递增——重放顺序只有这一个依据。
+ */
+export class Journal {
+  /** 数据目录。 */
+  readonly dir: string
+
+  private readonly segmentBytes: number
+  private readonly fsyncOnWrite: boolean
+  private shardIndex = 0
+  private shardBytes = 0
+  private maxSeq = 0
+  private total = 0
+  private opened = false
+  private readonly seenKeys = new Set<string>()
+  private readonly keySeq = new Map<string, number>()
+
+  /**
+   * @param options - 打开参数。
+   */
+  constructor(options: JournalOptions) {
+    this.dir = options.dir
+    // 单片大小至少 1 字节，避免配置成 0 导致每行都换片。
+    this.segmentBytes = Math.max(1, Math.floor(options.segmentBytes))
+    this.fsyncOnWrite = options.fsyncOnWrite
+  }
+
+  /**
+   * 打开日志：建目录、扫已有分片、恢复幂等键集合与序号水位。
+   *
+   * 顺带做崩溃修复：最后一个分片若没有以换行结尾，说明上次写到一半被强杀，
+   * 这里把它截断到最后一个完整行，保证后续追加不会接在半个 JSON 后面（ST-3）。
+   *
+   * 重复调用是安全的（幂等）。
+   */
+  open(): void {
+    if (this.opened) return
+    mkdirSync(this.dir, { recursive: true })
+    const files = listShardFiles(this.dir)
+    for (const file of files) {
+      const path = join(this.dir, file)
+      this.repairTail(path)
+      const text = readFileSync(path, 'utf8')
+      for (const line of text.split('\n')) {
+        const record = decodeRecord(line)
+        if (record === null) continue
+        this.total += 1
+        if (record.seq > this.maxSeq) this.maxSeq = record.seq
+        this.seenKeys.add(record.idempotencyKey)
+        if (!this.keySeq.has(record.idempotencyKey)) {
+          this.keySeq.set(record.idempotencyKey, record.seq)
+        }
+      }
+      const index = shardIndexOf(file)
+      if (index !== null && index > this.shardIndex) this.shardIndex = index
+    }
+    const lastFile = files[files.length - 1]
+    this.shardBytes = lastFile === undefined ? 0 : statSync(join(this.dir, lastFile)).size
+    this.opened = true
+  }
+
+  /**
+   * 追加一条记录。
+   *
+   * 幂等键重复时直接丢弃并返回 `appended: false`，不写盘、不推进序号。
+   *
+   * @param record - 待追加记录；其 `seq` 只是建议值，日志保证落盘序号严格递增。
+   * @returns 追加结果。
+   */
+  append(record: JournalRecord): AppendOutcome {
+    this.ensureOpen()
+    const existingSeq = this.keySeq.get(record.idempotencyKey)
+    if (existingSeq !== undefined) {
+      return { appended: false, record, duplicateOfSeq: existingSeq }
+    }
+    const seq = record.seq > this.maxSeq ? record.seq : this.maxSeq + 1
+    const stored: JournalRecord = {
+      v: 1,
+      seq,
+      at: record.at,
+      idempotencyKey: record.idempotencyKey,
+      op: record.op,
+    }
+    const line = encodeRecord(stored)
+    const bytes = Buffer.byteLength(line, 'utf8')
+    // 当前片已写满（且不是空片）才滚动，否则单条超大记录会陷入「每行一片」。
+    if (this.shardIndex === 0 || (this.shardBytes > 0 && this.shardBytes + bytes > this.segmentBytes)) {
+      this.shardIndex += 1
+      this.shardBytes = 0
+    }
+    const path = join(this.dir, shardFileName(this.shardIndex))
+    const fd = openSync(path, 'a')
+    try {
+      writeSync(fd, line)
+      if (this.fsyncOnWrite) fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    this.shardBytes += bytes
+    this.maxSeq = seq
+    this.total += 1
+    this.seenKeys.add(stored.idempotencyKey)
+    this.keySeq.set(stored.idempotencyKey, seq)
+    return { appended: true, record: stored }
+  }
+
+  /**
+   * 按分片顺序、行顺序读出全部记录。
+   *
+   * 坏行与空行被跳过：宁可少一条，也不让整库打不开。
+   *
+   * @returns 记录数组。
+   */
+  readAll(): JournalRecord[] {
+    this.ensureOpen()
+    const records: JournalRecord[] = []
+    for (const file of listShardFiles(this.dir)) {
+      const text = readFileSync(join(this.dir, file), 'utf8')
+      for (const line of text.split('\n')) {
+        const record = decodeRecord(line)
+        if (record !== null) records.push(record)
+      }
+    }
+    return records
+  }
+
+  /**
+   * 当前最大序号；空日志为 0。
+   *
+   * @returns 序号水位。
+   */
+  lastSeq(): number {
+    this.ensureOpen()
+    return this.maxSeq
+  }
+
+  /**
+   * 已落盘记录条数。
+   *
+   * @returns 条数。
+   */
+  count(): number {
+    this.ensureOpen()
+    return this.total
+  }
+
+  /**
+   * 判断幂等键是否已出现过。
+   *
+   * @param key - 幂等键。
+   * @returns 是否已见。
+   */
+  hasKey(key: string): boolean {
+    this.ensureOpen()
+    return this.seenKeys.has(key)
+  }
+
+  /**
+   * 关闭日志。
+   *
+   * 每次写入都是「打开—写入—fsync—关闭」，不持有常驻文件句柄，
+   * 因此这里只需把打开标记复位，便于同一实例重复使用。
+   */
+  close(): void {
+    this.opened = false
+  }
+
+  /** 懒打开，避免调用方漏调 {@link open}。 */
+  private ensureOpen(): void {
+    if (!this.opened) this.open()
+  }
+
+  /**
+   * 截断尾部残缺行。
+   *
+   * @param path - 分片文件绝对路径。
+   */
+  private repairTail(path: string): void {
+    const text = readFileSync(path, 'utf8')
+    if (text.length === 0 || text.endsWith('\n')) return
+    const cut = text.lastIndexOf('\n') + 1
+    truncateSync(path, Buffer.byteLength(text.slice(0, cut), 'utf8'))
+  }
+}

@@ -91,7 +91,8 @@ export function gateTurn(
     : []
 
   const signals = [...new Set([...userSignals, ...assistantSignals])]
-  const pass = userSignals.length > 0 || (userLong && userSignals.length > 0) || (userLong && assistantLong)
+  // 三选一：用户侧有信号、助手侧有信号、或双方都足够长（信息量够）。
+  const pass = signals.length > 0 || (userLong && assistantLong)
   return { pass, signals }
 }
 
