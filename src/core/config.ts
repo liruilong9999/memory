@@ -345,15 +345,12 @@ export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConf
     debugExplain: override.debugExplain ?? base.debugExplain,
   }
   // 数组字段必须整体替换，浅合并会让用户的自定义关键词被默认值覆盖。
-  if (override.forgetting?.neverArchiveKinds !== undefined) {
-    merged.forgetting.neverArchiveKinds = [...override.forgetting.neverArchiveKinds]
-  }
-  if (override.extraction?.domains !== undefined) {
-    merged.extraction.domains = [...override.extraction.domains]
-  }
-  if (override.extraction?.signalKeywords !== undefined) {
-    merged.extraction.signalKeywords = [...override.extraction.signalKeywords]
-  }
+  // 而且**无论覆盖与否都要复制**：直接沿用 base 的数组会让结果与 DEFAULT_CONFIG
+  // 共享引用，调用方一句 `push` 就能污染全局默认值（跨测试、跨插件实例串味）。
+  merged.forgetting.neverArchiveKinds = [...(override.forgetting?.neverArchiveKinds ?? base.forgetting.neverArchiveKinds)]
+  merged.extraction.domains = [...(override.extraction?.domains ?? base.extraction.domains)]
+  merged.extraction.signalKeywords = [...(override.extraction?.signalKeywords ?? base.extraction.signalKeywords)]
+  merged.extraction.dueKeywords = [...(override.extraction?.dueKeywords ?? base.extraction.dueKeywords)]
   return merged
 }
 
