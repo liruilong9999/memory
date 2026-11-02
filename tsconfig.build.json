@@ -2,7 +2,7 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true,
     "declaration": true,
     "declarationMap": false,
     "sourceMap": false,

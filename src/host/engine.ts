@@ -23,7 +23,9 @@ import type {
 } from '../core/types.ts'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import type { MemoryStore } from '../store/store.ts'
-import { buildTimeState, pickDue, renderTimeContext } from '../time/clock.ts'
+import {
+  buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
+} from '../time/clock.ts'
 
 /** 引擎参数。 */
 export interface EngineOptions {
@@ -229,6 +231,59 @@ export class MemoryEngine {
       detail: { ...report },
     })
     return report
+  }
+
+  /**
+   * 取当前时刻（宿主无关，便于上层注入假时钟）。
+   *
+   * @returns 毫秒时间戳。
+   */
+  now(): number {
+    return this.clock()
+  }
+
+  /**
+   * 取指定时刻在本引擎时区下的本地日期（`YYYY-MM-DD`）。
+   *
+   * 夜整理用它判断「今天是否已经整理过」（FR-C1 / 起源第 4 条）。
+   *
+   * @param at - 毫秒时间戳。
+   * @returns 本地日期字符串。
+   */
+  localDate(at: number): string {
+    return formatLocalDate(at, this.timeZone)
+  }
+
+  /**
+   * 取「最近一条用户消息」作为召回查询。
+   *
+   * 为什么需要它：动态上下文的渲染函数在请求装配阶段被调用，此时拿不到
+   * 本轮请求文本，只能退回上一次交互的意图——这是最稳的近似（C7 下每轮重算）。
+   *
+   * @returns 查询文本；库里没有卡时为空串。
+   */
+  recentQuery(): string {
+    let latest: MemoryCard | null = null
+    for (const card of this.store.listCards({ status: 'active' })) {
+      if (latest === null || card.updatedAt > latest.updatedAt) latest = card
+    }
+    return latest?.text ?? ''
+  }
+
+  /**
+   * 从日志重建索引与状态（FR-F4）。
+   *
+   * 记忆卡是派生视图，日志才是唯一真相源（P2）。索引怀疑不一致时调它。
+   *
+   * @returns 重建摘要。
+   */
+  rebuild(): { records: number; active: number; archived: number } {
+    this.store.reload()
+    return {
+      records: this.store.count(),
+      active: this.store.count('active'),
+      archived: this.store.count('archived'),
+    }
   }
 
   /**

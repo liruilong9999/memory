@@ -1,0 +1,19 @@
+# dsh-memory 的 Cordis bundle patch。
+#
+# 本插件只插入一行：一个 Host 插件，把记忆系统挂到宿主上。
+# 它不替换、不禁用任何已有行，所以与其它 bundle 叠加是安全的。
+#
+# config 里的字段会深合并到 src/core/config.ts 的 DEFAULT_CONFIG 之上，
+# 因此这里只写「与默认值不同」的项。数据目录留空表示用默认的 .dsh-memory。
+
+- insert:
+    - id: memory
+      name: dsh-memory
+      config:
+        storage:
+          # 记忆库放在工作区的隐藏目录，随项目走，不污染用户主目录。
+          dataDir: .dsh-memory
+        consolidation:
+          # 起源第 4 条：夜晚休眠整理。03:30 是本地时间，由宿主机时区解释。
+          enabled: true
+          dailyAt: '03:30'
