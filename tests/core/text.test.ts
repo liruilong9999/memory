@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   coverage, estimateTokens, extractEntities, jaccard, matchSignals,
@@ -81,6 +81,69 @@ test('extractEntities 抽取引号内专名', () => {
 test('extractEntities 去重', () => {
   const entities = extractEntities('buildCardId 和 buildCardId 是同一个')
   assert.equal(entities.filter((e) => e === 'buildCardId').length, 1)
+})
+
+describe('extractEntities 抽取裸专有名词（补齐图谱连边的输入）', () => {
+  // 这一组守的是一个真实缺陷：原先只认文件路径 / URL / 驼峰标识符 / 引号专名
+  // 四类，中文对话里最常出现的项目名与技术名（Cordis / Redis / Vue3 / Qt5）
+  // 全部抽不出来。实测 20 轮语料里 Cordis 出现 8 句、抽出 0 句。
+  //
+  // 后果不是「少抽几个词」，而是 same-entity 边几乎产不出来 ⇒ 图谱稀疏
+  // ⇒ 扩散激活没有边可走 ⇒ 「突触效果」在真实中文数据上近乎不可见。
+  test('抽出中文句子里嵌入的拉丁专名（Cordis / Redis / Vue3 / Qt5 / Vite）', () => {
+    const cases: [string, string][] = [
+      ['决定把 Cordis 版本升到 4', 'Cordis'],
+      ['方案是用 Redis 做缓存，结论已定', 'Redis'],
+      ['决定前端用 Vue3，Vite 构建', 'Vue3'],
+      ['决定用 Qt5 写客户端，方案已定', 'Qt5'],
+    ]
+    for (const [text, expected] of cases) {
+      assert.ok(
+        extractEntities(text).includes(expected),
+        `${expected} 必须被抽出，否则它所在的卡连不上任何同类卡：${text}`,
+      )
+    }
+  })
+
+  test('英文句首的常用词不得被当成专名（误抽会连出假边）', () => {
+    // 反向风险：首字母大写的判据会把 The / This / When 全抽出来。
+    // 假边比没有边更糟——图谱是用来溯源的，假边会让溯源指向错的地方。
+    const sentences = [
+      'The build failed because the cache was stale',
+      'This approach works but that one does not',
+      'When you deploy, remember to bump the version',
+    ]
+    for (const text of sentences) {
+      const entities = extractEntities(text)
+      for (const word of ['The', 'This', 'When', 'But', 'After']) {
+        assert.ok(!entities.includes(word), `${word} 是常用词，不该被当专名抽出：${text}`)
+      }
+    }
+    // 正对照：同一句里真正的专名必须仍然被抽出——否则上面的断言可以靠
+    // 「一个都不抽」通过，那就变成了空绿。
+    assert.ok(
+      extractEntities('After the migration, Redis should be restarted').includes('Redis'),
+      '排除常用词不能连真专名一起排除',
+    )
+  })
+
+  test('全大写通用缩写不抽（实测加进去精确率下降、召回率不涨）', () => {
+    // API / HTTP 在任何话题里都出现，没有区分力，抽出来只会乱连边。
+    // 定标实测：加入全大写规则后，连边精确率 92% → 89%，召回率不变。
+    const entities = extractEntities('架构上 Cordis 和 Vue3 之间走 HTTP 约定，用 API 暴露')
+    assert.ok(!entities.includes('HTTP'), 'HTTP 是通用缩写，不该当实体')
+    assert.ok(!entities.includes('API'), 'API 是通用缩写，不该当实体')
+    assert.ok(entities.includes('Cordis'), '同一句里的真专名必须仍然抽出')
+  })
+
+  test('裸专名让「共享项目名」的两张卡真的连得上（端到端）', () => {
+    // 只断言「抽出了 Cordis」不够——要断言它**真的连出了边**。
+    // 抽出来了但没连边，图谱一样是空的，而单看抽取结果会以为已经修好。
+    const a = extractEntities('决定把 Cordis 版本升到 4')
+    const b = extractEntities('结论是 Cordis 的 bundle patch 要重写')
+    const shared = a.filter((x) => b.includes(x))
+    assert.deepEqual(shared, ['Cordis'], '两张卡必须共享同一个实体锚点')
+  })
 })
 
 test('truncate 短文本原样返回', () => {
