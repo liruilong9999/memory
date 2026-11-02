@@ -194,7 +194,10 @@ export function spreadActivation(
   config: MemoryConfig,
 ): SpreadBoost[] {
   const sp = config.spread
-  if (!sp.enabled) return []
+  // 只有 `off` 才跳过计算。`shadow` **必须照常算**——影子模式的全部价值
+  // 在于它算的是真账；若它跳过计算再返回空，那它观察到的永远是「无变化」，
+  // 用这种数据攒出来的证据不足以支撑任何决定。
+  if (sp.mode === 'off') return []
   if (seeds.length === 0) return []
 
   // 护栏下限：自身分数必须达到 absoluteThreshold × minSelfScoreRatio。

@@ -15,6 +15,7 @@
 import type { MemoryConfig } from './config.ts'
 import { applySpread, buildAdjacency, spreadActivation } from './spread.ts'
 import { coverage, estimateTokens, tokenSet, truncate } from './text.ts'
+import type { SpreadBoost } from './spread.ts'
 import type {
   FocusPack, MemoryCard, MemoryEdge, ScoreBreakdown, ScoredCard, TimeState,
 } from './types.ts'
@@ -365,7 +366,7 @@ export function scoreCards(
     if (b.score.total !== a.score.total) return b.score.total - a.score.total
     return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
   })
-  if (edges.length === 0 || !config.spread.enabled) return scored
+  if (edges.length === 0 || config.spread.mode === 'off') return scored
   return mergeSpread(scored, edges, config)
 }
 
@@ -379,19 +380,50 @@ export function scoreCards(
  * 会把自己的弱激活撒给邻居，扩散就从「强化确定命中」退化成「放大噪声」。
  * 阈值在这里被复用为「值得传播」的判据，与它「值得展示」的判据一致。
  *
+ * ## 影子模式（`mode === 'shadow'`）怎么工作
+ *
+ * 扩散**照常计算**，但结果只写进 `shadowSpread` 字段，**不动 `score.total`、
+ * 不动排序**。返回的数组与 `off` 模式逐位相同，唯一区别是多了观察值。
+ *
+ * 为什么不让影子模式「只算一半」：影子模式的全部价值在于它算的是**真账**。
+ * 若它用了不同的种子集合或不同的护栏，那它预测的就不是「打开后会怎样」，
+ * 而是一个近似值——用近似值攒出来的证据，不足以支撑「该不该打开」的决定。
+ *
  * 需求 FR-G1；护栏见 `SpreadPolicy.minSelfScoreRatio`。
  *
  * @param scored - 已按自身分数排序的候选。
  * @param edges - 全部图谱边。
  * @param config - 配置。
- * @returns 合并扩散加分并重新排序的结果。
+ * @returns 合并扩散加分并重新排序的结果（影子模式下只附加观察值）。
  */
 function mergeSpread(
   scored: readonly ScoredCard[], edges: readonly MemoryEdge[], config: MemoryConfig,
 ): ScoredCard[] {
   const selfScores = new Map(scored.map((item) => [item.card.id, item.score.total]))
+  // 种子判据用 **seedRatio**，且门槛是**相对本次最高分**，不是绝对阈值。
+  //
+  // ## 这里曾经让整个机制在数学上恒为空（被实测抓出的设计缺陷）
+  //
+  // 最初是 `total >= absoluteThreshold`，与加分护栏
+  // （`absoluteThreshold * minSelfScoreRatio`，校验强制 ≥ 1）**恰好相等**：
+  //   能加分的卡一定已经是种子 → 而种子不因扩散加分 → boost 恒为空集。
+  // 31 条单测全绿，因为它们各自构造了现实链路里不可能出现的状态。
+  //
+  // 第一次修复改成「阈值 × 倍数」（0.18 × 1.5 = 0.27），**实测仍然恒空**。
+  // 原因是打分有基础分下限：完全不相关的两句话也有 0.33 左右
+  // （importance / recency / confidence 各贡献一份），而 0.18 永远拦不住
+  // 任何卡。实测 12 个样本最低 0.3295，无一低于 0.18。
+  // **任何「阈值 × 倍数」的门槛都会落在所有卡之下。**
+  //
+  // ## 现在的做法：相对最高分
+  //
+  // 门槛 = 本轮候选池最高分 × seedRatio。无量纲，自动跟随本轮分数分布：
+  // 查询精确时门槛高，模糊时门槛低。它衡量的不是「够不够格」，而是
+  // 「在本轮里够不够强」——那才是「值得把激活撒出去」的判据。
+  const maxScore = scored.reduce((m, item) => (item.score.total > m ? item.score.total : m), 0)
+  const seedFloor = maxScore * config.spread.seedRatio
   const seeds = scored
-    .filter((item) => item.score.total >= config.recall.absoluteThreshold)
+    .filter((item) => item.score.total >= seedFloor)
     .map((item) => ({ id: item.card.id, score: item.score.total }))
   // 邻接表按**全部边**构造：扩散才能从候选卡走到「本轮没被检索命中」的邻居。
   // 但结果只对候选池内的卡生效——`selfScores` 里没有的卡会被护栏挡掉。
@@ -401,12 +433,70 @@ function mergeSpread(
   // 已排序数组，行为与不启用扩散时完全一致（零回归）。
   if (boosts.length === 0) return [...scored]
 
+  if (config.spread.mode === 'shadow') return attachShadow(scored, boosts)
+
   const applied = applySpread(scored, boosts)
   applied.sort((a, b) => {
     if (b.score.total !== a.score.total) return b.score.total - a.score.total
     return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
   })
   return applied
+}
+
+/**
+ * 影子模式：算出「假设打开扩散会怎样」，但**不改动排序**。
+ *
+ * 返回的数组与入参**顺序完全相同**，只在每张卡上附加 `shadowSpread`。
+ *
+ * ## 为什么要同时给出 `actualRank` 和 `hypotheticalRank`
+ *
+ * 只给 boost 不足以判断影响：+0.05 的加分作用在第一名身上毫无意义，
+ * 作用在阈值边缘的卡上可能让它直接挤进焦点包。**扩散真正的影响是排序变化，
+ * 不是分数变化。** 两个排名放在一起，一眼就能看出这次扩散到底改变了什么。
+ *
+ * 排序键与真实链路（`applySpread` 之后那次 sort）**必须完全一致**：
+ * 分数降序 + id 升序。若这里用了不同的 tie-break，影子模式算出的排名
+ * 与真打开后的排名会对不上，那份证据就废了。
+ *
+ * @param scored - 已按自身分数排序的候选。
+ * @param boosts - 扩散结果。
+ * @returns 顺序不变、每张卡带影子观察值的结果。
+ */
+function attachShadow(
+  scored: readonly ScoredCard[], boosts: readonly SpreadBoost[],
+): ScoredCard[] {
+  const applied = applySpread(scored, boosts)
+  const hypothetical = [...applied].sort((a, b) => {
+    if (b.score.total !== a.score.total) return b.score.total - a.score.total
+    return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
+  })
+  const hypotheticalRank = new Map(hypothetical.map((item, index) => [item.card.id, index + 1]))
+  const actualRank = new Map(scored.map((item, index) => [item.card.id, index + 1]))
+  // 原总分从 `scored` 里取，**不用减法还原**：`applySpread` 内部有 `clamp01`，
+  // 分数本来接近 1 时加分会先被截断，`total - boost` 得不到原值。
+  // 这种误差在正常分数区间（0.2~0.6）看不出来，只在边界上出现——
+  // 正是最难发现的那一类，所以从一开始就不走这条路。
+  const originalTotal = new Map(scored.map((item) => [item.card.id, item.score.total]))
+  return applied.map((item) => {
+    const base = originalTotal.get(item.card.id) ?? item.score.total
+    const restored = { ...item, score: { ...item.score, total: base } }
+    // 只有**真的被扩散推动**的卡才留观察值。
+    //
+    // `applySpread` 会给每张卡都挂 `spreadBoost: 0`，若照搬就会让所有卡都带
+    // 一条 `boost: 0` 的影子记录——那会把「观察到了什么」和「什么都没发生」
+    // 混成同一件事。观察值非空必须等价于「扩散对这张卡有意见」。
+    if (item.spreadBoost <= 0) return restored
+    return {
+      ...restored,
+      shadowSpread: {
+        boost: item.spreadBoost,
+        sources: item.spreadSources,
+        hypotheticalTotal: item.score.total,
+        hypotheticalRank: hypotheticalRank.get(item.card.id) ?? 0,
+        actualRank: actualRank.get(item.card.id) ?? 0,
+      },
+    }
+  })
 }
 
 /**

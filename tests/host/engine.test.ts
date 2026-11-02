@@ -697,7 +697,7 @@ describe('图谱扩散不写库（FR-G1 / 起源 L29）', () => {
     // 真正能发现问题的是「库里的边权/边数有没有变」，那需要真实 store + 日志。
     const dir = tempDir()
     const config = makeConfig({
-      spread: { enabled: true, plasticityEnabled: true },
+      spread: { mode: 'on', plasticityEnabled: true },
     })
     const store = openStore({ dataDir: dir, config })
     const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })

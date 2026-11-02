@@ -273,14 +273,36 @@ export interface MemoryConfig {
  * 这里提前实现的是它的**规则部分**（扩散、可塑性、剪枝），不含任何语义判断
  * （`causes` / `part-of` / `contrasts` 三类语义边仍然无产出点，见 `types.ts`）。
  */
+/**
+ * 扩散激活的工作模式。
+ *
+ * 三种状态互斥，用一个字段表达而不是两个布尔（`enabled` + `shadow`）：
+ * 后者能造出「关掉了但还在影子计算」这种自相矛盾的组合，
+ * 而互斥的字符串联合从类型上就不允许它存在。
+ *
+ * - `off`：完全不计算扩散。链路退化成「只看单卡分数」，
+ *   与引入本功能之前逐位相同（FR-F4 可回滚）。
+ * - `shadow`：**照常计算，但不改变召回结果**。扩散会算出「哪些卡本该
+ *   被提权、提了多少、因为谁」，这些信息进 `explain` 与日志，
+ *   排序与注入内容一字不动。
+ * - `on`：扩散真实参与排序。
+ *
+ * 为什么需要 `shadow`：FR-G1 的触发条件是「积累了 2 周真实数据」，
+ * 而现在一条真实数据都没有。`on` 等于让一个未经检验的机制悄悄改变
+ * 每一次召回；`off` 又等于永远无法积累「它到底会怎么改」的证据——
+ * 而那份证据正是判断该不该打开它的依据。`shadow` 让两者同时成立：
+ * **可见，但不生效。**
+ */
+export type SpreadMode = 'off' | 'shadow' | 'on'
+
 export interface SpreadPolicy {
   /**
-   * 是否启用扩散激活。
+   * 扩散激活的工作模式，见 {@link SpreadMode}。
    *
-   * 关掉时 `spreadScores` 原样返回，整条链路退化成「只看单卡分数」，
-   * 与引入本功能之前的行为完全一致——这是可回滚的开关（FR-F4）。
+   * 默认 `'shadow'`：能看见扩散想做什么，但不让它改变召回结果。
+   * 这是「可回滚开关」（FR-F4）与「未验证不上生产」两条约束的交点。
    */
-  enabled: boolean
+  mode: SpreadMode
   /**
    * 每跳衰减系数（0..1）。
    *
@@ -305,6 +327,54 @@ export interface SpreadPolicy {
    * 「扩散可以帮忙排序，但不能让一张本来不合格的卡合格」。
    */
   minSelfScoreRatio: number
+  /**
+   * 成为**种子**所需的分数下限，**相对本次候选池的最高分**（0 < seedRatio < 1）。
+   *
+   * ## 为什么这个参数必须存在（这是一个被实测抓出来的设计缺陷）
+   *
+   * 最初的实现里种子判据是 `total >= absoluteThreshold`，而加分护栏是
+   * `selfScore >= absoluteThreshold * minSelfScoreRatio`，且
+   * `minSelfScoreRatio` 被校验强制 ≥ 1。于是：
+   *
+   * ```text
+   * 加分门槛 (0.18 × 1 = 0.18)  ≥  种子门槛 (0.18)
+   * ⇒ 能加分的卡一定已经是种子
+   * ⇒ 而种子自己不因扩散加分
+   * ⇒ boost 恒为空集
+   * ```
+   *
+   * **整个扩散机制在数学上恒为空。** 31 条单测全绿，因为它们各自构造了
+   * 现实链路里不可能出现的状态（把「谁是种子」和「谁被加分」分开造）。
+   * 反向验证时把种子判据改成恒 false，只有 2 条断言变红——原本那条
+   * 「扩散能把卡推进焦点包」写的是 `after >= before`，等式成立也算通过。
+   *
+   * ## 为什么不能用「绝对阈值 × 倍数」来标定种子
+   *
+   * 第一次修复时我改成 `seedRatio = 1.5`（门槛 0.18 × 1.5 = 0.27），
+   * 实测**仍然是空集**。原因是打分有基础分下限：即使完全不相关的两句话，
+   * 分数也在 0.33 左右（importance / recency / confidence 三项各贡献一份），
+   * 而 `absoluteThreshold = 0.18` **永远拦不住任何卡**。实测 12 个样本
+   * 最低 0.3295，无一低于 0.18。
+   *
+   * 所以任何「阈值 × 倍数」形式的门槛都会落在所有卡之下，全部卡都成种子，
+   * 扩散依然恒空。**绝对量标定在这个打分公式下没有意义。**
+   *
+   * ## 正解：相对本次最高分
+   *
+   * 种子门槛 = `max(候选池总分) × seedRatio`。这是无量纲量，自动跟着
+   * 本轮查询的分数分布走：查询精确时最高分高，门槛也高；查询模糊时
+   * 最高分低，门槛也低。它衡量的不是「这张卡够不够格」，而是
+   * **「这张卡在本轮里够不够强」**——这正是「值得把自己的激活撒出去」的判据。
+   *
+   * ## 为什么两端都必须开区间（0 < seedRatio < 1）
+   *
+   * 两端各自会让扩散退化，且退化后**看不出异常**：
+   * - `>= 1`：门槛不低于最高分，可能没有卡够格 ⇒ 没有种子 ⇒ 无激活源。
+   * - `<= 0`：所有卡都是种子 ⇒ 没有「非种子」可被推动 ⇒ 无受益者。
+   *
+   * 由配置校验强制。默认 0.85：只有分数接近本轮最高分的那几张才算强命中。
+   */
+  seedRatio: number
   /**
    * 同一次召回中，扩散最多影响多少张卡。
    *
@@ -346,7 +416,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 4,
+  configVersion: 5,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -438,15 +508,31 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     pollMs: 60 * 1000,
   },
   spread: {
-    // 默认**关闭**。理由：FR-G1 的触发条件是「稳定记忆跑通、积累了 2 周真实数据」，
-    // 现在一条真实数据都没有。默认开启等于让一个未经真实数据检验的机制
-    // 悄悄改变每一次召回的排序——而且改得不多，正是最难发现的那一类。
-    // 开关留在这里，打开它是一次显式决定，不是继承来的默认。
-    enabled: false,
+    // 默认 `'shadow'`：**计算但不生效**。
+    //
+    // 为什么不默认 `'on'`：FR-G1 的触发条件是「稳定记忆跑通、积累了 2 周
+    // 真实数据」，现在一条真实数据都没有。默认开启等于让一个未经检验的
+    // 机制悄悄改变每一次召回的排序——而且改得不多，正是最难发现的那一类。
+    //
+    // 为什么不默认 `'off'`：关掉就永远拿不到「它到底会怎么改」的证据，
+    // 而那份证据恰恰是判断该不该打开它的唯一依据。关闭状态下的「没出问题」
+    // 不能证明任何事——它压根没跑。
+    //
+    // `'shadow'` 同时解决这两件事：算出来、记下来、**但排序不动**。
+    // 攒够数据后把它改成 `'on'` 是一次显式决定，不是继承来的默认。
+    mode: 'shadow',
     hopDecay: 0.5,
     maxHops: 2,
     maxBoost: 0.12,
     minSelfScoreRatio: 1,
+    // 种子门槛 = 本轮最高分 × 0.85。为什么是相对量：打分有基础分下限
+    // （无关文本也有 0.33 左右），任何绝对门槛都会落在所有卡之下，扩散恒空
+    // ——详见 SpreadPolicy.seedRatio 的推导与实测数据。
+    //
+    // 为什么不是 0.5：门槛太低会把半匹配的卡也算成种子，它们本就该被扩散
+    // 推动，却被当成激活源，扩散就失去推动对象了。0.85 只让接近本轮最高分
+    // 的那几张当种子。
+    seedRatio: 0.85,
     maxAffected: 5,
     distillBidirectional: true,
     plasticityEnabled: false,
@@ -460,7 +546,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 4
+export const MEMORY_CONFIG_VERSION = 5
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -569,6 +655,11 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   // 图谱扩散（FR-G1）。这里的每条约束都对应一种「扩散会把召回带坏」的具体方式，
   // 不是形式化的范围检查——写校验时逐条想清楚了它拦住的是哪种坏结果。
   const sp = config.spread
+  // mode 是字符串联合，TS 已经挡住非法值；但配置可能来自 JSON / 宿主 schema，
+  // 运行时是 `unknown`。校验层是最后一道闸，所以这里仍要检查一次。
+  if (sp.mode !== 'off' && sp.mode !== 'shadow' && sp.mode !== 'on') {
+    errors.push(`spread.mode 必须是 'off' / 'shadow' / 'on' 之一，实际为 ${String(sp.mode)}`)
+  }
   inUnit('spread.hopDecay', sp.hopDecay)
   inUnit('spread.maxBoost', sp.maxBoost)
   // hopDecay 必须严格小于 1：等于 1 时一跳传满，连通分量会被整体点亮，
@@ -585,6 +676,18 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   // 那会把 absoluteThreshold 的语义稀释掉（阈值本来是「这条记忆本身够不够格」）。
   if (sp.minSelfScoreRatio < 1) {
     errors.push('spread.minSelfScoreRatio 必须 ≥ 1（小于 1 会让不合格的卡靠邻居混进焦点包）')
+  }
+  // seedRatio 必须在开区间 (0, 1) 内，两端都会让扩散静默退化。
+  //
+  // 这条不是形式化的范围检查，它拦住的是一个已经发生过的真实缺陷：
+  // 种子门槛曾与加分护栏相等，能加分的卡一定已经是种子，而种子不加分，
+  // 于是 boost ⊆ ∅。当时 31 条单测全绿，因为没有任何一条走真实链路。
+  if (!(sp.seedRatio > 0) || !(sp.seedRatio < 1)) {
+    errors.push(
+      `spread.seedRatio 必须在开区间 (0, 1) 内（实际 ${sp.seedRatio}）；`
+      + '≥ 1 会没有卡够格当种子（无激活源），≤ 0 会让所有卡都是种子（无受益者），'
+      + '两种情况扩散都恒为空集且看不出异常',
+    )
   }
   if (!Number.isInteger(sp.maxAffected) || sp.maxAffected < 0) {
     errors.push('spread.maxAffected 必须是 ≥ 0 的整数')

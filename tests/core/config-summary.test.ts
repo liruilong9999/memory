@@ -62,7 +62,8 @@ describe('摘要配置的默认值与版本', () => {
     //   2 → 时间感与到期提醒参数
     //   3 → 摘要与蒸馏参数
     //   4 → 图谱扩散与突触可塑性参数（FR-G1）
-    assert.equal(MEMORY_CONFIG_VERSION, 4, '新增扩散与可塑性参数后版本应为 4')
+    //   5 → 扩散从布尔开关改成三态 mode（off / shadow / on），默认 shadow
+    assert.equal(MEMORY_CONFIG_VERSION, 5, '扩散改成三态 mode 后版本应为 5')
   })
 
   it('层级上限默认递增：日 > 周 > 月', () => {

@@ -323,3 +323,64 @@ describe('validateConfig 未覆盖分支', () => {
     expectSingleError((c) => { c.weights.recency = Number.POSITIVE_INFINITY }, 'weights.recency')
   })
 })
+
+/**
+ * `spread.seedRatio` 的校验。
+ *
+ * 这个参数是修一个真实缺陷时引入的：种子判据原本用 `absoluteThreshold`，
+ * 与加分护栏的门槛恰好相等，导致**扩散在数学上恒为空**，而 31 条单测全绿。
+ * 所以这条校验不是形式化的范围检查，它守的是「扩散不会静默失效」。
+ *
+ * 两端都会退化，且退化后**看不出异常**：
+ * - `>= 1`：没有卡够格当种子 → 无激活源。
+ * - `<= 0`：所有卡都是种子 → 无受益者。
+ */
+describe('validateConfig 的 spread.seedRatio', () => {
+  function base(): typeof DEFAULT_CONFIG {
+    return mergeConfig(DEFAULT_CONFIG)
+  }
+
+  it('默认配置的 seedRatio 在开区间 (0,1) 内', () => {
+    const r = validateConfig(base())
+    assert.equal(r.ok, true, `默认配置必须合法：${r.errors.join(' / ')}`)
+    assert.ok(
+      DEFAULT_CONFIG.spread.seedRatio > 0 && DEFAULT_CONFIG.spread.seedRatio < 1,
+      `默认 seedRatio 必须在 (0,1) 内，实际 ${DEFAULT_CONFIG.spread.seedRatio}`,
+    )
+  })
+
+  it('seedRatio = 1 时报错（没有卡够格当种子）', () => {
+    const config = base()
+    config.spread.seedRatio = 1
+    const result = validateConfig(config)
+    assert.equal(result.ok, false)
+    assert.ok(
+      result.errors.some((e) => e.includes('seedRatio')),
+      `错误必须提到 seedRatio，实际：${result.errors.join(' / ')}`,
+    )
+  })
+
+  it('seedRatio > 1 时报错', () => {
+    const config = base()
+    config.spread.seedRatio = 1.5
+    const result = validateConfig(config)
+    assert.equal(result.ok, false)
+    assert.ok(result.errors.some((e) => e.includes('seedRatio')))
+  })
+
+  it('seedRatio = 0 时报错（所有卡都是种子）', () => {
+    const config = base()
+    config.spread.seedRatio = 0
+    const result = validateConfig(config)
+    assert.equal(result.ok, false)
+    assert.ok(result.errors.some((e) => e.includes('seedRatio')))
+  })
+
+  it('seedRatio 为负数时报错', () => {
+    const config = base()
+    config.spread.seedRatio = -0.5
+    const result = validateConfig(config)
+    assert.equal(result.ok, false)
+    assert.ok(result.errors.some((e) => e.includes('seedRatio')))
+  })
+})

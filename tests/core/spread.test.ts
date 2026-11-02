@@ -35,11 +35,12 @@ import type { MemoryEdge } from '../../src/core/types.ts'
 function spreadConfig(over: Partial<MemoryConfig['spread']> = {}): MemoryConfig {
   return makeConfig({
     spread: {
-      enabled: true,
+      mode: 'on',
       hopDecay: 0.5,
       maxHops: 2,
       maxBoost: 0.12,
       minSelfScoreRatio: 1,
+      seedRatio: 0.85,
       maxAffected: 5,
       distillBidirectional: true,
       plasticityEnabled: true,
@@ -62,7 +63,7 @@ function edge(
 
 describe('扩散激活（FR-G1）', () => {
   it('关闭时原样返回空结果，整条链路退化到引入本功能之前', () => {
-    const config = makeConfig({ spread: { enabled: false } })
+    const config = makeConfig({ spread: { mode: 'off' } })
     const adjacency = buildAdjacency([edge('a', 'b')])
     const seeds: SpreadSeed[] = [{ id: 'a', score: 0.9 }]
     const boosts = spreadActivation(seeds, adjacency, new Map([['b', 0.5]]), config)
@@ -283,22 +284,52 @@ describe('边关系是否参与扩散（FR-G1）', () => {
 })
 
 describe('把扩散结果合并进打分（FR-G1 / FR-B2）', () => {
-  it('扩散在阈值截断之前生效，能把卡推进焦点包', () => {
-    // b 自身分数低于绝对阈值，靠扩散仍不够（护栏会挡）；所以这里验证的是
-    // 「本来就合格但排名靠后的卡，扩散后排名上升」。
-    const config = spreadConfig({ maxBoost: 0.12 })
-    const a = makeCard({ id: 'a', text: '项目 alpha 的部署方案' })
-    const b = makeCard({ id: 'b', text: '项目 beta 的测试计划' })
-    const query = makeQuery('alpha', config, 1000)
-    const noSpread = scoreCards([a, b], query, config, [])
-    const withSpread = scoreCards([a, b], query, config, [edge('a', 'b', 'same-entity', 1)])
-    const bBefore = noSpread.find((x) => x.card.id === 'b')?.score.total ?? 0
-    const bAfter = withSpread.find((x) => x.card.id === 'b')?.score.total ?? 0
-    assert.ok(bAfter >= bBefore, `b 的分数不应下降：${bBefore} → ${bAfter}`)
+  it('扩散真的把排名靠后的卡提了分（断言严格上升，不是「没下降」）', () => {
+    // 这条测试曾经写的是 `assert.ok(bAfter >= bBefore)`，**等式成立也算通过**。
+    // 而当时扩散在真实链路上恒为空（种子判据 0.18 低于所有卡的基础分下限，
+    // 所有卡都是种子、种子不加分），所以 bAfter === bBefore，它一直绿着，
+    // 却从没守过任何东西。反向验证把种子判据改坏，它也不红。
+    //
+    // 现在断言**严格上升**，并且同时断言「谁被加分」符合种子规则：
+    // 只有过了 seedRatio 门槛的最高分卡当种子，其余卡才是受益者。
+    const config = spreadConfig({ maxBoost: 0.12, seedRatio: 0.85 })
+    const a = makeCard({ id: 'a', text: 'Cordis 版本' })
+    const b = makeCard({ id: 'b', text: 'Cordis' })
+    const c = makeCard({ id: 'c', text: '无关的做饭记录' })
+    const query = makeQuery('Cordis 版本', config, 1000)
+    const noSpread = scoreCards([a, b, c], query, config, [])
+    const withSpread = scoreCards([a, b, c], query, config, [
+      edge('a', 'b', 'same-entity', 0.9),
+      edge('a', 'c', 'same-entity', 0.9),
+    ])
+    const total = (list: typeof noSpread, id: string) =>
+      list.find((x) => x.card.id === id)?.score.total ?? 0
+
+    // 前提：a 必须是唯一够格当种子的卡（否则下面的断言守不住种子规则）。
+    const maxScore = Math.max(...noSpread.map((x) => x.score.total))
+    assert.equal(total(noSpread, 'a'), maxScore, '前提：a 是本轮最高分')
+    assert.ok(
+      total(noSpread, 'b') < maxScore * config.spread.seedRatio,
+      '前提：b 必须够不到种子门槛，才可能是扩散的受益者',
+    )
+
+    assert.ok(
+      total(withSpread, 'b') > total(noSpread, 'b'),
+      `b 的分数必须严格上升：${total(noSpread, 'b')} → ${total(withSpread, 'b')}`,
+    )
+    assert.ok(
+      total(withSpread, 'c') > total(noSpread, 'c'),
+      `c 的分数必须严格上升：${total(noSpread, 'c')} → ${total(withSpread, 'c')}`,
+    )
+    // 种子自己不因扩散加分（否则等于「命中自己还额外奖励」，重复计分）。
+    assert.equal(
+      total(withSpread, 'a'), total(noSpread, 'a'),
+      '种子卡 a 不得因扩散加分',
+    )
   })
 
   it('关闭扩散时，传不传边集结果完全一致（零回归保证）', () => {
-    const config = makeConfig({ spread: { enabled: false } })
+    const config = makeConfig({ spread: { mode: 'off' } })
     const a = makeCard({ id: 'a', text: '项目 alpha 部署' })
     const b = makeCard({ id: 'b', text: '项目 beta 测试' })
     const query = makeQuery('alpha', config, 1000)
@@ -408,17 +439,59 @@ describe('buildAdjacency（FR-G1）', () => {
 })
 
 describe('默认配置的诚实性（FR-G1 / 起源 L15）', () => {
-  it('扩散与可塑性默认都关闭', () => {
-    // 这条测试守的不是行为，是**承诺**：FR-G1 位于需求规格 §7.7「后续扩展」，
-    // 触发条件是「稳定记忆跑通、积累了 2 周真实数据」。现在一条真实数据都没有，
-    // 默认开启等于让一个未经真实数据检验的机制悄悄改变每一次召回的排序——
-    // 而且改得不多，正是最难发现的那一类。
+  it('扩散默认是影子模式，可塑性默认未启用', () => {
+    // 这条测试守的不是行为，是**承诺**。
     //
-    // 它拦住的是这种改动：有人看到「扩散实现了、测试全绿」，觉得「那当然应该
-    // 默认开着」，顺手把 enabled 改成 true。那时所有测试仍然全绿（因为测试
-    // 自己造配置），真实召回的排序却已经悄悄变了。
-    assert.equal(DEFAULT_CONFIG.spread.enabled, false, '扩散默认必须关闭')
+    // FR-G1 位于需求规格 §7.7「后续扩展」，触发条件是「稳定记忆跑通、
+    // 积累了 2 周真实数据」。现在一条真实数据都没有，所以：
+    //   - 不能默认 `'on'`：那等于让一个未经检验的机制悄悄改变每一次召回的
+    //     排序，而且改得不多，正是最难发现的那一类；
+    //   - 也不能默认 `'off'`：关掉就永远拿不到「它到底会怎么改」的证据，
+    //     而那份证据正是判断该不该打开它的唯一依据。关闭状态下的「没出问题」
+    //     不能证明任何事——它压根没跑。
+    // 所以默认 `'shadow'`：算出来、记下来、排序不动。
+    //
+    // 它拦住的是这两种改动：有人看到「扩散实现了、测试全绿」，顺手把 mode
+    // 改成 `'on'`（所有测试仍绿，因为测试自己造配置，真实召回却已悄悄改变）；
+    // 或者有人为了「绝对安全」把 mode 改成 `'off'`，于是影子观察永久为零，
+    // 而没人会注意到「观测数据一直是空的」这件事本身是个问题。
+    assert.equal(DEFAULT_CONFIG.spread.mode, 'shadow', '扩散默认必须是影子模式')
     assert.equal(DEFAULT_CONFIG.spread.plasticityEnabled, false, '可塑性默认必须关闭')
+  })
+
+  it('影子模式默认值能真的产出观察数据（不是空转）', () => {
+    // 上面那条只断言了「默认值是 shadow」。默认值对，不代表**默认配置下
+    // 影子观察真的会发生**。
+    //
+    // 这条测试的来历值得记下来：它第一次写的时候只放了两张**分数相同**的卡，
+    // 于是两张都是种子、谁都不被加分，观察数为 0，测试红了。查下去才发现
+    // 真正的问题比测试红严重得多——当时种子判据用的是 `absoluteThreshold`
+    // （0.18），而打分有基础分下限（无关文本也有 0.33），0.18 永远拦不住
+    // 任何卡，**所有卡都是种子，扩散在真实链路上恒为空**，31 条单测却全绿。
+    //
+    // 所以这条用例的构造必须让「有种子、也有非种子」同时成立：三张卡分三档，
+    // 只有最高分那张过 seedRatio 门槛。
+    const config = DEFAULT_CONFIG
+    const now = 1000
+    const cards = [
+      makeCard({ id: 'a', text: 'Cordis 版本' }),
+      makeCard({ id: 'b', text: 'Cordis' }),
+      makeCard({ id: 'c', text: '无关的做饭记录' }),
+    ]
+    const edges = [
+      makeEdge('a', 'b', 'same-entity', 0.9, now),
+      makeEdge('a', 'c', 'same-entity', 0.9, now),
+    ]
+    const query = makeQuery('Cordis 版本', config, now)
+    const result = scoreCards(cards, query, config, edges)
+    const observed = result.filter((item) => item.shadowSpread !== undefined)
+    assert.ok(observed.length > 0, '前提：默认配置下影子模式必须真的观察到扩散')
+    // 观察到的卡，其实际总分必须与不传边时**逐位相同**——这是影子模式的定义。
+    const withoutEdges = scoreCards(cards, query, config, [])
+    for (const item of result) {
+      const plain = withoutEdges.find((x) => x.card.id === item.card.id)
+      assert.equal(item.score.total, plain?.score.total, `影子模式不得改动 ${item.card.id} 的实际总分`)
+    }
   })
 
   it('打分链路不改边权（纯函数性质）', () => {
@@ -437,5 +510,188 @@ describe('默认配置的诚实性（FR-G1 / 起源 L15）', () => {
     const before = edges.map((e) => e.weight)
     scoreCards([a, b], makeQuery('alpha', config, 1000), config, edges)
     assert.deepEqual(edges.map((e) => e.weight), before, '纯函数不得修改入参')
+  })
+})
+
+describe('影子模式（SpreadMode = shadow）', () => {
+  // 三张卡分三档：a 最高（唯一种子），b 次高（被 a 连，扩散的受益者），
+  // c 最低且孤立。
+  //
+  // `maxBoost` 必须足够大，让 b 加分后**真的超过** c —— 否则影子模式观察到
+  // 的排名永远不变，「actualRank vs hypotheticalRank」就永远看不出差异，
+  // 那几条断言也就守不住任何东西（反向验证时确实一条都没红）。
+  function shadowFixture(mode: MemoryConfig['spread']['mode']): {
+    config: MemoryConfig
+    cards: ReturnType<typeof makeCard>[]
+    edges: MemoryEdge[]
+    query: ReturnType<typeof makeQuery>
+  } {
+    const config = spreadConfig({ mode, maxBoost: 0.2 })
+    const cards = [
+      makeCard({ id: 'a', text: 'Cordis 版本' }),
+      makeCard({ id: 'b', text: 'Cordis' }),
+      makeCard({ id: 'c', text: 'Cordis 版本 3.2' }),
+    ]
+    const edges = [edge('a', 'b', 'same-entity', 1)]
+    return { config, cards, edges, query: makeQuery('Cordis 版本', config, 1000) }
+  }
+
+  it('影子模式算出真实加分，但实际总分与不传边时逐位相同', () => {
+    const { config, cards, edges, query } = shadowFixture('shadow')
+    const observed = scoreCards(cards, query, config, edges)
+    const plain = scoreCards(cards, query, config, [])
+    // 前提：影子模式必须真的算出了东西，否则下面「总分不变」是空转。
+    const withShadow = observed.filter((x) => x.shadowSpread !== undefined)
+    assert.ok(withShadow.length > 0, '前提：影子模式必须产出观察值')
+    for (const item of withShadow) {
+      assert.ok(item.shadowSpread!.boost > 0, '观察到的加分必须为正')
+      const p = plain.find((x) => x.card.id === item.card.id)
+      assert.equal(
+        item.score.total, p?.score.total,
+        `影子模式不得改动实际总分（${item.card.id}）`,
+      )
+    }
+  })
+
+  it('影子模式不改变排序：实际顺序与不传边时完全一致', () => {
+    const { config, cards, edges, query } = shadowFixture('shadow')
+    const observed = scoreCards(cards, query, config, edges).map((x) => x.card.id)
+    const plain = scoreCards(cards, query, config, []).map((x) => x.card.id)
+    assert.deepEqual(observed, plain, '影子模式不得改变排序')
+  })
+
+  it('影子模式记录的 hypotheticalRank 与真实 on 模式的排名一致', () => {
+    // 这是影子模式价值的核心：它观察到的「假如生效会怎样」必须是**真的**。
+    // 若 hypotheticalRank 与实际 on 模式的排名不一致，攒下的证据全是假的，
+    // 那么「攒够数据再决定是否打开」这条路就走不通。
+    const shadow = shadowFixture('shadow')
+    const on = shadowFixture('on')
+    const shadowResult = scoreCards(shadow.cards, shadow.query, shadow.config, shadow.edges)
+    const onResult = scoreCards(on.cards, on.query, on.config, on.edges)
+    const onRank = new Map(onResult.map((x, i) => [x.card.id, i + 1]))
+    for (const item of shadowResult) {
+      if (item.shadowSpread === undefined) continue
+      assert.equal(
+        item.shadowSpread.hypotheticalRank, onRank.get(item.card.id),
+        `${item.card.id} 的影子排名必须等于真实 on 模式的排名`,
+      )
+      const onTotal = onResult.find((x) => x.card.id === item.card.id)?.score.total ?? -1
+      assert.equal(
+        item.shadowSpread.hypotheticalTotal, onTotal,
+        `${item.card.id} 的影子总分必须等于真实 on 模式的总分`,
+      )
+    }
+  })
+
+  it('影子模式记录 actualRank，且 actualRank 与 hypotheticalRank 可分离', () => {
+    const { config, cards, edges, query } = shadowFixture('shadow')
+    const result = scoreCards(cards, query, config, edges)
+    const observed = result.filter((x) => x.shadowSpread !== undefined)
+    assert.ok(observed.length > 0, '前提：必须有观察值')
+    for (const item of observed) {
+      const actualIndex = result.findIndex((x) => x.card.id === item.card.id)
+      assert.equal(
+        item.shadowSpread!.actualRank, actualIndex + 1,
+        `${item.card.id} 的 actualRank 必须是它当前的真实位置（1-based）`,
+      )
+    }
+  })
+
+  it("关闭（off）时不产出任何观察值——没算就是没算，不能假装算过", () => {
+    const { config, cards, edges, query } = shadowFixture('off')
+    const result = scoreCards(cards, query, config, edges)
+    assert.equal(
+      result.filter((x) => x.shadowSpread !== undefined).length, 0,
+      'off 模式下 shadowSpread 必须全部为 undefined',
+    )
+  })
+
+  it("打开（on）时加分已折进总分，不再单独留观察值——避免两个真相来源", () => {
+    const { config, cards, edges, query } = shadowFixture('on')
+    const result = scoreCards(cards, query, config, edges)
+    assert.equal(
+      result.filter((x) => x.shadowSpread !== undefined).length, 0,
+      'on 模式下 shadowSpread 必须全部为 undefined（加分已在 total 里）',
+    )
+    // 同时证明 on 模式确实改了分（否则上一条断言可能只是因为什么都没算）。
+    const plain = scoreCards(cards, query, config, [])
+    const changed = result.some((item) => {
+      const p = plain.find((x) => x.card.id === item.card.id)
+      return p !== undefined && item.score.total !== p.score.total
+    })
+    assert.ok(changed, '前提：on 模式必须真的改变了某些卡的总分')
+  })
+
+  it('影子模式不污染 explain——人读渲染不得看到未生效的加分', () => {
+    // explain 会被 renderFocusPackExplain 打印给人和 CLI，
+    // 若把 hypothetical 数值写进 explain，读的人会以为它已经生效了。
+    //
+    // 注意：explain 是**字符串数组**（每个维度一行），必须 deepEqual 逐行比，
+    // 用 assert.equal 比的是数组引用，两个不同数组永远不相等——那条写法
+    // 会让这条测试在正确实现上也失败（我第一版就写错了）。
+    const { config, cards, edges, query } = shadowFixture('shadow')
+    const withEdges = scoreCards(cards, query, config, edges)
+    const plain = scoreCards(cards, query, config, [])
+    for (const item of withEdges) {
+      const p = plain.find((x) => x.card.id === item.card.id)
+      assert.deepEqual(item.explain, p?.explain, `影子模式不得改动 ${item.card.id} 的 explain`)
+    }
+  })
+})
+
+describe('影子模式的排名预测必须与真实排序一致（tie-break 专项）', () => {
+  // 上一条「hypotheticalRank 与 on 模式一致」的用例，fixture 里三张卡分数
+  // **两两不同**，所以排序时根本走不到 tie-break 分支。把 tie-break 改成
+  // id 降序，那条用例依然全绿——它没守住 tie-break。
+  //
+  // 这里专门造「两张被加分的卡同分」：a 是种子，b 和 c 都被 a 连、
+  // 加同样的分，于是 hypotheticalTotal 完全相等。此时顺序只能由
+  // tie-break（id 升序）决定，一旦 tie-break 写错，影子预测的排名
+  // 就会与真实 on 模式的排名不一致——那份证据就废了。
+  function tieFixture(mode: MemoryConfig['spread']['mode']): {
+    config: MemoryConfig
+    cards: ReturnType<typeof makeCard>[]
+    edges: MemoryEdge[]
+    query: ReturnType<typeof makeQuery>
+  } {
+    const config = spreadConfig({ mode, maxBoost: 0.2 })
+    const cards = [
+      makeCard({ id: 'a', text: 'Cordis 版本' }),
+      makeCard({ id: 'b', text: 'Cordis' }),
+      makeCard({ id: 'c', text: '版本' }),
+    ]
+    const edges = [
+      edge('a', 'b', 'same-entity', 1),
+      edge('a', 'c', 'same-entity', 1),
+    ]
+    return { config, cards, edges, query: makeQuery('Cordis 版本', config, 1000) }
+  }
+
+  it('同分时影子预测的排名与真实 on 模式完全一致', () => {
+    const shadow = tieFixture('shadow')
+    const on = tieFixture('on')
+    const shadowResult = scoreCards(shadow.cards, shadow.query, shadow.config, shadow.edges)
+    const onResult = scoreCards(on.cards, on.query, on.config, on.edges)
+
+    // 前提：必须真的出现同分，否则 tie-break 不会被触发，这条用例就没意义。
+    const boosted = shadowResult.filter((x) => x.shadowSpread !== undefined)
+    assert.equal(boosted.length, 2, '前提：必须恰好两张卡被加分')
+    assert.equal(
+      boosted[0]?.shadowSpread?.hypotheticalTotal, boosted[1]?.shadowSpread?.hypotheticalTotal,
+      '前提：两张被加分的卡必须同分，tie-break 才会被触发',
+    )
+
+    const onRank = new Map(onResult.map((x, i) => [x.card.id, i + 1]))
+    for (const item of boosted) {
+      assert.equal(
+        item.shadowSpread!.hypotheticalRank, onRank.get(item.card.id),
+        `${item.card.id} 同分时的影子排名必须等于真实 on 模式排名`,
+      )
+    }
+    // 同分时 id 小的排前面（升序 tie-break）。
+    assert.ok(
+      (onRank.get('b') ?? 99) < (onRank.get('c') ?? 99),
+      '同分时必须按 id 升序：b 应排在 c 之前',
+    )
   })
 })
