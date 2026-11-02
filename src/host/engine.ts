@@ -23,6 +23,7 @@ import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
 } from '../core/types.ts'
 import { cardSimilarity } from '../consolidate/dedupe.ts'
+import { aggregateMetrics } from '../core/metrics.ts'
 import { normalizeText } from '../core/text.ts'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -283,6 +284,9 @@ export class MemoryEngine {
         picked: result.pack.cards.map((c) => ({ id: c.card.id, total: c.score.total })),
         tokens: result.pack.tokens,
         empty: result.pack.empty,
+        // FR-F3 的「冲突数」从这里聚合。**必须真的写进日志**：
+        // 指标从日志算（重启不清零），日志里没有这个字段就永远算不出 0 以外的值。
+        conflicts: result.pack.cards.filter((c) => c.conflict).length,
         // 键名用 `shadow` 而不是 `boost`：这个值没有参与排序，命名必须让它
         // 不可能被误读成已生效。为空时省略，让日志形状反映真实模式。
         ...(shadow.length > 0 ? { shadow } : {}),
@@ -798,17 +802,85 @@ export class MemoryEngine {
   }
 
   /**
-   * 取内部统计（FR-F3）。
+   * 汇总指标（FR-F3）。
    *
-   * @returns 指标对象。
+   * ## 为什么分成两半
+   *
+   * FR-F3 要的五个指标里，`库大小` 能当场从 store 数出来，但
+   * `召回次数 / 命中率 / 冲突数 / 注入 token` 都是**累计量**——
+   * 用 `this.recallCount` 这类进程内计数器只能给出「本次运行以来」，
+   * 重启就归零，而 FR-F3 还要求「有最小周报」，周报天然跨进程、跨天。
+   *
+   * 所以：累计量从**已落盘的诊断日志**聚合（`aggregateMetrics`），
+   * 库大小当场数，并用 `source` 标出这次读的是哪个来源——
+   * 两个来源口径不同，混成一个字段会让周报在重启后莫名变 0。
+   *
+   * @returns 五个指标 + 归档数 + 上次整理时刻 + 数据来源。
    */
-  metrics(): { recalls: number; active: number; archived: number; lastConsolidationAt: number | null } {
+  metrics(): {
+    recalls: number
+    hitRate: number
+    conflicts: number
+    active: number
+    injectTokens: number
+    archived: number
+    lastConsolidationAt: number | null
+    source: 'log' | 'memory'
+  } {
+    // 读**自己刚写的那个文件**，而不是另起一个计数器。
+    // 两个来源（内存计数器 + 磁盘日志）必然漂移，而指标恰恰是用来
+    // 判断「系统在做什么」的——一个会漂移的观测点比没有观测点更危险。
+    const entries = this.readOwnLog()
+    if (entries !== null) {
+      const aggregated = aggregateMetrics(entries, this.store.count('active'))
+      return {
+        ...aggregated,
+        archived: this.store.count('archived'),
+        lastConsolidationAt: this.lastConsolidationAt,
+        source: 'log',
+      }
+    }
+    // 落盘关闭时只能退回进程内计数，但**必须标出来**：
+    // 这种情况下 `recalls` 是「本次运行以来」，重启归零，
+    // 与 `source: 'log'` 的「累计」不是同一个量。
     return {
       recalls: this.recallCount,
+      hitRate: 0,
+      conflicts: 0,
       active: this.store.count('active'),
+      injectTokens: 0,
       archived: this.store.count('archived'),
       lastConsolidationAt: this.lastConsolidationAt,
+      source: 'memory',
     }
+  }
+
+  /**
+   * 读回本引擎落盘的诊断日志。
+   *
+   * @returns 日志条目；落盘关闭或文件不存在时 `null`。
+   */
+  private readOwnLog(): MemoryLogEntry[] | null {
+    const path = this.logFilePath
+    if (path === null || !existsSync(path)) return null
+    let raw: string
+    try {
+      raw = readFileSync(path, 'utf8')
+    } catch {
+      // 读不回来不是「零召回」，是「读不到」——退回内存计数并标 source。
+      return null
+    }
+    const entries: MemoryLogEntry[] = []
+    for (const line of raw.split(String.fromCharCode(10))) {
+      if (line.length === 0) continue
+      try {
+        entries.push(JSON.parse(line) as MemoryLogEntry)
+      } catch {
+        // 单行损坏跳过（进程被杀时最后一行常是半条）。
+        continue
+      }
+    }
+    return entries
   }
 
   /**

@@ -396,6 +396,34 @@ if (mutated === original) {
 - [x] 巩固面 `src/consolidate/`
 - [x] 适配面 `src/host/` + `src/index.ts` + `cordis.patch.yml`
 - [x] 离线 CLI `src/cli/`（query / export / rebuild / health / consolidate）
+- [x] FR-F3 指标只有 4 个且重启清零 → 真缺陷十三。
+      原 `engine.metrics()` 返回 `{ recalls, active, archived, lastConsolidationAt }`：
+      规格点名的五个指标里**缺命中率与注入 token**，`conflicts` 也没算；
+      更根本的是 `recalls` 来自**进程内计数器** `this.recallCount`，
+      重启归零——而 FR-F3 要求「有最小周报」，周报天然跨天、跨进程，
+      内存计数器在数学上支撑不了它。
+      修法：新增 `src/core/metrics.ts`（纯函数，ST-1），
+      `aggregateMetrics(entries, active)` 从**已落盘的诊断日志**聚合
+      召回次数 / 命中率 / 冲突数 / 注入 token，`buildWeeklyReport` 产出
+      最小周报（五个指标 + 一句人话结论）；`engine.metrics()` 改读
+      **自己刚写的那个文件**（`readOwnLog`），落盘关闭时才退回内存计数，
+      并**用 `source: 'log' | 'memory'` 标出**——两个来源的口径不同，
+      静默混用会让周报在重启后莫名变 0。`recall` 日志补写 `conflicts` 字段，
+      否则指标永远算不出 0 以外的值。CLI 加 `report` 子命令 + `--days`
+      （默认 7，非正整数直接报用法错误：0 天窗口恒空 ⇒ 周报永远说
+      「没有召回」，**那是个看起来正常的错误结论**）。
+      反向验证 10/10 全部命中。
+      三条值得记的：
+      - **`metrics()` 的第一版我改错了语义**：让它接受外部传入的日志数组，
+        而现有 4 条测试断言的是「本进程内召回了几次」。红了一条才发现
+        这不是测试要改，而是我把「本次运行以来」和「累计」混成了一个方法。
+        正解是**同一个方法、标出来源**，而不是让调用方猜。
+      - 周报零召回时**必须说「无参考价值」，不能报「正常」**：
+        没有数据和数据不好是两件事，把前者说成后者是撒谎。
+      - `report` 与 `logs` 对「日志文件不存在」必须给同一个判据
+        （说「还没有」而不是输出一份全 0 周报）。
+      踩坑：脚本里转义写坏，落进 TS 源码变成了真换行，`tsc` 报
+      `TS1002: Unterminated string literal`；改用 `String.fromCharCode(10)` 绕开。
 - [ ] 宿主实机验证
 - [x] bundle 展示资源（`icon.svg` / `locale/zh.json` / `locale/en.json`）
 - [ ] 起源对照审查遗留项（见 `docs/5-起源对照审查.md` 第二部分）：

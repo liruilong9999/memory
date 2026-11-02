@@ -39,6 +39,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url'
 
 import { DEFAULT_CONFIG, mergeConfig, validateConfig } from '../core/config.ts'
 import type { DeepPartial, MemoryConfig } from '../core/config.ts'
+import { buildWeeklyReport } from '../core/metrics.ts'
 import { renderFocusPackExplain } from '../core/render.ts'
 import { formatTime } from '../core/scoring.ts'
 import type { MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
@@ -84,7 +85,9 @@ export const CLI_NAME = 'memoryctl'
 export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
-const COMMANDS = ['query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'help'] as const
+const COMMANDS = [
+  'query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'report', 'help',
+] as const
 
 /** 子命令名。 */
 type Command = (typeof COMMANDS)[number]
@@ -118,6 +121,9 @@ export interface CliOptions {
 
   /** `logs` 读取条数上限；0 表示全部。 */
   readonly limit: number
+
+  /** `report` 的统计窗口天数（FR-F3）。 */
+  readonly days: number
 }
 
 /** 参数解析结果。失败时只带一条人可读信息，不带异常。 */
@@ -257,6 +263,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let verbose = false
   let includeArchived = false
   let limit = 50
+  let days = 7
   let reason = ''
   let helpRequested = false
   let onlyPositionals = false
@@ -324,6 +331,16 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       limit = parsed
       continue
     }
+    if (name === '--days') {
+      const value = takeValue(name, inline)
+      if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
+      const parsed = Number.parseInt(value, 10)
+      // 0 天没有意义（窗口恒空），且会让周报永远说「没有召回」——
+      // 那是个看起来正常的错误结论，比报错更难发现。
+      if (!Number.isInteger(parsed) || parsed < 1) return { ok: false, message: `选项 ${name} 需要正整数` }
+      days = parsed
+      continue
+    }
     if (name === '--data-dir' || name === '--tz' || name === '--out' || name === '--reason') {
       const value = takeValue(name, inline)
       if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
@@ -341,7 +358,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     return {
       ok: true,
       options: {
-        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit,
+        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days,
       },
     }
   }
@@ -353,7 +370,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     options: {
       command: first,
       positionals: positionals.slice(1),
-      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit,
+      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days,
     },
   }
 }
@@ -491,6 +508,7 @@ export function helpText(): string {
     '  restore <id>              把一张归档卡恢复成活跃（FR-C2：归档必须可逆）',
     '  revise <id> <新正文>      修正卡片正文并保留旧版本（FR-A5：可查改过什么）',
     '  logs                      读回落盘的诊断日志（FR-F1：最近 N 次操作可回溯）',
+    '  report                    最小周报（FR-F3：召回次数/命中率/冲突数/库大小/注入 token）',
     '  help                      显示本帮助（等同 -h / --help / 无参数）',
     '',
     '全局选项：',
@@ -509,6 +527,7 @@ export function helpText(): string {
     '',
     'logs 专用选项：',
     '  --limit <条数>            只读最后 N 条，默认 50，0 表示全部',
+    '  --days <天数>             report 的统计窗口，默认 7',
     '',
     '退出码：',
     '  0  正常',
@@ -651,13 +670,6 @@ function runExport(
 }
 
 /**
- * `rebuild` 子命令（FR-F4 的运维动作）。
- *
- * @param options - 解析后的参数。
- * @param engine - 记忆引擎。
- * @returns 命令结果。
- */
-/**
  * `restore` 子命令：把一张归档卡恢复成活跃（FR-C2）。
  *
  * ## 为什么 CLI 必须有它
@@ -783,6 +795,91 @@ function runLogs(options: CliOptions, resolved: ResolvedCliConfig, storeDir: str
   return { code: EXIT_OK, stdout: `${text}\n`, stderr: '' }
 }
 
+/**
+ * 读回已落盘的诊断日志（供 `logs` 与 `report` 共用）。
+ *
+ * 抽出来是因为两个子命令的**读法必须完全一致**：一个说「最近 50 条」、
+ * 另一个说「这一周」，若各自实现，周报的窗口边界和 `logs` 看到的内容
+ * 会在无人察觉时漂移——而周报的全部价值就是「它统计的确实是发生过的事」。
+ *
+ * @param path - 日志文件绝对路径。
+ * @returns 可解析的日志条目（按文件顺序，单行损坏跳过）。
+ */
+function readLogEntries(path: string): MemoryLogEntry[] {
+  if (!existsSync(path)) return []
+  const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.length > 0)
+  const entries: MemoryLogEntry[] = []
+  for (const line of lines) {
+    try {
+      entries.push(JSON.parse(line) as MemoryLogEntry)
+    } catch {
+      // 单行损坏不能让整条命令失败（进程被杀时最后一行常是半条）。
+      continue
+    }
+  }
+  return entries
+}
+
+/**
+ * `report` 子命令：最小周报（FR-F3）。
+ *
+ * 「最小」是需求原文的用词，含义是**能回答「这一周系统在做什么」**，
+ * 不是仪表盘。所以只报 FR-F3 点名的五个指标 + 一句人话结论。
+ *
+ * 默认窗口 7 天，可用 `--days` 覆盖。
+ *
+ * @param options - 解析后的参数。
+ * @param resolved - 解析后的配置。
+ * @param storeDir - 记忆库目录（日志与它同源）。
+ * @param active - 活跃卡片数。
+ * @param archived - 归档卡片数。
+ * @param now - 当前时刻。
+ * @returns 命令结果。
+ */
+function runReport(
+  options: CliOptions, resolved: ResolvedCliConfig, storeDir: string,
+  active: number, archived: number, now: number, timeZone: string,
+): CliResult {
+  const file = resolved.config.storage.logFile
+  if (file.length === 0) {
+    return { code: EXIT_OK, stdout: '', stderr: '诊断日志落盘已关闭（storage.logFile 为空串），无法生成周报\n' }
+  }
+  const days = options.days
+  const since = now - days * 24 * 60 * 60 * 1000
+  const logPath = join(storeDir, file)
+  if (!existsSync(logPath)) {
+    // 与 `logs` 子命令保持一致：文件不存在时说「还没有」，而不是输出一份
+    // 全 0 周报。**全 0 周报会被读成「这一周系统没被用过」，而真相是
+    // 「指标根本没记录」**——这两种情况需要的处置完全不同。
+    return { code: EXIT_OK, stdout: '', stderr: '还没有诊断日志，无法生成周报' + String.fromCharCode(10) }
+  }
+  const all = readLogEntries(logPath)
+  // 时间窗在这里筛选，`aggregateMetrics` 只负责算——这样「窗口边界」
+  // 只有一处定义，纯函数也保持无时钟依赖（ST-1）。
+  const windowed = all.filter((entry) => entry.at >= since && entry.at <= now)
+  const report = buildWeeklyReport({
+    entries: windowed,
+    active,
+    archived,
+    since,
+    until: now,
+    // 时区由调用方传入，和 `logs` 用**同一个**已校验的 `timeZone`：
+    // 两个子命令对同一批日志报出不同日期的周报，是「同一个库两套输出」的翻版。
+    timeZone,
+  })
+  if (options.json) {
+    return { code: EXIT_OK, stdout: jsonText({ days, since, until: now, ...report.metrics }), stderr: '' }
+  }
+  return { code: EXIT_OK, stdout: `${report.text}\n`, stderr: '' }
+}
+
+/**
+ * `rebuild` 子命令（FR-F4 的运维动作）。
+ *
+ * @param options - 解析后的参数。
+ * @param engine - 记忆引擎。
+ * @returns 命令结果。
+ */
 function runRebuild(options: CliOptions, engine: MemoryEngine): CliResult {
   const report = engine.rebuild()
   if (options.json) {
@@ -971,6 +1068,11 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
         break
       case 'logs':
         result = runLogs(options, resolved, store.dir, timeZone)
+        break
+      case 'report':
+        result = runReport(
+          options, resolved, store.dir, store.count('active'), store.count('archived'), clock(), timeZone,
+        )
         break
       default:
         // `help` 已在前面提前返回，这里是穷尽性兜底。

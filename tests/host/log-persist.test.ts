@@ -250,3 +250,78 @@ describe('FR-F1 · logs 子命令能读回日志', () => {
     assert.ok(payload.length > 0, '其余记录必须仍然读得出来')
   })
 })
+
+describe('FR-F3 · report 子命令（最小周报）', () => {
+  it('真实数据下报出五个指标，而不是一排 0', () => {
+    // 「有周报」不等于「周报有内容」。一个恒输出「召回 0 次」的实现
+    // 也能让「命令退出码为 0」的测试全绿，而它毫无价值。
+    const dir = tempDir()
+    const { store, engine } = openEngine(dir)
+    writeOnce(engine)
+    engine.recall('Redis 缓存')
+    engine.recall('Kubernetes 部署')
+    store.close()
+
+    // --days 要足够大：T0 是 2023-11-15，而 runCli 的 now 也是 T0，
+    // 默认 7 天窗口会把它排除在外。这里显式放宽，让「窗口筛选」
+    // 和「数据不存在」两种失败原因不会混在一起。
+    const result = runCli(['report', '--data-dir', dir, '--days', '3650'], { now: () => T0 })
+    assert.equal(result.code, 0)
+    assert.match(result.stdout, /召回 2 次/u, '召回次数必须来自真实日志')
+    assert.match(result.stdout, /命中率 100\.0%/u)
+    assert.match(result.stdout, /活跃 \d+ 张/u)
+    assert.doesNotMatch(result.stdout, /召回 0 次/u, '有数据时不得报 0')
+  })
+
+  it('--json 给出结构化指标，字段名与 FR-F3 的五个指标对应', () => {
+    const dir = tempDir()
+    const { store, engine } = openEngine(dir)
+    writeOnce(engine)
+    engine.recall('Redis 缓存')
+    store.close()
+
+    const result = runCli(['report', '--data-dir', dir, '--days', '3650', '--json'], { now: () => T0 })
+    assert.equal(result.code, 0)
+    const payload = JSON.parse(result.stdout) as Record<string, unknown>
+    for (const key of ['recalls', 'hitRate', 'conflicts', 'active', 'injectTokens']) {
+      assert.ok(key in payload, `周报 JSON 缺少 FR-F3 指标 ${key}`)
+    }
+    assert.equal(payload['recalls'], 1)
+  })
+
+  it('时间窗真的生效：数据在窗口外时必须报 0', () => {
+    // 只测「窗口内有数据时报出来」等于没测窗口——恒不筛选的实现也绿。
+    const dir = tempDir()
+    const { store, engine } = openEngine(dir)
+    writeOnce(engine)
+    engine.recall('Redis 缓存')
+    store.close()
+
+    // now 推后 10 天，窗口 1 天 ⇒ 那两条记录都在窗外。
+    const later = T0 + 10 * 24 * 60 * 60 * 1000
+    const result = runCli(['report', '--data-dir', dir, '--days', '1'], { now: () => later })
+    assert.equal(result.code, 0)
+    assert.match(result.stdout, /召回 0 次/u, '窗口外的数据不得算进来')
+    assert.match(result.stdout, /无参考价值/u)
+  })
+
+  it('--days 非正整数时报用法错误，而不是静默当成默认值', () => {
+    // 0 天窗口恒空 ⇒ 周报永远说「没有召回」，那是个**看起来正常的错误结论**，
+    // 比报错难发现得多。
+    for (const bad of ['0', '-3', 'abc']) {
+      const result = runCli(['report', '--data-dir', tempDir(), '--days', bad], { now: () => T0 })
+      assert.equal(result.code, 2, `--days ${bad} 必须被拒绝`)
+      assert.match(result.stderr, /--days/u)
+    }
+  })
+
+  it('日志文件不存在时明确说「无法生成周报」，不输出一份全 0 的假周报', () => {
+    // 全 0 的周报会被读成「这一周系统没被用过」，而真相是「指标根本没记录」
+    // ——这两种情况需要的处置完全不同。与 `logs` 子命令保持同一判据。
+    const dir = tempDir()
+    const result = runCli(['report', '--data-dir', dir], { now: () => T0 })
+    assert.equal(result.code, 0)
+    assert.match(result.stderr, /无法生成周报/u)
+    assert.equal(result.stdout, '', '不得输出一份全 0 的假周报')
+  })
+})
