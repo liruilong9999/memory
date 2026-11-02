@@ -34,12 +34,17 @@ docs/        设计文档（中文）
 
 1. **语言**：文档、注释、提交信息写中文；标识符用英文。
 2. **术语**：英文术语首次出现必须带括号解释，如「焦点包（Focus Pack）」。
-3. **类型**：`strict` + `erasableSyntaxOnly`。禁止 `enum`、`namespace`、参数属性。
-4. **导入**：相对导入必须带 `.ts` 后缀（`allowImportingTsExtensions`）。
-5. **不写死参数**：所有阈值、权重、上限必须落在 `src/core/config.ts`，禁止散落字面量。
-6. **纯函数优先**：`core/` 下全部函数必须无副作用、无 IO、可重复调用得到相同结果（ST-1 确定性验收）。
-7. **不写自定义 session 事件**（C5）；记忆状态只进 storage domain / 本地日志。
-8. **删除文件只能单个删除**，禁止 `rm -rf` 或通配批量删除。
+3. **引用起源必须双锚定**：写 `起源 L行号（第 N 条·关键词）`，不许只写「起源第 N 条」。
+   `docs/0-起源.md` 只有 **8 个编号条目**（L21/23/25/27/29/31/33/35）加 **7 条无编号**
+   （L3 激素、L5 连续人生、L11 细节会忘、L13 三模块、L15 图谱、L17 上下文污染、L19 感受经验）。
+   只写编号时，编号一错审计者无从发现；带上行号就能直接翻原文核对。
+   仓库曾出现引用「起源第 10 条」（起源根本没有第 10 条）与多处方冠李戴，详见 `docs/5-起源对照审查.md`。
+4. **类型**：`strict` + `erasableSyntaxOnly`。禁止 `enum`、`namespace`、参数属性。
+5. **导入**：相对导入必须带 `.ts` 后缀（`allowImportingTsExtensions`）。
+6. **不写死参数**：所有阈值、权重、上限必须落在 `src/core/config.ts`，禁止散落字面量。
+7. **纯函数优先**：`core/` 下全部函数必须无副作用、无 IO、可重复调用得到相同结果（ST-1 确定性验收）。
+8. **不写自定义 session 事件**（C5）；记忆状态只进 storage domain / 本地日志。
+9. **删除文件只能单个删除**，禁止 `rm -rf` 或通配批量删除。
 
 ## 四、常用命令
 
@@ -85,11 +90,18 @@ pnpm cli --help    # 离线命令行
 - [x] 宿主约束调研
 - [x] 工程脚手架（package.json / tsconfig / .gitignore）
 - [x] 契约层 `src/core/types.ts`、`src/core/config.ts`
-- [ ] 文本内核 `src/core/text.ts`
-- [ ] 数据面 `src/store/`
-- [ ] 打分与抽取 `src/core/scoring.ts`、`src/core/extraction.ts`
-- [ ] 时间状态 `src/time/`
-- [ ] 巩固面 `src/consolidate/`
-- [ ] 适配面 `src/host/` + `cordis.patch.yml`
+- [x] 文本内核 `src/core/text.ts`
+- [x] 数据面 `src/store/`
+- [x] 打分与抽取 `src/core/scoring.ts`、`src/core/extraction.ts`
+- [x] 时间状态 `src/time/`
+- [x] 巩固面 `src/consolidate/`
+- [x] 适配面 `src/host/` + `src/index.ts` + `cordis.patch.yml`
 - [ ] 离线 CLI `src/cli/`
 - [ ] 宿主实机验证
+- [ ] 起源对照审查遗留项（见 `docs/5-起源对照审查.md` 第二部分）：
+  - [ ] `feeling` 加入 `neverArchiveKinds`（起源 L11 直接冲突）
+  - [ ] `RecallQuery.domains` 是死字段，召回不按域过滤（起源 L13）
+  - [ ] `dueAt` 永远为 null，`pickDue` 恒空，FR-D3 / SC-5 不可能通过（起源 L21）
+  - [ ] 召回反馈是正反馈，与「专注当前位置」的抑制语义相反（起源 L29）
+  - [ ] `renderFocusPack` 头尾固定开销未计入 token 预算（起源 L33）
+  - [ ] 无日摘要、无跨周期层级压缩（起源 L27）

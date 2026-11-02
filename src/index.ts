@@ -223,7 +223,7 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   )
   if (!injected) logger.warn('无法注册动态上下文，记忆不会被注入到系统提示词')
 
-  // ---- 写路径（FR-A1 / 起源第 4 条）----
+  // ---- 写路径（FR-A1 / 起源 L27 第 4 条「今日记忆渐进累积」）----
   const turnStopping = subscribe(ctx, 'agent/turn-stopping', (...args: unknown[]) => {
     const payload = args[0] as { agent?: unknown; turn?: unknown } | undefined
     const turn = typeof payload?.turn === 'number' ? payload.turn : 0
@@ -248,7 +248,7 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   })
   if (!turnStopping) logger.warn('无法订阅 agent/turn-stopping，记忆不会被写入')
 
-  // ---- 夜整理（FR-C1 / 起源第 4 条）----
+  // ---- 夜整理（FR-C1 / 起源 L27 第 4 条「夜晚休眠整理」）----
   if (config.consolidation.enabled) {
     let lastRunAt: number | null = null
     const timeZone = resolveTimeZone()

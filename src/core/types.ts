@@ -17,7 +17,7 @@
 /**
  * 记忆域（Memory Domain）。
  *
- * 对应起源第 3 条：把生活、学习、工作拆成三个记忆模块，可插拔
+ * 对应起源 L13（无编号）：把生活、学习、工作拆成三个记忆模块，可插拔
  * （同时存在，或者只有一个）。域是**最外层的分区键**，跨域关联通过
  * {@link MemoryEdge} 表达，不做物理合并。
  */
@@ -40,7 +40,8 @@ export const MEMORY_DOMAINS: readonly MemoryDomain[] = ['work', 'study', 'life']
  * - `feeling`    感受：起源「我们大多数细节都会忘记，只会留下感受」
  * - `experience` 经验：从事件里沉淀下来的可复用做法（起源「经验的写入和回忆」）
  *
- * `feeling` 与 `experience` 是对起源第 1、7 条的直接落地：细节可以忘，
+ * `feeling` 与 `experience` 是对起源 L11（细节会忘只留感受）与 L19（感受与经验的
+ * 写入和回忆）的直接落地：细节可以忘，
  * 感受与经验必须留下。
  */
 export type MemoryKind = 'event' | 'fact' | 'promise' | 'concept' | 'feeling' | 'experience'
@@ -121,7 +122,7 @@ export interface MemoryCard {
   /**
    * 情绪强度 0..1。
    *
-   * 起源第 1 条：「激素是关键，大脑皮层只是记忆」。本阶段不做情绪系统，
+   * 起源 L3（无编号）：「激素是关键，大脑皮层只是记忆」。本阶段不做情绪系统，
    * 只把情绪强度作为**记忆强度的调制量**——强烈的感受更容易被记住、更难被归档。
    */
   emotional: number

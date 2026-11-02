@@ -54,7 +54,7 @@ export interface ForgettingPolicy {
   archiveThreshold: number
   /** 归档后强度保留比例，便于恢复（FR-C2）。 */
   archiveRetention: number
-  /** 情绪强度对半衰期的放大系数上限：强烈的感受忘得更慢（起源第 1 条）。 */
+  /** 情绪强度对半衰期的放大系数上限：强烈的感受忘得更慢（起源 L3·激素是关键）。 */
   emotionalHalfLifeBoost: number
   /** 永不归档的类型（FR-C3）。 */
   neverArchiveKinds: string[]
