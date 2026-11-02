@@ -408,6 +408,13 @@ export interface MemoryFilter {
   entity?: string
   /** 文本包含的子串（按原文比较，大小写敏感）。 */
   contains?: string
+  /**
+   * 是否钉住（FR-C3）。
+   *
+   * 给 `true` 时只返回钉住的卡；给 `false` 时只返回未钉住的卡；
+   * 省略则不按钉住状态过滤。召回路径用它兜底「承诺与核心事实不能因检索没命中而消失」。
+   */
+  pinned?: boolean
   /** 起始时刻（含）。 */
   since?: number
   /** 结束时刻（含）。 */
@@ -437,6 +444,7 @@ export function filterCards(state: MemoryState, filter: MemoryFilter = {}): Memo
     if (filter.tag !== undefined && !card.tags.includes(filter.tag)) continue
     if (filter.entity !== undefined && !card.entities.includes(filter.entity)) continue
     if (filter.contains !== undefined && !card.text.includes(filter.contains)) continue
+    if (filter.pinned !== undefined && card.pinned !== filter.pinned) continue
     if (filter.since !== undefined && card.createdAt < filter.since) continue
     if (filter.until !== undefined && card.createdAt > filter.until) continue
     result.push(card)

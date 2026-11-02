@@ -4,7 +4,7 @@
  * 设计依据：
  * - 需求 FR-C1「夜整理最小集：去重、合并、降权、归档、重建索引，产出变更日志」。
  * - 起源第 6 条「今日记忆渐进累积，夜晚休眠整理，很长时间迭代」——本文件就是
- *   「夜晚休眠整理」那一步，白天只管写，晚上统一压缩。
+ *   「夜晚休眠整理」那一步：白天只管写，晚上统一压缩。
  * - 原则 P8「成本有界」：`maxCardsPerRun` 限制单次处理量，
  *   `maxArchiveRatio` 限制单次归档比例，整理耗时与破坏力都有硬上限。
  *
@@ -18,17 +18,17 @@
 import type { ConsolidationReport, JournalOp, MemoryCard, MemoryEdge } from '../core/types.ts'
 import type { MemoryConfig } from '../core/config.ts'
 import { truncate } from '../core/text.ts'
-import { decayCard, decayStrength } from './decay.ts'
-import { findDuplicateGroups, mergeGroup } from './dedupe.ts'
+import { decayCard } from './decay.ts'
+import { findDuplicateGroups, mergeGroup, sortByAge } from './dedupe.ts'
 import { applyArchiveRatio, archiveCard, releaseExpiredDue, shouldArchive } from './archive.ts'
 import { buildEdges } from './graph.ts'
 
-/** 夜整理需要的输入状态。 */
+/** 夜整理需要的输入状态。卡片与边都接受数组或 Map，便于直接接数据面的 MemoryState。 */
 export interface ConsolidationInput {
-  /** 当前全部卡片（含已归档，函数内部自行过滤）。 */
-  cards: readonly MemoryCard[]
+  /** 当前全部卡片（含已归档），函数内部自行过滤。 */
+  cards: readonly MemoryCard[] | ReadonlyMap<string, MemoryCard>
   /** 已知的图谱边（含历史边）；缺省视为空。 */
-  edges?: readonly MemoryEdge[]
+  edges?: readonly MemoryEdge[] | ReadonlyMap<string, MemoryEdge>
 }
 
 /** 夜整理的产物。 */
@@ -43,8 +43,20 @@ export interface ConsolidationResult {
   edges: MemoryEdge[]
 }
 
-/** 日志里摘要文本的截断长度，避免 notes 过长污染日志。 */
+/** 报告里摘要文本的截断长度，避免 notes 过长污染日志。 */
 const NOTE_TEXT_CHARS = 24
+
+/**
+ * 把「数组或 Map」统一成数组。
+ *
+ * @param source - 数组或 Map，或缺省。
+ * @returns 数组视图。
+ */
+function toArray<T>(source: readonly T[] | ReadonlyMap<string, T> | undefined): T[] {
+  if (source === undefined) return []
+  if (Array.isArray(source)) return [...(source as readonly T[])]
+  return [...(source as ReadonlyMap<string, T>).values()]
+}
 
 /**
  * 截断文本用于报告，超长补省略号。
@@ -54,6 +66,19 @@ const NOTE_TEXT_CHARS = 24
  */
 function brief(text: string): string {
   return truncate(text, NOTE_TEXT_CHARS)
+}
+
+/**
+ * 一张卡是否算「活跃」：状态 active 且未被合并掉。
+ *
+ * 被合并掉的卡虽然 `status` 仍是 active（归档与合并是两个正交概念），
+ * 但它已经是作废视图，不应计入活跃数。
+ *
+ * @param card - 记忆卡。
+ * @returns 是否计入活跃。
+ */
+function isLive(card: MemoryCard): boolean {
+  return card.status === 'active' && card.mergedInto === undefined
 }
 
 /**
@@ -73,17 +98,21 @@ function mergeNote(merged: MemoryCard, absorbed: readonly MemoryCard[]): string 
  *
  * 处理顺序（与 FR-C1 的「去重、合并、降权、归档、重建索引」一一对应）：
  *
- * 1. **取工作集**：只处理 `active` 且未被合并的卡，按 `maxCardsPerRun` 截断；
+ * 1. **取工作集**：只处理活跃且未被合并的卡，按 `maxCardsPerRun` 截断；
  *    排序用「创建时间 + id」，保证同样输入取到同样的子集（ST-1）。
- * 2. **衰减**：对工作集算新强度，强度变化才产出 `put`，避免无意义日志。
+ * 2. **衰减**：先释放已过期的到期时刻，再按遗忘曲线算新强度；
+ *    有变化才产出 `put`，避免无意义日志。
  * 3. **去重合并**：相似度达 `duplicateSimilarity` 的组，产出一条 `merge` 操作。
- *    存活卡的 id 沿用组内最早那张，被并入的卡由 `merge` 操作标记作废。
+ *    存活卡沿用组内最早那张的 id，被并入的卡标记 `mergedInto`（作废但保留溯源）。
  * 4. **归档**：`shouldArchive` 筛出候选，`applyArchiveRatio` 按比例上限截断，
  *    产出 `archive` 操作（可逆，FR-C2）。
- * 5. **连边**：`buildEdges` 重建图谱，只产出尚不存在的边，`buildEdgeId` 保证幂等。
+ * 5. **连边**：`buildEdges` 重建图谱，只补尚不存在的边，`buildEdgeId` 保证幂等。
  *
  * 工作集之外（超过 `maxCardsPerRun`）的卡原样返回、原样保留，本次不衰减也不归档，
- * 留给下一次整理——这比「一次处理完但可能跑几十分钟」更符合 P8。
+ * 留给下一次整理——这比「一次处理完但可能跑很久」更符合 P8。
+ *
+ * 确定性：全程无随机、无时钟读取、所有排序都有完整的决胜键，
+ * 因此同样的 `(state, config, now)` 永远得到同样的 `ops` 与 `report`（ST-1）。
  *
  * @param state - 输入状态。
  * @param config - 完整配置。
@@ -96,24 +125,14 @@ export function runConsolidation(
   const notes: string[] = []
   const ops: JournalOp[] = []
 
-  const allCards = [...state.cards]
-  const priorEdges = [...(state.edges ?? [])]
-  const beforeActive = allCards.filter((card) => card.status === 'active').length
-
-  // 一、取工作集：稳定排序后按上限截断。
-  const eligible = allCards
-    .filter((card) => card.status === 'active' && card.mergedInto === undefined)
-    .sort((x, y) => {
-      if (x.createdAt !== y.createdAt) return x.createdAt - y.createdAt
-      return x.id < y.id ? -1 : x.id > y.id ? 1 : 0
-    })
-  const limit = Math.max(0, Math.floor(config.consolidation.maxCardsPerRun))
-  const working = eligible.slice(0, limit)
-  const deferred = eligible.length - working.length
+  const allCards = toArray(state.cards)
+  const priorEdges = toArray(state.edges)
+  const beforeActive = allCards.filter(isLive).length
 
   const next = new Map<string, MemoryCard>()
   for (const card of allCards) next.set(card.id, card)
 
+  // 开关关闭时不做任何变更，但仍返回一份可读报告（FR-F1：整理要留痕）。
   if (!config.consolidation.enabled) {
     notes.push('巩固已禁用（consolidation.enabled = false），本次不做任何变更')
     return {
@@ -134,41 +153,40 @@ export function runConsolidation(
     }
   }
 
-  // 二、衰减：先把过期的到期时刻清掉，再按衰减曲线算新强度。
+  // 一、取工作集：稳定排序后按上限截断。
+  const eligible = sortByAge(allCards.filter(isLive))
+  const limit = Math.max(0, Math.floor(config.consolidation.maxCardsPerRun))
+  const working = eligible.slice(0, limit)
+  const deferred = eligible.length - working.length
+
+  // 二、衰减：先释放已过期的到期时刻，再按遗忘曲线算新强度。
   let decayed = 0
   const decayedCards: MemoryCard[] = []
   for (const card of working) {
-    const cleared = releaseExpiredDue(card, now)
-    const before = decayStrength(cleared, now, config)
-    const after = decayCard(cleared, now, config)
-    const changed = after !== cleared || before !== cleared.strength
-    const settled = changed ? after : cleared
+    const settled = decayCard(releaseExpiredDue(card, now), now, config)
     if (settled !== card) {
       next.set(card.id, settled)
       ops.push({ op: 'put', card: settled })
-      decayedCards.push(settled)
       if (settled.strength < card.strength) decayed += 1
     }
+    decayedCards.push(settled)
   }
 
   // 三、去重合并。
   const groups = findDuplicateGroups(decayedCards, config)
   const absorbedIds = new Set<string>()
-  const absorbedCards: MemoryCard[] = []
   for (const group of groups) {
     const merged = mergeGroup(group.cards, config)
-    // 组内其余卡：标记 mergedInto，交给 merge 操作统一处理。
     const absorbed = group.cards.filter((card) => card.id !== merged.id)
     for (const card of absorbed) {
       absorbedIds.add(card.id)
-      absorbedCards.push(card)
+      // 被并入的卡：作废但保留溯源，随时能追回原始事件（FR-A4）。
+      next.set(card.id, { ...card, mergedInto: merged.id })
     }
-    // 存活卡自身的衰减结果可能被 mergeGroup 覆盖，这里以合并结果为准。
     next.set(merged.id, merged)
     ops.push({ op: 'merge', ids: group.cards.map((card) => card.id), into: merged, at: now })
     notes.push(mergeNote(merged, absorbed))
   }
-  const mergedCount = groups.length
 
   // 四、归档：候选必须排除刚被合并掉的卡。
   const archiveCandidates: MemoryCard[] = []
@@ -188,26 +206,23 @@ export function runConsolidation(
     ops.push({ op: 'archive', id: archived.id, at: now, reason: '强度低于归档阈值（夜整理自动归档）' })
   }
 
-  // 五、连边：基于整理后的活跃卡重建，只补尚不存在的边。
-  const activeAfterMerge = [...next.values()].filter(
-    (card) => card.status === 'active' && card.mergedInto === undefined && !absorbedIds.has(card.id),
-  )
+  // 五、连边：基于整理后的活跃卡重建图谱，只补尚不存在的边。
+  const activeAfter = [...next.values()].filter(isLive)
   const knownEdgeIds = new Set(priorEdges.map((edge) => edge.id))
-  const freshEdges = buildEdges(activeAfterMerge, config, now).filter((edge) => !knownEdgeIds.has(edge.id))
+  const freshEdges = buildEdges(activeAfter, config, now).filter((edge) => !knownEdgeIds.has(edge.id))
   for (const edge of freshEdges) ops.push({ op: 'edge', edge })
   const edges = [...priorEdges, ...freshEdges]
 
   // 六、汇总报告（FR-C1：每次整理必须有一份可读报告）。
-  const afterActive = [...next.values()].filter((card) => card.status === 'active').length
-  const archivedCount = toArchive.length
+  const afterActive = activeAfter.length
   notes.unshift(
-    `夜整理完成：活跃卡 ${beforeActive} → ${afterActive}，合并 ${mergedCount} 组重复卡，`
-    + `衰减 ${decayed} 张，归档 ${archivedCount} 张低强度卡，新增 ${freshEdges.length} 条图谱边`,
+    `夜整理完成：活跃卡 ${beforeActive} → ${afterActive}，合并 ${groups.length} 组重复卡，`
+    + `衰减 ${decayed} 张，归档 ${toArchive.length} 张低强度卡，新增 ${freshEdges.length} 条图谱边`,
   )
   if (deferred > 0) {
     notes.push(`本次处理上限 ${limit} 张，尚有 ${deferred} 张顺延到下一次整理`)
   }
-  if (archivedCount > 0) {
+  if (toArchive.length > 0) {
     notes.push('归档只改状态不删数据，可随时恢复（FR-C2）')
   }
 
@@ -216,11 +231,11 @@ export function runConsolidation(
     finishedAt: now,
     beforeActive,
     afterActive,
-    merged: mergedCount,
+    merged: groups.length,
     decayed,
-    archived: archivedCount,
-    // 连边即索引重建的产物：图谱是可丢弃可重建的派生视图（FR-A7）。
-    reindexed: freshEdges.length,
+    archived: toArchive.length,
+    // 索引是可丢弃可重建的派生视图（FR-A7）：重建索引 = 为每张活跃卡重新登记。
+    reindexed: afterActive,
     notes,
   }
 

@@ -238,7 +238,11 @@ export class Journal {
    *
    * 幂等键重复时直接丢弃并返回 `appended: false`，不写盘、不推进序号。
    *
-   * @param record - 待追加记录；其 `seq` 只是建议值，日志保证落盘序号严格递增。
+   * 序号**由日志统一分配**（当前水位 + 1），入参的 `seq` 只当建议值忽略。
+   * 为什么不让调用方决定：外部传入的历史序号可能带空洞或倒序，
+   * 而重放顺序只认 `seq`，一旦出现倒序，重放结果就不再确定（ST-1）。
+   *
+   * @param record - 待追加记录；其 `seq` 会被日志覆盖。
    * @returns 追加结果。
    */
   append(record: JournalRecord): AppendOutcome {
@@ -247,7 +251,7 @@ export class Journal {
     if (existingSeq !== undefined) {
       return { appended: false, record, duplicateOfSeq: existingSeq }
     }
-    const seq = record.seq > this.maxSeq ? record.seq : this.maxSeq + 1
+    const seq = this.maxSeq + 1
     const stored: JournalRecord = {
       v: 1,
       seq,

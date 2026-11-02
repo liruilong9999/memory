@@ -129,15 +129,18 @@ describe('revise 修正历史', () => {
     const state = createEmptyState()
     const card = makeCard({ text: 'v1', createdAt: 0, updatedAt: 0 })
     applyRecord(state, putRecord(1, card))
-    applyRecord(state, makeRecord(2, {
-      op: 'revise', id: card.id, text: 'v2', normalized: 'v2', reason: 'r2', at: 2, actor: 'system',
-    }))
-    applyRecord(state, makeRecord(3, {
-      op: 'revise', id: card.id, text: 'v3', normalized: 'v3', reason: 'r3', at: 3, actor: 'system',
-    }))
+    const second = { ...makeRecord(2, {
+      op: 'revise' as const, id: card.id, text: 'v2', normalized: 'v2', reason: 'r2', at: 2, actor: 'system' as const,
+    }), at: 2 }
+    const third = { ...makeRecord(3, {
+      op: 'revise' as const, id: card.id, text: 'v3', normalized: 'v3', reason: 'r3', at: 3, actor: 'system' as const,
+    }), at: 3 }
+    applyRecord(state, second)
+    applyRecord(state, third)
     const stored = getCard(state, card.id)
     assert.equal(stored?.revisions.length, 2)
     assert.deepEqual(stored?.revisions.map((item) => item.previousText), ['v1', 'v2'])
+    // updatedAt 取「卡片原值」与「修正时刻」中较晚者，这里修正时刻更大。
     assert.equal(stored?.updatedAt, 3)
   })
 
