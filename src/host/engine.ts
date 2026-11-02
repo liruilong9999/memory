@@ -231,16 +231,32 @@ export class MemoryEngine {
     const query = makeQuery(queryText, this.config, at, goalText)
     const result = this.buildRecall(at, query)
     this.recallCount += 1
+    // 影子模式的观察值必须有人看得到，否则「算完了但不显示」等于没算。
+    // 这里只记**真实存在的观察值**：`off` 模式没算、`on` 模式已折进总分，
+    // 两种情况下 `shadowSpread` 都是 undefined，日志里就不该出现影子字段
+    // ——否则读者会以为当前跑的是 shadow。
+    const shadow = result.pack.cards
+      .filter((item) => item.shadowSpread !== undefined)
+      .map((item) => ({
+        id: item.card.id,
+        boost: item.shadowSpread!.boost,
+        actualRank: item.shadowSpread!.actualRank,
+        hypotheticalRank: item.shadowSpread!.hypotheticalRank,
+      }))
     this.log({
       kind: 'recall',
       at,
-      summary: `召回 ${result.pack.cards.length} 条（候选 ${result.candidates}，token ${result.pack.tokens}）`,
+      summary: `召回 ${result.pack.cards.length} 条（候选 ${result.candidates}，token ${result.pack.tokens}）`
+        + (shadow.length > 0 ? `，影子模式下 ${shadow.length} 条会被扩散提权（未生效）` : ''),
       detail: {
         query: queryText,
         candidates: result.candidates,
         picked: result.pack.cards.map((c) => ({ id: c.card.id, total: c.score.total })),
         tokens: result.pack.tokens,
         empty: result.pack.empty,
+        // 键名用 `shadow` 而不是 `boost`：这个值没有参与排序，命名必须让它
+        // 不可能被误读成已生效。为空时省略，让日志形状反映真实模式。
+        ...(shadow.length > 0 ? { shadow } : {}),
       },
     })
     return result

@@ -160,3 +160,82 @@ describe('renderFocusPackExplain（FR-B4 可解释）', () => {
     assert.equal(renderFocusPackExplain(pack, 7), renderFocusPackExplain(pack, 7))
   })
 })
+
+/**
+ * 影子模式观察值的渲染（FR-G1 / 起源 L15·无编号·图谱）。
+ *
+ * 影子模式的价值全在「人能看到它想做什么」——算完不显示等于没算。
+ * 但显示必须**明确标注未生效**：观察值长得像分数的一部分，读者很容易
+ * 以为它已经参与了排序，从而对召回结果产生错误预期。
+ *
+ * 这里同时守住两条边界：
+ * 1. 观察值**不混进 `explain`**——`explain` 的语义是「这个分数怎么算出来的」，
+ *    而影子值没参与计算，混进去就是让解释替实现撒谎。
+ * 2. 注入文本（`renderFocusPack`）**完全不读它**，所以不可能污染上下文
+ *    （起源 L17·无编号·上下文污染）。
+ */
+describe('renderFocusPackExplain 的影子模式观察值', () => {
+  it('有观察值时渲染出加分量与排名变化，并标注未生效', () => {
+    const scored = makeScored('被扩散提权的卡', 0.45, {
+      shadowSpread: {
+        boost: 0.099,
+        sources: ['seed-a', 'seed-b'],
+        hypotheticalTotal: 0.549,
+        hypotheticalRank: 1,
+        actualRank: 2,
+      },
+    })
+    const text = renderFocusPackExplain(makePack([scored]), 2)
+    assert.ok(text.includes('[影子]'), '必须显式标出这是影子值')
+    assert.ok(text.includes('+0.099'), '必须显示加了多少分')
+    assert.ok(text.includes('0.549'), '必须显示假设总分')
+    assert.ok(text.includes('2 → 1'), '必须显示排名变化')
+    assert.ok(text.includes('未生效'), '必须明说当前未生效——这是最容易被误读的一点')
+    assert.ok(text.includes('2 张种子卡'), '必须显示激活来自几张种子卡')
+  })
+
+  it('没有观察值时不产生任何影子行（off / on 模式）', () => {
+    const scored = makeScored('普通卡', 0.5)
+    const text = renderFocusPackExplain(makePack([scored]), 1)
+    assert.ok(!text.includes('[影子]'), '没有观察值时不得凭空渲染影子行')
+  })
+
+  it('观察值不混进 explain（解释不能替实现撒谎）', () => {
+    // explain 的语义是「这个分数怎么算出来的」。影子值没参与计算，
+    // 若混进 explain，读者会以为总分里已经含了那 0.099。
+    const explainLines = ['recency 0.5 × 0.25 = 0.125']
+    const scored = makeScored('卡', 0.45, {
+      explain: explainLines,
+      shadowSpread: {
+        boost: 0.099, sources: ['s'], hypotheticalTotal: 0.549,
+        hypotheticalRank: 1, actualRank: 2,
+      },
+    })
+    renderFocusPackExplain(makePack([scored]), 1)
+    assert.deepEqual(scored.explain, explainLines, '渲染不得修改 explain 数组')
+    assert.equal(scored.explain.length, 1, '渲染不得往 explain 里追加行')
+  })
+
+  it('总分仍显示实际值，不显示假设值', () => {
+    const scored = makeScored('卡', 0.45, {
+      shadowSpread: {
+        boost: 0.099, sources: ['s'], hypotheticalTotal: 0.549,
+        hypotheticalRank: 1, actualRank: 2,
+      },
+    })
+    const text = renderFocusPackExplain(makePack([scored]), 1)
+    assert.ok(text.includes('总分 0.450'), '总分必须是实际值 0.450')
+    assert.ok(!text.includes('总分 0.549'), '假设值绝不能出现在「总分」那一行')
+  })
+
+  it('渲染两次结果一致（ST-1 确定性）', () => {
+    const scored = makeScored('卡', 0.45, {
+      shadowSpread: {
+        boost: 0.1, sources: ['s'], hypotheticalTotal: 0.55,
+        hypotheticalRank: 1, actualRank: 2,
+      },
+    })
+    const pack = makePack([scored])
+    assert.equal(renderFocusPackExplain(pack, 1), renderFocusPackExplain(pack, 1))
+  })
+})

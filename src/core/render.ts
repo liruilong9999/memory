@@ -39,6 +39,19 @@ function renderScoredCard(scored: ScoredCard): string[] {
     `  总分 ${scored.score.total.toFixed(3)}${scored.conflict ? '（有冲突）' : ''}`,
   ]
   for (const line of scored.explain) lines.push(`  ${line}`)
+  // 影子模式的观察值单独一段，**不混进 explain**：`explain` 的解释是「这个分数
+  // 是怎么算出来的」，而影子值没有参与计算，混进去会让读者以为它已经生效了。
+  // 这里用「假设」二字把语义钉死，并且必须显式标注「未生效」。
+  if (scored.shadowSpread !== undefined) {
+    const shadow = scored.shadowSpread
+    lines.push(
+      `  [影子] 若开启扩散：+${shadow.boost.toFixed(3)} → ${shadow.hypotheticalTotal.toFixed(3)}`
+      + `，排名 ${shadow.actualRank} → ${shadow.hypotheticalRank}（当前未生效）`,
+    )
+    if (shadow.sources.length > 0) {
+      lines.push(`  [影子] 激活来自 ${shadow.sources.length} 张种子卡`)
+    }
+  }
   return lines
 }
 

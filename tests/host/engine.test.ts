@@ -843,3 +843,105 @@ describe('扩散激活的端到端链路（FR-G1 / 起源 L15）', () => {
     off.store.close()
   })
 })
+
+/**
+ * 影子观察值必须有人看得到（FR-G1 / FR-F1 可观测）。
+ *
+ * 影子模式的全部价值在于「先看它想做什么，再决定要不要开」。算完不暴露，
+ * 就等于算了个寂寞——而这正是这个模块差点犯的错：`shadowSpread` 算出来了，
+ * 但没有任何出口，`explain` 里不许放（那是「分数怎么算出来的」），
+ * 注入文本里更不能放（起源 L17·无编号·上下文污染）。
+ *
+ * 两个出口，各测一条：
+ * 1. 人读渲染 `renderFocusPackExplain`（`/memory explain` 与 CLI `query` 共用）
+ *    ——已在 `tests/core/render.test.ts` 覆盖。
+ * 2. 结构化日志 `engine.recall` 的 `detail.shadow`——本组覆盖。
+ *
+ * 日志这条尤其要测**不该出现时不出现**：若 `off` / `on` 也带 `shadow` 字段，
+ * 运维看日志会以为当前跑的是 shadow 模式。
+ */
+describe('影子观察值的可观测出口（FR-G1 / FR-F1）', () => {
+  /** 造一个「有真实边」的库，并把日志收集起来。 */
+  function libraryWithLogs(mode: MemoryConfig['spread']['mode']): {
+    store: MemoryStore
+    engine: MemoryEngine
+    logs: MemoryLogEntry[]
+  } {
+    const logs: MemoryLogEntry[] = []
+    const config = makeConfig({ spread: { mode, maxBoost: 0.2 } })
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({
+      store, config, timeZone: TZ, clock: () => T0,
+      onLog: (entry) => logs.push(entry),
+    })
+    engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」的版本用「ThreePointTwo」', at: T0,
+    }))
+    engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」需要重新构建，因为「BuildScript」有问题',
+      turn: 2, at: T0 + 1000,
+    }))
+    engine.consolidate(T0 + 2000)
+    return { store, engine, logs }
+  }
+
+  it('shadow 模式的召回日志带上影子观察值', () => {
+    const lib = libraryWithLogs('shadow')
+    // 前提：必须真的有边，否则扩散恒空，这条测试会空绿。
+    assert.ok(lib.store.allEdges().length > 0, '前提：夜整理必须产出边')
+
+    lib.engine.recall('CordisPlugin 版本')
+    const entry = lib.logs.filter((e) => e.kind === 'recall').at(-1)
+    assert.ok(entry !== undefined, '前提：recall 必须写日志')
+
+    const shadow = entry.detail.shadow as Array<Record<string, unknown>> | undefined
+    assert.ok(shadow !== undefined, 'shadow 模式的召回日志必须带 shadow 字段')
+    assert.ok(shadow.length > 0, '必须至少观察到一条会被提权的卡')
+    for (const item of shadow) {
+      assert.ok(typeof item.id === 'string', '观察值必须能定位到具体卡')
+      assert.ok((item.boost as number) > 0, '观察到的加分必须为正')
+      assert.ok(typeof item.actualRank === 'number', '必须记下实际排名')
+      assert.ok(typeof item.hypotheticalRank === 'number', '必须记下假设排名')
+    }
+  })
+
+  it('shadow 模式的日志摘要里明说「未生效」', () => {
+    // 摘要行是运维最先看到的东西。若只说「2 条会被扩散提权」而不说未生效，
+    // 读者会以为召回结果已经变了。
+    const lib = libraryWithLogs('shadow')
+    lib.engine.recall('CordisPlugin 版本')
+    const entry = lib.logs.filter((e) => e.kind === 'recall').at(-1)
+    assert.ok(entry!.summary.includes('影子模式'), '摘要必须点明这是影子模式')
+    assert.ok(entry!.summary.includes('未生效'), '摘要必须点明未生效')
+  })
+
+  it('off 模式的召回日志不带 shadow 字段', () => {
+    // off 模式根本没算扩散。若日志里带 shadow 字段（哪怕是空数组），
+    // 运维会以为当前跑的是 shadow。
+    const lib = libraryWithLogs('off')
+    lib.engine.recall('CordisPlugin 版本')
+    const entry = lib.logs.filter((e) => e.kind === 'recall').at(-1)
+    assert.ok(entry !== undefined, '前提：recall 必须写日志')
+    assert.equal('shadow' in entry.detail, false, 'off 模式的日志不得出现 shadow 字段')
+    assert.ok(!entry.summary.includes('影子'), 'off 模式的摘要不得提影子模式')
+  })
+
+  it('on 模式的召回日志不带 shadow 字段（观察值已折进总分）', () => {
+    // on 模式里加分已经进了 total。此时再记一份 shadow 就是两个真相来源，
+    // 而且读者会分不清那 0.1 是「已生效」还是「只是假设」。
+    const lib = libraryWithLogs('on')
+    lib.engine.recall('CordisPlugin 版本')
+    const entry = lib.logs.filter((e) => e.kind === 'recall').at(-1)
+    assert.ok(entry !== undefined, '前提：recall 必须写日志')
+    assert.equal('shadow' in entry.detail, false, 'on 模式的日志不得出现 shadow 字段')
+  })
+
+  it('peek 不写日志，因此影子观察值也不会从 peek 泄进日志', () => {
+    // peek 是只读入口（起源 L29·第 5 条·专注当前位置）。它若写日志，
+    // 「看一眼」就等于「用过」，还会让日志里出现大量重复的影子记录。
+    const lib = libraryWithLogs('shadow')
+    const before = lib.logs.length
+    lib.engine.peek('CordisPlugin 版本')
+    assert.equal(lib.logs.length, before, 'peek 不得写日志')
+  })
+})
