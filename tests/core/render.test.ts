@@ -14,7 +14,8 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { renderFocusPackExplain } from '../../src/core/render.ts'
-import type { FocusPack, MemoryCard, ScoredCard } from '../../src/core/types.ts'
+import { formatTime, renderFocusPack } from '../../src/core/scoring.ts'
+import type { FocusPack, MemoryCard, ScoredCard, TimeState } from '../../src/core/types.ts'
 
 /**
  * 造一张最小可用的记忆卡。
@@ -237,5 +238,75 @@ describe('renderFocusPackExplain 的影子模式观察值', () => {
     })
     const pack = makePack([scored])
     assert.equal(renderFocusPackExplain(pack, 1), renderFocusPackExplain(pack, 1))
+  })
+})
+
+/**
+ * FR-D1：注入文本必须带上**当前绝对时刻**。
+ *
+ * 这条需求此前**零断言**——`renderFocusPack` 一直产出 `当前时间：...` 这一行，
+ * 但没有任何测试读它。`tests/core/scoring.test.ts` 那条截断用例只截
+ * `- [` 开头的行，恰好绕过了它。**「代码里有」和「有人守」是两件事**，
+ * 前者不能替代后者：这一行哪天被顺手删掉，全部测试依然绿。
+ *
+ * 为什么它重要：模型没有时钟。不给绝对时刻，它就无法判断「这条记忆是三年前的
+ * 还是昨天的」，只能靠猜——而猜年份是模型最容易编造的地方（起源 L19
+ * 「感受与经验」，L5「连续人生」都依赖时间锚点）。
+ *
+ * @module tests/core/render.test
+ */
+describe('renderFocusPack 的绝对时刻（FR-D1）', () => {
+  /** 造一个只有一张卡的非空焦点包。 */
+  function packWithOneCard(): FocusPack {
+    return makePack([makeScored('这个项目用 Qt5 开发', 0.6)])
+  }
+
+  it('注入文本包含「当前时间：YYYY-MM-DD HH:mm」且时区正确', () => {
+    const time: TimeState = {
+      now: 1_700_000_000_000, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+      sinceLastSession: null, sinceLastTurn: null, sessionStartedAt: null, due: [],
+    }
+    const rendered = renderFocusPack(packWithOneCard(), time)
+    const line = rendered.split('\n').find((l) => l.startsWith('当前时间：'))
+    assert.ok(line !== undefined, `注入文本必须有当前时间行，实际：\n${rendered}`)
+    // 断言具体值而不是「匹配 \d{4}」：正则只证明「有个像时间的东西」，
+    // 时区写错、格式漂移都能通过。这里把 UTC 与上海两个值都算出来对比，
+    // 才能证明**时区真的被用上了**（UTC 是 2023-11-14 22:13，上海是次日 06:13）。
+    assert.equal(line, '当前时间：2023-11-15 06:13')
+    assert.equal(formatTime(time.now, 'UTC'), '2023-11-14 22:13', '前提：两个时区在这一刻必须跨日，否则时区断言测不出东西')
+    assert.notEqual(formatTime(time.now, 'Asia/Shanghai'), formatTime(time.now, 'UTC'))
+  })
+
+  it('时间随注入时钟变化（不是写死的常量）', () => {
+    const base: TimeState = {
+      now: 1_700_000_000_000, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+      sinceLastSession: null, sinceLastTurn: null, sessionStartedAt: null, due: [],
+    }
+    const oneHourLater: TimeState = { ...base, now: base.now + 60 * 60 * 1000 }
+    const a = renderFocusPack(packWithOneCard(), base)
+    const b = renderFocusPack(packWithOneCard(), oneHourLater)
+    const lineOf = (text: string): string => text.split('\n').find((l) => l.startsWith('当前时间：')) ?? ''
+    assert.notEqual(lineOf(a), lineOf(b), '一小时之后注入的时间行必须不同，否则它是写死的')
+    assert.equal(lineOf(b), '当前时间：2023-11-15 07:13')
+  })
+
+  it('时间行只出现一次（重复注入会让模型以为有两套时钟）', () => {
+    const time: TimeState = {
+      now: 1_700_000_000_000, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+      sinceLastSession: null, sinceLastTurn: null, sessionStartedAt: null, due: [],
+    }
+    const rendered = renderFocusPack(packWithOneCard(), time)
+    const count = rendered.split('\n').filter((l) => l.startsWith('当前时间：')).length
+    assert.equal(count, 1, `当前时间行必须恰好一行，实际 ${count} 行`)
+  })
+
+  it('空包时不产出时间行（空包整体不注入）', () => {
+    // 与「空包返回空串」配对：若哪天改成空包也注入时间，模型会收到一段
+    // 只有时间、没有记忆的上下文，等于告诉它「有记忆但我没给你」。
+    const time: TimeState = {
+      now: 1_700_000_000_000, timeZone: 'Asia/Shanghai', localDate: '2023-11-14',
+      sinceLastSession: null, sinceLastTurn: null, sessionStartedAt: null, due: [],
+    }
+    assert.equal(renderFocusPack(makePack([]), time), '')
   })
 })
