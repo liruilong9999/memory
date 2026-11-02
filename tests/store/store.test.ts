@@ -459,3 +459,56 @@ describe('多写者保护（D-08）', () => {
     defaulted.close()
   })
 })
+
+/**
+ * 进程内并发写入（任务卡 task-3 的 `Promise.all` 验收项）。
+ *
+ * ## 结论：进程内不需要写锁，因为 `append` 全程同步
+ *
+ * 实测 100 个 async 上下文同时触发 `append`（每个之间插 `await` 让出），
+ * 磁盘上 100 条记录、序号 `1..100` 连续无重复、无空洞。
+ *
+ * 原因不是「运气好」或「概率低」，而是**结构性**的：`append` 从取
+ * `lastSeq()` 到 `writeSync` 结束全程没有 `await`，JS 单线程下一个同步函数
+ * 一旦开始就不可被抢占。所以「两个 async 上下文同时写」在进程内**不存在**
+ * 交错窗口，加锁只会增加代码而不增加正确性。
+ *
+ * ## 那这条测试守什么
+ *
+ * 守的是**将来**：若有人把 `append` 改成 `async`（比如为了加 fsync 队列、
+ * 或换成异步 IO），同步性这条隐含前提就没了，进程内交错立刻成为真实风险。
+ * 那时这条测试会变红——**它守的不是当前行为，是一个会被悄悄破坏的前提**。
+ *
+ * 跨进程的真实风险不在这里，见上面的「多写者保护（D-08）」。
+ */
+describe('进程内并发写入', () => {
+  it('多个 async 上下文同时写入不应产生重复序号或丢记录', async () => {
+    const dir = tempDir()
+    const store = openStore({ config: makeConfig(), dataDir: dir })
+    const N = 100
+
+    await Promise.all(
+      Array.from({ length: N }, async (_, i) => {
+        // 故意让出一个 microtask，给「交错」制造机会。同步实现下这不会改变结果，
+        // 一旦实现变成异步，这里就会开始丢记录或撞序号。
+        await Promise.resolve()
+        store.putCard(makeCard({ id: `c${i}` }))
+      }),
+    )
+
+    // 正向证据：先确认写入真的发生了。若 count 不是 N，下面「序号连续」的
+    // 结论就没有意义——那可能只是一条都没写进去。
+    assert.equal(store.count(), N, `前提：${N} 条记录必须全部写入`)
+    assert.equal(store.snapshot().lastSeq, N, `序号水位应为 ${N}`)
+
+    const seqs = store.listCards().length
+    assert.equal(seqs, N)
+
+    // 关掉重开，从磁盘读——内存里的 lastSeq 是自报的，磁盘才是证据。
+    store.close()
+    const reader = openStore({ config: makeConfig(), dataDir: dir })
+    assert.equal(reader.count(), N, '重放后条数必须一致（无丢失）')
+    assert.equal(reader.snapshot().lastSeq, N, '重放后序号水位必须一致（无重复）')
+    reader.close()
+  })
+})
