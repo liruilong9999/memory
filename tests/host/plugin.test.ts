@@ -17,6 +17,7 @@
 import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import { apply, contextOrder, consolidationPollMs, name } from '../../src/index.ts'
 import type { HostContext } from '../../src/host/adapter.ts'
 import { openStore } from '../../src/store/store.ts'
@@ -68,8 +69,13 @@ interface RecordingHost {
   intervals: { callback: () => void; ms: number }[]
   logs: string[]
   effects: (() => void)[]
-  /** 触发某个事件的所有监听器。 */
-  emit: (event: string, payload: unknown) => Promise<void>
+  /**
+   * 触发某个事件的所有监听器。
+   *
+   * 用可变参数是因为宿主事件不都是单参数：`session/event` 派发的是
+   * `(session, event)` 两个参数，只传一个会让生产代码取不到事件。
+   */
+  emit: (event: string, ...payload: unknown[]) => Promise<void>
   /** 取某次动态上下文的渲染函数。 */
   render: (index?: number) => string
 }
@@ -151,10 +157,10 @@ function makeHost(overrides: { dropContext?: boolean; dropEvents?: boolean; drop
     intervals,
     logs,
     effects,
-    emit: async (event, payload) => {
+    emit: async (event, ...payload) => {
       for (const subscription of subscriptions) {
         if (subscription.event !== event) continue
-        await subscription.listener(payload)
+        await subscription.listener(...payload)
       }
     },
     render: (index = 0) => {
@@ -173,17 +179,30 @@ function makeHost(overrides: { dropContext?: boolean; dropEvents?: boolean; drop
  * @param events - 事件数组。
  * @returns 假 agent。
  */
-function makeAgent(events: { type: string; data: unknown }[]): unknown {
-  return {
-    session: {
-      id: 'sess-test',
-      seq: events.length,
-      eventAt: (index: number) => {
-        const event = events[index]
-        if (event === undefined) return undefined
-        return { type: event.type, data: event.data }
-      },
-    },
+/**
+ * 造一个假 agent。
+ *
+ * 刻意**不带** `eventAt`：宿主已把它标为 @deprecated 且禁止新调用，
+ * 生产代码改成订阅 `session/event` 增量累积，假宿主也要跟着换模型，
+ * 否则测试在验证一条已经不存在的调用路径。
+ */
+function makeAgent(): unknown {
+  return { session: { id: 'sess-test' } }
+}
+
+/**
+ * 把一组会话事件推给已订阅的 `session/event` 监听器。
+ *
+ * 生产代码靠这个事件累积本轮文本，所以测试必须按真实顺序投递：
+ * 先 `turn/start`，再消息事件。
+ *
+ * @param host - 记录型假宿主。
+ * @param events - 要投递的事件。
+ */
+async function emitSessionEvents(host: RecordingHost, events: { type: string; data: unknown }[]): Promise<void> {
+  const session = { id: 'sess-test' }
+  for (const event of events) {
+    await host.emit('session/event', session, event)
   }
 }
 
@@ -278,7 +297,9 @@ describe('apply 的写路径（FR-A1）', () => {
     await apply(host.ctx, baseConfig(tempDir()))
     // 订阅是「监听宿主事件」，不是「注册新事件类型」。
     // C5 禁止的是往 session 日志里写自定义类型，这里只检查订阅的都是宿主已知事件。
-    const allowed = new Set(['agent/turn-stopping'])
+    // session/event 是宿主内建事件（Session.commit 里派发），不是我们新造的类型；
+    // 订阅它正是 C5 推荐的姿势——读会话日志，而不往日志里写自定义事件。
+    const allowed = new Set(['agent/turn-stopping', 'session/event'])
     for (const subscription of host.subscriptions) {
       assert.ok(allowed.has(subscription.event), `不应订阅未知事件 ${subscription.event}`)
     }
@@ -289,7 +310,8 @@ describe('apply 的写路径（FR-A1）', () => {
     const host = makeHost()
     await apply(host.ctx, baseConfig(dir))
 
-    const agent = makeAgent([
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
       turnStartEvent(1),
       userEvent('我决定用 Alembic 管理数据库迁移，不要手写 SQL'),
       assistantEvent('好的，我记下了。Alembic 会自动生成迁移脚本。'),
@@ -308,7 +330,8 @@ describe('apply 的写路径（FR-A1）', () => {
     const host = makeHost()
     await apply(host.ctx, baseConfig(dir))
 
-    const agent = makeAgent([
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
       turnStartEvent(1),
       userEvent('我决定用 Alembic 管理数据库迁移，不要手写 SQL'),
       assistantEvent('好的。'),
@@ -339,7 +362,8 @@ describe('apply 的写路径（FR-A1）', () => {
     const dir = tempDir()
     const host = makeHost()
     await apply(host.ctx, baseConfig(dir))
-    const agent = makeAgent([turnStartEvent(1), userEvent('')])
+    const agent = makeAgent()
+    await emitSessionEvents(host, [turnStartEvent(1), userEvent('')])
     await host.emit('agent/turn-stopping', { agent, turn: 1 })
     const store = openStore({ dataDir: dir })
     const cards = store.listCards({ status: 'active' })
@@ -348,21 +372,144 @@ describe('apply 的写路径（FR-A1）', () => {
   })
 })
 
-describe('apply 的夜整理接线（FR-C1）', () => {
-  it('注册了定时器', async () => {
+describe('apply 的到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
+  it('到点后主动唤醒，无需用户输入（FR-D3 验收原文）', async () => {
+    const dir = tempDir()
     const host = makeHost()
-    await apply(host.ctx, baseConfig(tempDir()))
-    assert.equal(host.intervals.length, 1)
-    assert.equal(host.intervals[0]?.ms, consolidationPollMs())
+    // 用一个可控时钟：先写卡，再把时钟推到到期之后。
+    const clock = { now: Date.UTC(2024, 0, 15, 2, 0, 0) } // 2024-01-15 10:00 上海
+    await apply(host.ctx, {
+      ...baseConfig(dir),
+      reminder: { enabled: true, pollMs: 1000 },
+      _clock: () => clock.now,
+    })
+
+    // 1. 投递一轮对话，让系统记住「明天下午三点提醒我交周报」。
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('明天下午三点提醒我交周报，别忘了'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    // 2. 还没到点：轮询不应该唤醒。
+    const wakes: unknown[] = []
+    const followup = (message: unknown): void => {
+      wakes.push(message)
+    }
+    ;(agent as { followup: unknown }).followup = followup
+    // 重新投递一次 turn-stopping，让插件记住这个可唤醒的 agent。
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    const poll = host.intervals.find((timer) => timer.ms === 1000)
+    assert.ok(poll !== undefined, '应有到期轮询定时器')
+    poll.callback()
+    assert.equal(wakes.length, 0, '未到点不应唤醒')
+
+    // 3. 把时钟推到到期时刻之后，轮询应该主动唤醒。
+    clock.now = Date.UTC(2024, 0, 16, 7, 1, 0) // 2024-01-16 15:01 上海
+    poll.callback()
+    assert.equal(wakes.length, 1, '到点应主动唤醒一次')
+
+    // 4. 再轮询一次不应重复唤醒（同一到期只提醒一次）。
+    poll.callback()
+    assert.equal(wakes.length, 1, '同一到期不应重复唤醒')
   })
 
-  it('consolidation.enabled = false 时不注册定时器', async () => {
+  it('提醒文本包含到期事项且说明来自系统', async () => {
+    const dir = tempDir()
+    const host = makeHost()
+    const clock = { now: Date.UTC(2024, 0, 15, 2, 0, 0) }
+    await apply(host.ctx, {
+      ...baseConfig(dir),
+      reminder: { enabled: true, pollMs: 1000 },
+      _clock: () => clock.now,
+    })
+
+    const agent = makeAgent()
+    const wakes: unknown[] = []
+    ;(agent as { followup: unknown }).followup = (message: unknown): void => {
+      wakes.push(message)
+    }
+    await emitSessionEvents(host, [turnStartEvent(1), userEvent('明天下午三点提醒我交周报')])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    clock.now = Date.UTC(2024, 0, 16, 7, 1, 0)
+    host.intervals.find((timer) => timer.ms === 1000)?.callback()
+
+    assert.equal(wakes.length, 1)
+    const message = wakes[0] as { content?: { text?: string }[] }
+    const text = message.content?.[0]?.text ?? ''
+    assert.ok(text.includes('到期提醒'), '应标注这是到期提醒')
+    assert.ok(text.includes('不是用户输入'), '应说明消息来自系统')
+    assert.ok(text.includes('周报'), '应包含到期事项原文')
+  })
+
+  it('没有可唤醒 agent 时不丢提醒，下次轮询再投递', async () => {
+    const dir = tempDir()
+    const host = makeHost()
+    const clock = { now: Date.UTC(2024, 0, 15, 2, 0, 0) }
+    await apply(host.ctx, {
+      ...baseConfig(dir),
+      reminder: { enabled: true, pollMs: 1000 },
+      _clock: () => clock.now,
+    })
+
+    // 写卡时 agent 不可唤醒（没有 followup）。
+    const plainAgent = makeAgent()
+    await emitSessionEvents(host, [turnStartEvent(1), userEvent('明天下午三点提醒我交周报')])
+    await host.emit('agent/turn-stopping', { agent: plainAgent, turn: 1 })
+
+    const poll = host.intervals.find((timer) => timer.ms === 1000)
+    clock.now = Date.UTC(2024, 0, 16, 7, 1, 0)
+    assert.doesNotThrow(() => poll?.callback(), '没有可唤醒 agent 时不应抛错')
+
+    // 换成可唤醒的 agent 后，同一次到期仍应投递（说明没被提前标记为已提醒）。
+    const wakes: unknown[] = []
+    const agent = makeAgent()
+    ;(agent as { followup: unknown }).followup = (message: unknown): void => {
+      wakes.push(message)
+    }
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+    poll?.callback()
+    assert.equal(wakes.length, 1, '提醒不应因为一次没投出去就永久丢失')
+  })
+})
+
+describe('apply 的夜整理接线（FR-C1）', () => {
+  it('注册了夜整理定时器', async () => {
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(tempDir()))
+    const consolidation = host.intervals.find((timer) => timer.ms === consolidationPollMs())
+    assert.ok(consolidation !== undefined, '应有夜整理定时器')
+  })
+
+  it('consolidation.enabled = false 时不注册夜整理定时器', async () => {
     const host = makeHost()
     await apply(host.ctx, {
       storage: { dataDir: tempDir() },
       consolidation: { enabled: false },
+      // 到期轮询是另一个独立能力，这里必须一起关掉才能断言「零定时器」。
+      reminder: { enabled: false },
     })
     assert.equal(host.intervals.length, 0)
+  })
+
+  it('注册了到期轮询定时器（FR-D3 主动接力）', async () => {
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(tempDir()))
+    const reminder = host.intervals.find((timer) => timer.ms === DEFAULT_CONFIG.reminder.pollMs)
+    assert.ok(reminder !== undefined, '应有到期轮询定时器')
+  })
+
+  it('reminder.enabled = false 时不注册到期轮询', async () => {
+    const host = makeHost()
+    await apply(host.ctx, {
+      storage: { dataDir: tempDir() },
+      reminder: { enabled: false },
+    })
+    const reminder = host.intervals.find((timer) => timer.ms === DEFAULT_CONFIG.reminder.pollMs)
+    assert.equal(reminder, undefined)
   })
 
   it('定时器回调可执行且不抛错', async () => {

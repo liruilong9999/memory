@@ -136,6 +136,24 @@ export interface ConsolidationPolicy {
   maxArchiveRatio: number
 }
 
+/** 到期提醒参数（FR-D3 / SC-5 / 起源 L21）。 */
+export interface ReminderPolicy {
+  /**
+   * 是否启用主动唤醒。
+   *
+   * 关掉后仍会把到期事项渲染进时间读数，但不会在到点时主动接力——
+   * 那就是 FR-D3 的一半，所以默认开启。
+   */
+  enabled: boolean
+  /**
+   * 轮询间隔（毫秒）。
+   *
+   * 轮询而不是精确定时：提醒不需要秒级精度，而逐个定时器会随卡片数量膨胀。
+   * 默认 60 秒，代价是最大 1 分钟的提醒延迟，远好于「只在用户开口时才发现已过期」。
+   */
+  pollMs: number
+}
+
 /** 完整配置。 */
 export interface MemoryConfig {
   /** 配置版本号，改动默认值时必须递增（FR-F4）。 */
@@ -154,6 +172,8 @@ export interface MemoryConfig {
   storage: StoragePolicy
   /** 巩固策略。 */
   consolidation: ConsolidationPolicy
+  /** 到期提醒策略（FR-D3）。 */
+  reminder: ReminderPolicy
   /** 调试开关：记录每次召回的解释。 */
   debugExplain: boolean
 }
@@ -225,6 +245,10 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     maxCardsPerRun: 5000,
     maxArchiveRatio: 0.05,
   },
+  reminder: {
+    enabled: true,
+    pollMs: 60 * 1000,
+  },
   debugExplain: true,
 }
 
@@ -292,6 +316,8 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (!/^\d{2}:\d{2}$/u.test(config.consolidation.dailyAt)) {
     errors.push('consolidation.dailyAt 必须是 HH:mm 形式')
   }
+  // 轮询间隔太短会空转烧 CPU，太长则提醒延迟不可接受（FR-D3）。
+  if (config.reminder.pollMs < 1000) errors.push('reminder.pollMs 必须 ≥ 1000（1 秒）')
   return { ok: errors.length === 0, errors }
 }
 
@@ -315,6 +341,7 @@ export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConf
     extraction: { ...base.extraction, ...override.extraction },
     storage: { ...base.storage, ...override.storage },
     consolidation: { ...base.consolidation, ...override.consolidation },
+    reminder: { ...base.reminder, ...override.reminder },
     debugExplain: override.debugExplain ?? base.debugExplain,
   }
   // 数组字段必须整体替换，浅合并会让用户的自定义关键词被默认值覆盖。

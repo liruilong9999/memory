@@ -482,7 +482,7 @@ Loader 的 `tree.import` 分三种情况：
 宿主在装配 patch 时，会把**相对/绝对路径**的行 `name` 预先转成 `file://` URL：
 
 ```ts
-// packages/boot/app-boot/src/index.ts:547-556
+// packages/boot/app-boot/src/index.ts:546-557
 function anchorInsertedPluginNames(patches: PatchOptions[], file: string): void {
   const base = dirname(file)
   ...
@@ -616,7 +616,7 @@ function resolveContext(entry: PromptContext, context: AssembleContext): Assembl
 对照 `section()`（另一条通道，本系统不用）：
 
 ```ts
-// packages/core/system-prompt/src/index.ts:485-494
+// packages/core/system-prompt/src/index.ts:477-494
   section(section: PromptSection): () => void {
     if (!Number.isFinite(section.order)) {
       throw new TypeError(`prompt section "${section.name}" order must be a finite number`)
@@ -2565,6 +2565,16 @@ declare const CONSOLIDATION_POLL_MS: number
 ## 9. 最小可运行接线代码
 
 ### 9.1 `src/index.ts`
+
+> **阅读提示**：下面的 `apply` 是**目标形态**，逐行标注的是「宿主 API 长什么样、为什么要这样调」。
+> 其中 `engine.open()` / `engine.focusPackSync()` / `engine.observeUser()` / `engine.observeAssistant()` /
+> `engine.observeTurnEnd()` / `engine.observeCompaction()` / `engine.flushTurn()` / `engine.runCommand()` /
+> `engine.consolidateOnce()` 是**本骨架建议新增的引擎方法名**，当前的 `src/host/engine.ts` 只有
+> `writeTurn()` / `recall()` / `renderTime()` / `consolidate()` / `health()` / `metrics()` 等
+> （`src/host/engine.ts:120/170/225/235/398/442`），存储打开由 `openStore()` 完成
+> （`src/store/store.ts:383-387`）。把这些方法补齐是**落地工作**，不是宿主 API 的结论；
+> 宿主侧事实（`ctx.on` / `ctx.systemPrompt.context` / `ctx.commands.register` / `ctx.interval` 的
+> 签名、事件 payload、同步约束）才是本文的实证内容。
 
 ```ts
 /**

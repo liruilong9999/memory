@@ -16,7 +16,7 @@ import type { MemoryConfig } from '../core/config.ts'
 import { extractMemoryCards } from '../core/extraction.ts'
 import type { TurnInput } from '../core/extraction.ts'
 import {
-  buildFocusPack, formatDuration, makeQuery, renderFocusPack, scoreCards,
+  buildFocusPack, formatDuration, formatTime, makeQuery, renderFocusPack, scoreCards,
 } from '../core/scoring.ts'
 import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
@@ -87,6 +87,13 @@ export class MemoryEngine {
   private lastConsolidationAt: number | null = null
   /** 每轮召回次数计数，用于 FR-F3。 */
   private recallCount = 0
+  /**
+   * 已提醒过的到期时刻：`cardId → dueAt`。
+   *
+   * 记住「到期时刻」而不是「提醒过」这个布尔值，是因为每日/每周提醒的
+   * `dueAt` 会推进；只有推进到新时刻才应该再唤醒一次（FR-D3）。
+   */
+  private readonly remindedDueAt = new Map<string, number>()
 
   /**
    * @param options - 引擎参数。
@@ -248,6 +255,65 @@ export class MemoryEngine {
    */
   now(): number {
     return this.clock()
+  }
+
+  /**
+   * 取此刻已到期、但尚未提醒过的记忆卡（FR-D3 / SC-5 / 起源 L21）。
+   *
+   * 「到点无需用户输入自行接力」是 FR-D3 的验收原文：
+   * 光把到期时刻渲染进时间读数不够——那只在用户恰好开口时才可见。
+   * 必须有一个主动轮询者（宿主定时器）在到点时来问「有什么到期了」，
+   * 再据此唤醒模型。
+   *
+   * 为什么要「尚未提醒过」：同一个提醒不能每次轮询都唤醒一次，
+   * 否则会变成刷屏。已提醒的卡记在 {@link remindedDueAt} 里，
+   * 只在到期时刻发生变化（例如每日/每周重复推进）时才会再次触发。
+   *
+   * @param at - 检查时刻；省略时取当前时钟。
+   * @returns 需要提醒的卡片，按到期时刻升序。
+   */
+  dueNow(at = this.clock()): MemoryCard[] {
+    const due = pickDue(this.store.listCards({ status: 'active' }), at)
+    return due.filter((card) => this.remindedDueAt.get(card.id) !== card.dueAt)
+  }
+
+  /**
+   * 标记这些卡「已经提醒过」，避免同一到期被重复唤醒。
+   *
+   * 与 {@link dueNow} 配对使用：调用方拿到要提醒的卡、成功投递之后再调本方法。
+   * 先投递后标记的顺序很重要——投递失败时不应吞掉提醒。
+   *
+   * @param cards - 已提醒的卡片。
+   */
+  markReminded(cards: readonly MemoryCard[]): void {
+    for (const card of cards) {
+      // dueAt 是可选属性，undefined 与 null 都表示「没有到期时刻」。
+      if (typeof card.dueAt === 'number') this.remindedDueAt.set(card.id, card.dueAt)
+    }
+  }
+
+  /**
+   * 把到期事项渲染成一段可直接投递给模型的提醒文本（FR-D3）。
+   *
+   * 措辞刻意包含「无需用户输入」的说明，因为这句话会作为一条新的用户消息
+   * 进入对话，模型需要知道它来自系统而不是人。
+   *
+   * @param cards - 已到期的卡片。
+   * @param at - 提醒时刻。
+   * @returns 提醒文本；`cards` 为空时返回空串。
+   */
+  renderDueReminder(cards: readonly MemoryCard[], at = this.clock()): string {
+    if (cards.length === 0) return ''
+    const lines: string[] = []
+    lines.push('## 到期提醒（由记忆系统定时投递，不是用户输入）')
+    lines.push(`当前时间：${formatTime(at, this.timeZone)}`)
+    lines.push('')
+    for (const card of cards) {
+      lines.push(`- ${card.text}`)
+    }
+    lines.push('')
+    lines.push('这些事项的约定时间已到，请主动提醒用户或继续推进；不需要等待用户再次开口。')
+    return lines.join('\n')
   }
 
   /**

@@ -48,8 +48,51 @@ const CONSOLIDATION_POLL_MS = 60 * 60 * 1000
 /** 注册名：动态上下文。 */
 const CONTEXT_NAME = 'memory:focus-pack'
 
+/** 换行符：消息片段之间用换行拼接。 */
+const NL = String.fromCharCode(10)
+
 /** 插件名，宿主日志与 loader 诊断用。 */
 export const name = 'memory'
+
+/**
+ * 可唤醒的 agent：只声明我们真正用到的两个成员。
+ *
+ * 刻意不 import 宿主的 `Agent` 类型（见 `src/host/adapter.ts` 的说明）：
+ * 结构探测让离线单测能传假 agent，宿主升级也不会让编译期崩掉（C8）。
+ */
+interface WakeableAgent {
+  /** 队列一条后续消息并唤醒驱动器。 */
+  followup: (message: unknown) => void
+}
+
+/**
+ * 判断一个宿主对象是否可唤醒。
+ *
+ * @param agent - 候选对象。
+ * @returns 具有 `followup` 函数时为 `true`。
+ */
+function isWakeable(agent: unknown): agent is WakeableAgent {
+  if (typeof agent !== 'object' || agent === null) return false
+  return typeof (agent as { followup?: unknown }).followup === 'function'
+}
+
+/**
+ * 构造一条可投递给 `followup` 的用户消息。
+ *
+ * 宿主侧的 `UserMessage` 要求 `{ content: [{type:'text', text}], source:{kind:'user'} }`。
+ * 我们在这里手工拼形状而不调 `createUserMessage`：那会把 `@deepseek-ai/*`
+ * 变成运行时依赖，违背适配面「零宿主依赖」的设计。
+ *
+ * @param text - 消息正文。
+ * @returns 宿主可接受的消息对象。
+ */
+function makeWakeMessage(text: string): unknown {
+  return {
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }
+}
 
 /**
  * 宿主侧接线状态。
@@ -68,64 +111,102 @@ interface Wiring {
 }
 
 /**
- * 从会话事件里取本轮的用户与助手文本。
+ * 一轮对话的文本累积器。
  *
- * 为什么从 session 反查而不是靠事件 payload：`agent/turn-stopping` 只给
- * `{ agent, turn, signal }`，没有消息文本。会话事件才是唯一真相源（P2 的精神），
- * 所以这里按 seq 从后往前扫，读到本轮为止。
+ * 为什么用「累积」而不是「回扫会话事件」：
+ * 宿主把 `Session.eventAt()` / `snapshotEvents()` / `ownEvents()` 三个同步读历史
+ * 的方法全部标了 `@deprecated`，迁移说明写得很明确——
+ * 「Existing logic may remain unmigrated for now, but **new calls are prohibited**」。
+ * 我们这是新代码，回扫历史属于明令禁止的用法。
  *
- * @param agent - 宿主 agent 对象（结构化访问，不 import 宿主类型）。
- * @param turn - 轮次号。
- * @returns 用户与助手文本；读不到时都为空串。
+ * 正确姿势是订阅 `session/event`（post-commit、fire-and-forget、监听器异常被兜住），
+ * 在事件到达时把消息文本增量记下来；`agent/turn-stopping` 时直接读累积结果。
+ * 这样既不依赖「完整历史常驻内存」这个即将消失的前提，也天然满足 P2（会话日志是真相源）。
  */
-function readTurnText(agent: unknown, turn: number): { userText: string; assistantText: string; seq: number } {
-  if (typeof agent !== 'object' || agent === null) return { userText: '', assistantText: '', seq: 0 }
-  const session = (agent as { session?: unknown }).session
-  if (typeof session !== 'object' || session === null) return { userText: '', assistantText: '', seq: 0 }
-  const cursor = session as {
-    seq?: unknown
-    eventAt?: (seq: number) => unknown
-  }
-  const last = typeof cursor.seq === 'number' ? cursor.seq : 0
-  if (typeof cursor.eventAt !== 'function') return { userText: '', assistantText: '', seq: last }
+interface TurnBuffer {
+  /** 本轮用户消息片段，按到达顺序。 */
+  user: string[]
+  /** 本轮助手消息片段，按到达顺序。 */
+  assistant: string[]
+  /** 本轮的轮次号；未知时为 `null`。 */
+  turn: number | null
+}
 
-  const userParts: string[] = []
-  const assistantParts: string[] = []
-  // 从最新事件往前扫，直到读到本轮起点（turn/start）为止。
-  for (let index = last - 1; index >= 0; index -= 1) {
-    const event = cursor.eventAt(index) as
-      | { type?: string; data?: { turn?: number } & Record<string, unknown> }
-      | undefined
-    if (event === undefined) continue
-    if (event.type === 'turn/start') {
-      if (event.data?.turn === turn) break
-      continue
-    }
-    if (event.type !== 'user/message' && event.type !== 'assistant/message') continue
-    const text = messageText(event.data)
-    if (text.length === 0) continue
-    if (event.type === 'user/message') userParts.unshift(text)
-    else assistantParts.unshift(text)
-  }
+/** 每个会话的累积器：`sessionId → 当前轮缓冲`。 */
+type TurnBuffers = Map<string, TurnBuffer>
+
+/**
+ * 读本轮已累积的用户与助手文本。
+ *
+ * @param buffers - 各会话的累积器。
+ * @param sessionId - 会话 id。
+ * @returns 用户与助手文本；没有累积到内容时都为空串。
+ */
+function readTurnText(buffers: TurnBuffers, sessionId: string): { userText: string; assistantText: string } {
+  const buffer = buffers.get(sessionId)
+  if (buffer === undefined) return { userText: '', assistantText: '' }
   return {
-    userText: userParts.join('\n'),
-    assistantText: assistantParts.join('\n'),
-    seq: last,
+    userText: buffer.user.join(NL),
+    assistantText: buffer.assistant.join(NL),
   }
 }
 
+/**
+ * 把一条 `session/event` 归并进累积器。
+ *
+ * 只关心三类事件：
+ * - `turn/start`：开新轮，清空缓冲（上一轮已经处理过）。
+ * - `user/message`：追加用户文本。
+ * - `assistant/message`：追加助手文本。
+ *
+ * @param buffers - 各会话的累积器。
+ * @param sessionId - 会话 id。
+ * @param event - 会话事件。
+ */
+function accumulateEvent(buffers: TurnBuffers, sessionId: string, event: unknown): void {
+  if (typeof event !== 'object' || event === null) return
+  const record = event as { type?: unknown; data?: unknown }
+  const type = record.type
+  if (type === 'turn/start') {
+    const data = record.data as { turn?: unknown } | undefined
+    const turn = typeof data?.turn === 'number' ? data.turn : null
+    buffers.set(sessionId, { user: [], assistant: [], turn })
+    return
+  }
+  if (type !== 'user/message' && type !== 'assistant/message') return
+  const text = messageText(record.data)
+  if (text.length === 0) return
+  let buffer = buffers.get(sessionId)
+  if (buffer === undefined) {
+    buffer = { user: [], assistant: [], turn: null }
+    buffers.set(sessionId, buffer)
+  }
+  if (type === 'user/message') buffer.user.push(text)
+  else buffer.assistant.push(text)
+}
 /**
  * 从消息对象里抽纯文本。
  *
  * 宿主消息是 `content: ContentBlock[]`，这里只认文本块，其它块（图片/文件）忽略：
  * 记忆卡只存文本摘要，二进制内容没有语义价值（且会撑爆日志）。
  *
+ * 两种载荷形状都要认（见 `packages/core/session/src/types.ts`）：
+ * - `user/message` 的 data **就是** `UserMessage`，`content` 在顶层；
+ * - `assistant/message` 的 data 是 `{ turn, step, message, stream, usage }`，
+ *   `content` 在 `message.content` 里。
+ *
  * @param data - 消息事件数据。
  * @returns 拼接后的文本；无法解析时为空串。
  */
 function messageText(data: unknown): string {
   if (typeof data !== 'object' || data === null) return ''
-  const content = (data as { content?: unknown }).content
+  const record = data as { content?: unknown; message?: unknown }
+  // assistant/message 把真正的消息包在 message 字段里，先剥一层。
+  const inner =
+    record.content === undefined && typeof record.message === 'object' && record.message !== null
+      ? record.message
+      : record
+  const content = (inner as { content?: unknown }).content
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
   const parts: string[] = []
@@ -134,7 +215,7 @@ function messageText(data: unknown): string {
     const item = block as { type?: unknown; text?: unknown }
     if (item.type === 'text' && typeof item.text === 'string') parts.push(item.text)
   }
-  return parts.join('\n')
+  return parts.join(NL)
 }
 
 /**
@@ -200,11 +281,18 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     logger.warn(`宿主缺少能力：${capabilities.missing.join('、')}，相关功能降级`)
   }
 
+  // 最近一个可唤醒的 agent。到期提醒要靠它主动接力（FR-D3 / 起源 L21）。
+  let lastAgent: WakeableAgent | null = null
   const store = openStore({ config })
+  // 时钟注入：`_clock` 是内部测试通道（下划线前缀表示非公开配置）。
+  // 生产环境不传，退回 `Date.now()`；测试靠它把时钟推到「明天下午三点」。
+  const rawClock = (rawConfig as { _clock?: unknown } | undefined)?._clock
+  const clock = typeof rawClock === 'function' ? (rawClock as () => number) : undefined
   const engine = new MemoryEngine({
     store,
     config,
     timeZone: resolveTimeZone(),
+    clock,
     onLog: (entry) => logger.debug(`${entry.kind} ${entry.summary}`),
   })
 
@@ -223,17 +311,32 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   )
   if (!injected) logger.warn('无法注册动态上下文，记忆不会被注入到系统提示词')
 
+  // ---- 会话事件累积（P2：会话日志是唯一真相源）----
+  // 不用 Session.eventAt() 回扫：宿主已把它标为 @deprecated 且禁止新调用。
+  // 改成订阅 session/event（post-commit、fire-and-forget），增量累积本轮文本。
+  const turnBuffers: TurnBuffers = new Map()
+  const sessionEvents = subscribe(ctx, 'session/event', (...args: unknown[]) => {
+    const session = args[0] as { id?: unknown } | undefined
+    const sessionId = typeof session?.id === 'string' ? session.id : ''
+    if (sessionId.length === 0) return
+    accumulateEvent(turnBuffers, sessionId, args[1])
+  })
+  if (!sessionEvents) logger.warn('无法订阅 session/event，记忆不会被写入')
+
   // ---- 写路径（FR-A1 / 起源 L27 第 4 条「今日记忆渐进累积」）----
   const turnStopping = subscribe(ctx, 'agent/turn-stopping', (...args: unknown[]) => {
     const payload = args[0] as { agent?: unknown; turn?: unknown } | undefined
     const turn = typeof payload?.turn === 'number' ? payload.turn : 0
-    const { userText, assistantText, seq } = readTurnText(payload?.agent, turn)
+    // 记住这个 agent：到期提醒需要靠它主动唤醒（FR-D3「到点无需用户输入自行接力」）。
+    if (isWakeable(payload?.agent)) lastAgent = payload.agent
+    const sessionId = sessionIdOf(payload?.agent)
+    const { userText, assistantText } = readTurnText(turnBuffers, sessionId)
     if (userText.length === 0) return
     const input: TurnInput = {
-      sessionId: sessionIdOf(payload?.agent),
+      sessionId,
       turn,
       step: 0,
-      seq,
+      seq: 0,
       userText,
       assistantText,
       domain: pickDomain(config),
@@ -245,14 +348,27 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
       // 写记忆失败不能影响用户回复：记一条日志然后放行。
       logger.error(`写入记忆失败：${error instanceof Error ? error.message : String(error)}`)
     }
+    // 本轮已处理完，清空缓冲避免下一轮重复写入（turn/start 也会清，双保险）。
+    turnBuffers.delete(sessionId)
   })
   if (!turnStopping) logger.warn('无法订阅 agent/turn-stopping，记忆不会被写入')
 
   // ---- 夜整理（FR-C1 / 起源 L27 第 4 条「夜晚休眠整理」）----
+  const timers: Array<() => void> = []
+  wiring.disposeTimer = () => {
+    for (const dispose of timers) {
+      try {
+        dispose()
+      } catch {
+        // 卸载时单个定时器清理失败不应阻断其余清理。
+      }
+    }
+    timers.length = 0
+  }
   if (config.consolidation.enabled) {
     let lastRunAt: number | null = null
     const timeZone = resolveTimeZone()
-    wiring.disposeTimer = setRepeating(ctx, () => {
+    timers.push(setRepeating(ctx, () => {
       const now = engine.now()
       if (!shouldRunDaily(lastRunAt, now, timeZone, config.consolidation.dailyAt)) return
       try {
@@ -262,7 +378,40 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
       } catch (error) {
         logger.error(`夜整理失败：${error instanceof Error ? error.message : String(error)}`)
       }
-    }, CONSOLIDATION_POLL_MS)
+    }, CONSOLIDATION_POLL_MS))
+  }
+
+  // ---- 到期提醒（FR-D3 / SC-5 / 起源 L21「定闹钟」）----
+  // 「到点无需用户输入自行接力」的验收要求：必须有一个主动轮询者。
+  // 只把到期事项渲染进时间读数是不够的——那只在用户恰好开口时才可见。
+  if (config.reminder.enabled) {
+    timers.push(setRepeating(ctx, () => {
+      const now = engine.now()
+      let cards
+      try {
+        cards = engine.dueNow(now)
+      } catch (error) {
+        logger.error(`检查到期事项失败：${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
+      if (cards.length === 0) return
+      if (lastAgent === null) {
+        // 还没有可唤醒的 agent：保留提醒，等下一次轮询再试。
+        // 不能在这里 markReminded，否则这次提醒就永远丢了。
+        logger.debug(`有 ${cards.length} 项到期，但当前没有可唤醒的会话`)
+        return
+      }
+      const text = engine.renderDueReminder(cards, now)
+      if (text.length === 0) return
+      try {
+        lastAgent.followup(makeWakeMessage(text))
+        // 投递成功后才标记，失败时下次轮询还能重试。
+        engine.markReminded(cards)
+        logger.info(`到期提醒已投递：${cards.length} 项`)
+      } catch (error) {
+        logger.error(`投递到期提醒失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }, config.reminder.pollMs))
   }
 
   // ---- 用户命令（FR-F2）----
