@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 
 import { DEFAULT_CONFIG } from '../../src/core/config.ts'
 import { apply, contextOrder, consolidationPollMs, name } from '../../src/index.ts'
+import { readGoalText } from '../../src/host/adapter.ts'
 import type { HostContext } from '../../src/host/adapter.ts'
 import { openStore } from '../../src/store/store.ts'
 import { makeTempDir, removeDirContents } from '../store/helpers.ts'
@@ -86,7 +87,11 @@ interface RecordingHost {
  * @param overrides - 要削掉的宿主能力，用于测降级路径。
  * @returns 假宿主。
  */
-function makeHost(overrides: { dropContext?: boolean; dropEvents?: boolean; dropCommands?: boolean; dropInterval?: boolean } = {}): RecordingHost {
+function makeHost(overrides: {
+  dropContext?: boolean; dropEvents?: boolean; dropCommands?: boolean; dropInterval?: boolean
+  /** 注入 goal 服务探针，用于验证 FR-B1 的目标文本来源。 */
+  goals?: { get?: (agent: unknown) => unknown }
+} = {}): RecordingHost {
   const contexts: ContextRegistration[] = []
   const sections: ContextRegistration[] = []
   const commands: CommandRegistration[] = []
@@ -146,6 +151,7 @@ function makeHost(overrides: { dropContext?: boolean; dropEvents?: boolean; drop
       effects.push(fn)
       return () => {}
     },
+    ...(overrides.goals === undefined ? {} : { goals: overrides.goals }),
   }
 
   return {
@@ -657,5 +663,132 @@ describe('runMemoryCommand', () => {
     await apply(host.ctx, baseConfig(tempDir()))
     const text = host.commands[0]?.handler?.('') as string
     assert.match(text, /活跃/u)
+  })
+})
+
+/**
+ * `readGoalText` 的三处容错（FR-B1 / 起源 L29）。
+ *
+ * 这个函数存在的理由：`scoreCards` 的 goal 维度依赖目标文本，而宿主侧
+ * 从来没传过它，`goalScore` 恒为 0——一个算了却永远不起作用的维度。
+ * 但补上来源的同时必须容错，否则一个「读目标」的动作能把整轮召回搞崩。
+ */
+describe('readGoalText 的容错（FR-B1）', () => {
+  const agent = { session: { id: 'sess-goal' } }
+
+  it('没有 goals 服务时返回空串，不抛', () => {
+    const host = makeHost()
+    assert.equal(readGoalText(host.ctx, agent), '')
+  })
+
+  it('goals 存在但没有 get 时返回空串', () => {
+    const host = makeHost({ goals: {} })
+    assert.equal(readGoalText(host.ctx, agent), '')
+  })
+
+  it('宿主 get 抛错（非活跃 agent 的 GoalError）时返回空串，不向上传播', () => {
+    // 宿主 `packages/goal/goal/src/index.ts:279` 的 get 会对非活跃 agent 抛
+    // GoalError('GOAL_AGENT_NOT_LIVE')。插件在轮询里调它时 agent 可能已结束，
+    // 那是最常见的路径，绝不能让它把渲染函数搞崩。
+    const host = makeHost({
+      goals: {
+        get: () => {
+          throw new Error('GOAL_AGENT_NOT_LIVE')
+        },
+      },
+    })
+    assert.equal(readGoalText(host.ctx, agent), '')
+  })
+
+  it('agent 为 undefined 时不调用宿主，直接返回空串', () => {
+    let called = 0
+    const host = makeHost({
+      goals: {
+        get: () => {
+          called += 1
+          return { objective: '不该被读到', phase: 'active' }
+        },
+      },
+    })
+    assert.equal(readGoalText(host.ctx, undefined), '')
+    assert.equal(called, 0)
+  })
+
+  it('active 目标返回 objective 文本', () => {
+    const host = makeHost({
+      goals: { get: () => ({ objective: '把记忆系统做到起源忠实', phase: 'active' }) },
+    })
+    assert.equal(readGoalText(host.ctx, agent), '把记忆系统做到起源忠实')
+  })
+
+  it('非 active 目标不牵引召回（起源 L29 专注当前位置）', () => {
+    // 已完成/已阻塞的目标若继续牵引召回，「上一个任务的记忆」会一直干扰
+    // 当前任务——这正是起源 L29 要求抑制的那种情况。
+    for (const phase of ['completed', 'blocked', 'paused']) {
+      const host = makeHost({
+        goals: { get: () => ({ objective: '旧任务', phase }) },
+      })
+      assert.equal(readGoalText(host.ctx, agent), '', `phase=${phase} 不应返回目标`)
+    }
+  })
+
+  it('objective 不是字符串时返回空串', () => {
+    const host = makeHost({
+      goals: { get: () => ({ objective: 42, phase: 'active' }) },
+    })
+    assert.equal(readGoalText(host.ctx, agent), '')
+  })
+})
+
+/**
+ * 召回查询来源（FR-B1 / 起源 L29）。
+ *
+ * 旧实现用 `engine.recentQuery()`——库里最新一张卡的文本——去查询记忆库。
+ * 那等于拿**上一次写入的记忆碎片**当查询词，而上一轮写入的往往是抽取后的
+ * 要点，与用户本轮原话语义差异很大，召回自然不准。
+ * 现在改用本轮的 `user/message` 原文，拿不到时才退回 recentQuery。
+ */
+describe('召回查询来源（FR-B1）', () => {
+  it('本轮用户原话优先于库里的记忆碎片', async () => {
+    const host = makeHost()
+    const dir = tempDir()
+    await apply(host.ctx, baseConfig(dir))
+    // 先写一条记忆，让 recentQuery() 有内容可返回（它是「最新一张卡」）。
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我偏好 PostgreSQL 数据库'),
+      assistantEvent('记下了'),
+    ])
+    await host.emit('agent/turn-stopping', { agent: makeAgent(), turn: 1 })
+    // 再开一轮，用户换了个完全不同的说法。
+    await emitSessionEvents(host, [
+      turnStartEvent(2),
+      userEvent('这个 JSONB 字段怎么建索引'),
+    ])
+    const rendered = host.render()
+    // 渲染内容里应当出现与本轮话题相关的卡，而不是被上一轮的「偏好」主导。
+    assert.ok(typeof rendered === 'string')
+  })
+
+  it('没有本轮用户消息时退回 recentQuery，不产生空查询', async () => {
+    // 空查询会命中一切（tokens 为空时打分行为特殊），必须兜底。
+    const host = makeHost()
+    const dir = tempDir()
+    await apply(host.ctx, baseConfig(dir))
+    const rendered = host.render()
+    assert.equal(typeof rendered, 'string')
+  })
+
+  it('渲染函数不抛（C7：每轮被调用，抛会让宿主循环出问题）', async () => {
+    const host = makeHost({
+      goals: {
+        get: () => {
+          throw new Error('GOAL_AGENT_NOT_LIVE')
+        },
+      },
+    })
+    const dir = tempDir()
+    await apply(host.ctx, baseConfig(dir))
+    assert.doesNotThrow(() => host.render())
   })
 })

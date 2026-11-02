@@ -22,7 +22,7 @@ import { DEFAULT_CONFIG } from './core/config.ts'
 import type { TurnInput } from './core/extraction.ts'
 import type { MemoryDomain } from './core/types.ts'
 import {
-  createLogger, probeCapabilities, registerCommand, registerDynamicContext,
+  createLogger, probeCapabilities, readGoalText, registerCommand, registerDynamicContext,
   resolveConfig, resolveTimeZone, setRepeating, subscribe,
 } from './host/adapter.ts'
 import type { HostContext, Logger } from './host/adapter.ts'
@@ -253,20 +253,39 @@ function pickDomain(config: MemoryConfig): MemoryDomain {
   return config.extraction.domains[0] ?? 'work'
 }
 
+/** 渲染函数的两个取值依赖，抽成参数是为了让测试注入固定值。 */
+interface FocusPackSources {
+  /** 取本轮召回查询文本（用户此刻在说什么）。 */
+  queryText: () => string
+  /** 取当前目标文本（agent 此刻在做什么）；没有目标时返回空串。 */
+  goalText: () => string
+}
+
 /**
  * 组装焦点包渲染函数。
  *
  * 这个函数每轮被宿主调用一次（C7：`text` 传函数，压缩后自动重新物化）。
  * 它必须**快且不抛**：慢会拖慢整个请求，抛会让宿主循环出问题。
  *
+ * 查询文本的来源演进（这是一处实打实的正确性修复）：
+ * 旧实现用 `engine.recentQuery()`，即「库里最新一张卡片的文本」。那等于
+ * **拿上一次写入的记忆碎片去查询记忆库**，而不是拿用户此刻说的话——问题是
+ * 上一轮写入的往往是抽取后的要点（「用户偏好 PostgreSQL」），与用户本轮
+ * 的原话（「这个 JSONB 字段怎么建索引」）语义差异很大，召回自然不准。
+ * 现在改用本轮的 `user/message` 原文（由 `session/event` 累积），
+ * 拿不到时才退回 `recentQuery()`（例如新会话第一轮之前）。
+ *
  * @param engine - 记忆引擎。
+ * @param sources - 查询文本与目标文本的来源。
  * @returns 渲染函数。
  */
-function makeFocusPackRenderer(engine: MemoryEngine): () => string {
+function makeFocusPackRenderer(engine: MemoryEngine, sources: FocusPackSources): () => string {
   return (): string => {
-    // 召回查询用「最近一条用户消息」是最稳的近似：
-    // 此刻还没拿到本轮请求，但上一轮的意图通常就是当前话题。
-    const result = engine.recall(engine.recentQuery())
+    const queryText = sources.queryText()
+    const goalText = sources.goalText()
+    // 查询文本为空（新会话、尚无用户消息）时用最近记忆兜底，避免空查询命中一切。
+    const effectiveQuery = queryText.length > 0 ? queryText : engine.recentQuery()
+    const result = engine.recall(effectiveQuery, goalText)
     const blocks: string[] = []
     const time = engine.renderTime()
     if (time.length > 0) blocks.push(time)
@@ -290,8 +309,6 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     logger.warn(`宿主缺少能力：${capabilities.missing.join('、')}，相关功能降级`)
   }
 
-  // 最近一个可唤醒的 agent。到期提醒要靠它主动接力（FR-D3 / 起源 L21）。
-  let lastAgent: WakeableAgent | null = null
   const store = openStore({ config })
   // 时钟注入：`_clock` 是内部测试通道（下划线前缀表示非公开配置）。
   // 生产环境不传，退回 `Date.now()`；测试靠它把时钟推到「明天下午三点」。
@@ -314,20 +331,40 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     },
   }
 
-  // ---- 注入通道（FR-E2 / C4 / C7）----
-  const injected = registerDynamicContext(
-    ctx, CONTEXT_NAME, CONTEXT_ORDER, makeFocusPackRenderer(engine),
-  )
-  if (!injected) logger.warn('无法注册动态上下文，记忆不会被注入到系统提示词')
-
   // ---- 会话事件累积（P2：会话日志是唯一真相源）----
   // 不用 Session.eventAt() 回扫：宿主已把它标为 @deprecated 且禁止新调用。
   // 改成订阅 session/event（post-commit、fire-and-forget），增量累积本轮文本。
+  //
+  // 注意：这个订阅必须**早于**注入通道注册。因为渲染函数每轮被调用时需要
+  // 读 turnBuffers 拿本轮用户原话，若订阅在注册之后建立，首轮渲染读不到内容。
   const turnBuffers: TurnBuffers = new Map()
+  /**
+   * 最近一个可唤醒的 agent。
+   *
+   * 两个用途：到期提醒靠它主动接力（FR-D3 / 起源 L21），召回靠它读当前目标
+   * （FR-B1，`goalScore` 的唯一来源）。用 `undefined` 而不是 `null`：
+   * `isWakeable` 是类型守卫，收窄后能直接调用，不必每次再判 null。
+   */
+  let lastAgent: WakeableAgent | undefined
+  /** 最近一次活跃的会话 id；用于从 turnBuffers 取本轮文本。 */
+  let lastSessionId = ''
+
+  // ---- 注入通道（FR-E2 / C4 / C7）----
+  const injected = registerDynamicContext(
+    ctx, CONTEXT_NAME, CONTEXT_ORDER, makeFocusPackRenderer(engine, {
+      // 本轮用户原话优先；拿不到（新会话、首轮之前）返回空串由渲染器兜底。
+      queryText: () => readTurnText(turnBuffers, lastSessionId).userText,
+      // 目标文本来自宿主的 goal 服务；没有目标时为空串，scoreCards 会跳过该维度。
+      goalText: () => readGoalText(ctx, lastAgent),
+    }),
+  )
+  if (!injected) logger.warn('无法注册动态上下文，记忆不会被注入到系统提示词')
+
   const sessionEvents = subscribe(ctx, 'session/event', (...args: unknown[]) => {
     const session = args[0] as { id?: unknown } | undefined
     const sessionId = typeof session?.id === 'string' ? session.id : ''
     if (sessionId.length === 0) return
+    lastSessionId = sessionId
     accumulateEvent(turnBuffers, sessionId, args[1])
   })
   if (!sessionEvents) logger.warn('无法订阅 session/event，记忆不会被写入')
@@ -404,7 +441,7 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
         return
       }
       if (cards.length === 0) return
-      if (lastAgent === null) {
+      if (lastAgent === undefined) {
         // 还没有可唤醒的 agent：保留提醒，等下一次轮询再试。
         // 不能在这里 markReminded，否则这次提醒就永远丢了。
         logger.debug(`有 ${cards.length} 项到期，但当前没有可唤醒的会话`)

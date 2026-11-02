@@ -59,6 +59,20 @@ export interface HostContext {
   interval?: (callback: () => void, ms: number) => unknown
   /** 存储 domain 服务；缺失时退回本地文件日志（数据面已实现）。 */
   storageDomain?: unknown
+  /**
+   * 目标（goal）服务探针；缺失时按「没有目标」处理。
+   *
+   * 用途：FR-B1 的召回查询需要「当前在做什么」作为目标文本，否则
+   * `goalScore` 恒为 0，目标匹配维度形同虚设。
+   *
+   * 宿主实现在 `packages/goal/goal/src/index.ts:279` 的 `get(agent)`，
+   * 它会对非活跃 agent **抛** `GoalError`（`GOAL_AGENT_NOT_LIVE`），
+   * 所以调用方必须 try/catch——见 `readGoalText`。
+   */
+  goals?: {
+    /** 取某个 agent 当前目标；无目标时返回 `undefined`。 */
+    get?: (agent: unknown) => unknown
+  }
   /** 插件卸载钩子。 */
   effect?: (fn: () => void) => unknown
 }
@@ -301,5 +315,42 @@ export function resolveTimeZone(): string {
     return new Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   } catch {
     return 'UTC'
+  }
+}
+
+/**
+ * 读取某个 agent 当前的目标文本（FR-B1 的召回目标来源）。
+ *
+ * 为什么需要这个：`scoreCards` 的 `goalScore` 依赖 `RecallQuery.goalText`，
+ * 而宿主侧从来没传过它，导致该维度恒为 0——一个算了但永远不起作用的维度。
+ * 起源 L29（第 5 条·专注当前位置）要求「专注当前位置」，而「当前位置」在
+ * 有目标时就是那个目标；没有目标时也不该给所有卡记 0 分（那是变相惩罚）。
+ *
+ * 三处必须容错，缺一不可：
+ * 1. `ctx.goals` 可能不存在（测试假上下文、精简 profile）；
+ * 2. `get` 可能不存在；
+ * 3. 宿主 `get` 对非活跃 agent **抛** `GoalError`（`GOAL_AGENT_NOT_LIVE`），
+ *    这在实际运行中很常见（agent 已经结束但插件还在轮询）。
+ * 任何一处出错都返回空串，由 `scoreCards` 跳过 goal 维度。
+ *
+ * @param ctx - 宿主上下文。
+ * @param agent - 目标 agent；未知时传 `undefined`。
+ * @returns 目标文本；取不到时为空串。
+ */
+export function readGoalText(ctx: HostContext, agent: unknown): string {
+  if (agent === undefined || agent === null) return ''
+  const goals = ctx.goals
+  if (goals === undefined || typeof goals.get !== 'function') return ''
+  try {
+    const goal = goals.get(agent)
+    if (typeof goal !== 'object' || goal === null) return ''
+    // 只取 active 目标：已完成/已阻塞的目标不该再牵引召回，
+    // 否则「上一个任务的记忆」会一直干扰当前任务（起源 L29）。
+    const record = goal as { objective?: unknown; phase?: unknown }
+    if (record.phase !== 'active') return ''
+    return typeof record.objective === 'string' ? record.objective : ''
+  } catch {
+    // 非活跃 agent 会抛 GoalError；没有目标不是错误，静默按「无目标」处理。
+    return ''
   }
 }
