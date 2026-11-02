@@ -20,6 +20,7 @@
 import type { MemoryConfig } from './core/config.ts'
 import { DEFAULT_CONFIG } from './core/config.ts'
 import type { TurnInput } from './core/extraction.ts'
+import { renderFocusPackExplain } from './core/render.ts'
 import type { MemoryDomain } from './core/types.ts'
 import {
   createLogger, probeCapabilities, readGoalText, registerCommand, registerDynamicContext,
@@ -525,24 +526,11 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     // 等于「算了但没暴露」。这个子命令把每个候选的分数构成摆出来，
     // 让「为什么想起这张卡」可以被人核对。
     //
-    // ⚠️ 交叉引用：离线 CLI `src/cli/memoryctl.ts` 的 `renderRecall` 与本分支
-    // 输出格式**必须逐行保持一致**（「焦点包 N 张，候选 M 张」→ 空行 → `■ 文本`
-    // → 两空格缩进的「总分 X（有冲突）」→ 两空格缩进的 explain 各行）。
-    // 两处是刻意的重复实现：本命令吃一个字符串且没有 JSON 出口，
-    // CLI 需要独立出口与退出码。改任何一处都要同步另一处，
-    // 否则同一个库在终端与会话里会看到两种格式。
+    // 渲染走 `src/core/render.ts` 的共享实现，与 CLI 的 `query` 同一份代码。
+    // 两处取数不同（本命令走 engine.recall 会刷新访问计数，CLI 走只读召回），
+    // 但输出格式必须一致——原先两处各写一遍靠人肉同步，现已收敛。
     const result = engine.recall(trimmed.slice('explain'.length).trim())
-    if (result.pack.cards.length === 0) {
-      return `没有命中任何记忆（候选 ${result.candidates} 张）`
-    }
-    const lines: string[] = [`焦点包 ${result.pack.cards.length} 张，候选 ${result.candidates} 张`]
-    for (const scored of result.pack.cards) {
-      lines.push('')
-      lines.push(`■ ${scored.card.text}`)
-      lines.push(`  总分 ${scored.score.total.toFixed(3)}${scored.conflict ? '（有冲突）' : ''}`)
-      for (const line of scored.explain) lines.push(`  ${line}`)
-    }
-    return lines.join('\n')
+    return renderFocusPackExplain(result.pack, result.candidates)
   }
   return `未知子命令「${command}」，可用：status / health / rebuild / explain`
 }

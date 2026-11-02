@@ -39,6 +39,7 @@ import { pathToFileURL } from 'node:url'
 
 import { DEFAULT_CONFIG, validateConfig } from '../core/config.ts'
 import type { MemoryConfig } from '../core/config.ts'
+import { renderFocusPackExplain } from '../core/render.ts'
 import { buildFocusPack, formatTime, makeQuery, scoreCards } from '../core/scoring.ts'
 import type { RecallQuery } from '../core/scoring.ts'
 import type { FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry } from '../core/types.ts'
@@ -501,33 +502,10 @@ export function readOnlyRecall(
   return { pack: buildFocusPack(scored, query, config), candidates: limited.length }
 }
 
-/**
- * 渲染一次只读召回结果。
- *
- * ⚠️ 交叉引用：`src/index.ts` 里 `/memory explain` 分支的渲染逻辑与本函数
- * 输出格式**必须逐行保持一致**（「焦点包 N 张，候选 M 张」→ 空行 → `■ 文本`
- * → 两空格缩进的「总分 X（有冲突）」→ 两空格缩进的 explain 各行）。
- * 这是两份实现（宿主命令吃字符串且没有 JSON 模式，CLI 需要独立出口与退出码），
- * 改任何一处都要同步另一处，否则同一个库在终端与会话里看到两种格式。
- * 收敛为单一实现的计划见 `docs/5-起源对照审查.md` 遗留项，当前刻意不动。
- *
- * @param pack - 焦点包。
- * @param candidates - 候选池大小。
- * @returns 人读文本。
- */
-function renderRecall(pack: FocusPack, candidates: number): string {
-  if (pack.cards.length === 0) {
-    return `没有命中任何记忆（候选 ${candidates} 张）`
-  }
-  const lines: string[] = [`焦点包 ${pack.cards.length} 张，候选 ${candidates} 张`]
-  for (const scored of pack.cards) {
-    lines.push('')
-    lines.push(`■ ${scored.card.text}`)
-    lines.push(`  总分 ${scored.score.total.toFixed(3)}${scored.conflict ? '（有冲突）' : ''}`)
-    for (const line of scored.explain) lines.push(`  ${line}`)
-  }
-  return lines.join('\n')
-}
+// 人读渲染统一走 `src/core/render.ts` 的 `renderFocusPackExplain`。
+// 这里原先有一份本地实现，与 `src/index.ts` 的 `/memory explain` 逐行重复，
+// 靠人肉同步维持一致——改一处忘一处，同一个库在终端与会话里就会显示两种
+// 格式，而且没人会立刻发现。现在一致性由共享实现保证。
 
 /**
  * `query` 子命令（FR-F2）。
@@ -550,7 +528,7 @@ function runQuery(
 
   const result = readOnlyRecall(store, CLI_CONFIG, timeZone, queryText, now)
   if (!options.json) {
-    return { code: EXIT_OK, stdout: `${renderRecall(result.pack, result.candidates)}\n`, stderr: '' }
+    return { code: EXIT_OK, stdout: `${renderFocusPackExplain(result.pack, result.candidates)}\n`, stderr: '' }
   }
   const payload = {
     query: queryText,
