@@ -32,3 +32,11 @@ export type { ExportHeader, ExportLine, ExportLineKind, ImportResult } from './e
 
 export { MemoryStore, cardIdFor, deriveIdempotencyKey, openStore } from './store.ts'
 export type { StoreOptions, WriteResult } from './store.ts'
+
+// 元信息（`meta.json`）刻意只导出**最小必要接口**：读写「上次巩固时刻」的两个
+// 函数，以及文件名常量（供测试证明分片正则不会误吞它）。
+//
+// 不导出 `readMeta` / `writeMeta` / `StoreMeta`：现在没有任何第二个模块有真实
+// 需求。接口越窄，越不可能被顺手用错；将来真有第二处要用，那时再放宽，
+// 成本远低于现在就猜一个宽接口。
+export { META_FILE_NAME, metaFilePath, readLastConsolidationAt, writeLastConsolidationAt } from './meta.ts'
