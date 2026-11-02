@@ -416,6 +416,25 @@ export interface SpreadPolicy {
   pruneThreshold: number
   /** 单次巩固最多删除多少条失效边，保证耗时可控（P8）。 */
   maxPrunePerRun: number
+  /**
+   * 人读解释里，每张来源卡最多显示多少个字符（0 表示只报数量不显示文本）。
+   *
+   * ## 为什么需要这个参数
+   *
+   * 用户要的是「类似神经的突触效果」。突触效果的可感知形态不是「分数高了
+   * 一点」，而是**能说出「因为想起 A，所以想起 B」**。只显示「来自 2 张关联卡」
+   * 时，读者知道有来源却不知道是哪两张，扩散在观感上仍是「莫名加分」。
+   *
+   * ## 为什么必须可配置且默认很小
+   *
+   * 这一行**只进人读渲染**（`/memory explain` 与 CLI `query`），不进注入上下文
+   * ——起源 L17（无编号·上下文污染）要求注入文本里不能有这类解释。
+   * 但它仍然要短：终端里一行塞两张 40 字的卡会把解释淹掉。
+   * 默认 24 字，够看清是哪条记忆，又不至于喧宾夺主。
+   *
+   * 设为 0 时退回「只报数量」的行为，用于终端极窄或不想看文本的场景。
+   */
+  explainSourceChars: number
 }
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
@@ -545,6 +564,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     decayFactor: 0.98,
     pruneThreshold: 0.1,
     maxPrunePerRun: 200,
+    explainSourceChars: 24,
   },
   debugExplain: true,
 }
@@ -695,6 +715,11 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   }
   if (!Number.isInteger(sp.maxAffected) || sp.maxAffected < 0) {
     errors.push('spread.maxAffected 必须是 ≥ 0 的整数')
+  }
+  // 来源文本长度必须是 ≥ 0 的整数：负数会让 `truncate` 产出空串，
+  // 于是「显示了来源」和「没显示」在输出上无法区分。
+  if (!Number.isInteger(sp.explainSourceChars) || sp.explainSourceChars < 0) {
+    errors.push('spread.explainSourceChars 必须是 ≥ 0 的整数（0 表示只报数量不显示文本）')
   }
   if (sp.maxAffected > config.recall.maxCards) {
     errors.push('spread.maxAffected 不得大于 recall.maxCards（受影响面不该超过焦点包容量）')

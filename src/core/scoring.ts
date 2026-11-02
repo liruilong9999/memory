@@ -435,12 +435,97 @@ function mergeSpread(
 
   if (config.spread.mode === 'shadow') return attachShadow(scored, boosts)
 
-  const applied = applySpread(scored, boosts)
+  const applied = applySpread(scored, boosts).map((item) => patchExplainForSpread(item, scored, config))
   applied.sort((a, b) => {
     if (b.score.total !== a.score.total) return b.score.total - a.score.total
     return a.card.id < b.card.id ? -1 : a.card.id > b.card.id ? 1 : 0
   })
   return applied
+}
+
+/**
+ * `on` 模式下，把扩散加分补进 `explain`，并让末行总分跟上新值。
+ *
+ * ## 这里曾经让 explain 自相矛盾（被实测抓出的真缺陷）
+ *
+ * `explain` 由 `scoreCard` 生成，那时扩散**还没发生**（`mergeSpread` 在打分
+ * 之后才跑）。`applySpread` 只改 `score.total`，不改 `explain`。于是 `on`
+ * 模式下同一张卡在人读渲染里报出**两个互相矛盾的总分**：
+ *
+ * ```text
+ * ■ 约定 Redis 的过期时间设成 300 秒，注意踩坑
+ *   总分 0.449          ← 头行取 score.total（已含 +0.12）
+ *   语义相关 0.500 ...  ← 五项加起来 = 0.329
+ *   冲突惩罚 -1.000 ...
+ *   总分 0.329          ← 末行取 explain，是加分前的值
+ * ```
+ *
+ * 实测 5 张卡里 3 张如此，差额恰好等于 boost（0.1200）。
+ * 比「少一行」更糟：少一行是漏了，**两行矛盾是自相矛盾**，读者只会认为
+ * 系统算错了。FR-B4「可解释」的判据是能回答「为什么想起这条」，
+ * 而这里给出的答案是错的。
+ *
+ * ## 为什么补一行而不是重算整个 explain
+ *
+ * 重算要把 `scoreCard` 的上下文（`goalApplied` / `conflictCapped`）一起搬过来，
+ * 等于复制一份打分逻辑。补一行只加「外部证据」那一项——扩散加分本来就不是
+ * 这张卡自身的属性（见 `applySpread` 的注释：它不参与归一化）。
+ *
+ * ## 为什么这一行必须说明「来自哪几张卡」
+ *
+ * 用户要的是「类似神经的突触效果」。突触效果的可感知形态不只是「分数高了」，
+ * 而是**能说出「因为想起 A，所以想起 B」**。只说「+0.120」等于「莫名高了
+ * 一点」，从用户视角看就是噪声。`sources` 已经在 `spreadActivation` 里算出
+ * （按 id 升序，可复现），这里只是给它一个出口。
+ *
+ * 注意这一行**只进人读渲染**：`explain` 的唯一消费方是
+ * `renderFocusPackExplain`（`/memory explain` 与 CLI `query`），注入路径
+ * `renderFocusPack` 不读它——起源 L17（无编号·上下文污染）要求注入文本
+ * 里不能有这类解释。
+ *
+ * @param item - 已合并扩散加分的卡片。
+ * @param pool - 本轮候选池（用于把来源 id 换成可读文本）。
+ * @param config - 配置（取 `explainSourceChars`）。
+ * @returns 补好解释行的新对象（不修改入参，ST-1）。
+ */
+function patchExplainForSpread<T extends {
+  card: MemoryCard
+  score: { total: number }
+  explain: string[]
+  spreadBoost: number
+  spreadSources: readonly string[]
+}>(item: T, pool: readonly ScoredCard[], config: MemoryConfig): T {
+  // 没被扩散推动的卡：explain 本来就是对的（总分没变），不要动它。
+  if (item.spreadBoost <= 0) return item
+  const lines = item.explain.slice()
+  const boostLine = `扩散加分 +${fmt(item.spreadBoost)} × 权重 1.000 = +${fmt(item.spreadBoost)}`
+  // 来源卡必须说出**是哪几条**，否则读者只知道「有来源」却不知道「因为想起什么」，
+  // 扩散在观感上仍是莫名加分。这就是「突触」的可感知形态。
+  //
+  // 来源 id 一定在候选池里：种子从 `scored` 里挑（见 `mergeSpread`），
+  // 所以 `pool` 足够把每个 id 换成文本。查不到时退回只报数量——
+  // 不猜、不编造（信条 5）。
+  const sourceTexts = item.spreadSources
+    .map((id) => pool.find((c) => c.card.id === id))
+    .filter((c): c is ScoredCard => c !== undefined)
+    .map((c) => truncate(c.card.text, config.spread.explainSourceChars))
+  const sourceNote = config.spread.explainSourceChars > 0 && sourceTexts.length > 0
+    ? `，因为想起了：${sourceTexts.join(' / ')}`
+    : item.spreadSources.length > 0
+      ? `（来自 ${item.spreadSources.length} 张关联卡）`
+      : ''
+  // 末行是 `总分 X`，必须换成**加过分之后**的值，否则和头行矛盾。
+  const tailIndex = lines.length - 1
+  const tail = lines[tailIndex]
+  if (tail !== undefined && tail.startsWith('总分 ')) {
+    lines[tailIndex] = boostLine + sourceNote
+    lines.push(`总分 ${fmt(item.score.total)}`)
+  } else {
+    // 末行不是总分 ⇒ `buildExplain` 的格式变了。不猜，把两项都补在最后：
+    // 宁可多两行也不能让总分消失（总分是 explain 里唯一的汇总行）。
+    lines.push(boostLine + sourceNote, `总分 ${fmt(item.score.total)}`)
+  }
+  return { ...item, explain: lines }
 }
 
 /**

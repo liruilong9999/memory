@@ -19,9 +19,10 @@ import {
   isSymmetricRelation, prunableEdges, reinforceEdges, spreadActivation,
 } from '../../src/core/spread.ts'
 import type { SpreadSeed } from '../../src/core/spread.ts'
-import { scoreCards } from '../../src/core/scoring.ts'
+import { buildFocusPack, renderFocusPack, scoreCards } from '../../src/core/scoring.ts'
 import { makeQuery } from '../../src/core/scoring.ts'
-import { EDGE_RELATIONS, type MemoryEdge } from '../../src/core/types.ts'
+import { renderFocusPackExplain } from '../../src/core/render.ts'
+import { EDGE_RELATIONS, type MemoryEdge, type TimeState } from '../../src/core/types.ts'
 
 /**
  * 开启扩散的配置。
@@ -838,6 +839,217 @@ describe('影子模式的排名预测必须与真实排序一致（tie-break 专
     assert.ok(
       (onRank.get('b') ?? 99) < (onRank.get('c') ?? 99),
       '同分时必须按 id 升序：b 应排在 c 之前',
+    )
+  })
+})
+
+describe('on 模式的 explain 必须自洽且能说出「因为想起了谁」（FR-B4）', () => {
+  // ## 这一组守的是一个被实测抓出的真缺陷
+  //
+  // `explain` 由 `scoreCard` 生成，那时扩散**还没发生**（`mergeSpread` 在打分
+  // 之后才跑）。`applySpread` 只改 `score.total`，不改 `explain`。于是 `on`
+  // 模式下同一张卡在人读渲染里报出**两个互相矛盾的总分**：
+  //
+  //   总分 0.449        ← 头行取 score.total（已含 +0.12）
+  //   语义相关 0.500 ... ← 五项加起来 = 0.329
+  //   总分 0.329        ← 末行取 explain，是加分前的值
+  //
+  // 实测 5 张卡里 3 张如此，差额恰好等于 boost（0.1200）。
+  // 比「少一行」更糟：少一行是漏了，**两行矛盾是自相矛盾**，
+  // 读者只会认为系统算错了。FR-B4「可解释」的判据是能回答「为什么想起这条」，
+  // 而这里给出的答案是错的。
+  //
+  // 注意 fixture **必须在本 describe 内定义**：上面几个 describe 里的
+  // `shadowFixture` 是各自的局部函数，跨 describe 取不到（第一版就踩了这个，
+  // 报 `ReferenceError: shadowFixture is not defined`）。
+
+  /**
+   * 三张卡 + 一条 a→b 边的最小扩散场景。
+   *
+   * @param mode - 扩散模式。
+   * @returns 配置、卡片、边、查询。
+   */
+  function explainFixture(mode: MemoryConfig['spread']['mode']): {
+    config: MemoryConfig
+    cards: ReturnType<typeof makeCard>[]
+    edges: MemoryEdge[]
+    query: ReturnType<typeof makeQuery>
+  } {
+    const config = spreadConfig({ mode, maxBoost: 0.2 })
+    const cards = [
+      makeCard({ id: 'a', text: 'Cordis 版本' }),
+      makeCard({ id: 'b', text: 'Cordis' }),
+      makeCard({ id: 'c', text: 'Cordis 版本 3.2' }),
+    ]
+    const edges = [edge('a', 'b', 'same-entity', 1)]
+    return { config, cards, edges, query: makeQuery('Cordis 版本', config, 1000) }
+  }
+
+  /**
+   * 从 explain 里取末行总分。
+   *
+   * @param explain - 解释行数组。
+   * @returns 末行声明的总分；末行不是总分时返回 undefined。
+   */
+  function tailTotal(explain: readonly string[]): number | undefined {
+    const tail = explain[explain.length - 1]
+    if (tail === undefined || !tail.startsWith('总分 ')) return undefined
+    return Number.parseFloat(tail.slice('总分 '.length))
+  }
+
+  it('末行总分必须等于 score.total——同一张卡不得报出两个总分', () => {
+    const { config, cards, edges, query } = explainFixture('on')
+    const result = scoreCards(cards, query, config, edges)
+    // 前提：必须真的有卡被加分，否则下面「两行一致」是空转。
+    const boosted = result.filter((x) => x.explain.some((l) => l.includes('扩散加分')))
+    assert.ok(boosted.length > 0, '前提：on 模式必须有卡被扩散加分')
+    for (const item of boosted) {
+      assert.equal(
+        tailTotal(item.explain), Number.parseFloat(item.score.total.toFixed(3)),
+        `${item.card.id} 的 explain 末行总分必须与 score.total 一致`
+        + `（实际末行 ${String(tailTotal(item.explain))}，score.total ${item.score.total}）`,
+      )
+    }
+  })
+
+  it('explain 必须有一行说明扩散加分，不能只改总分不解释', () => {
+    const { config, cards, edges, query } = explainFixture('on')
+    const result = scoreCards(cards, query, config, edges)
+    const boosted = result.filter((x) => x.explain.some((l) => l.includes('扩散加分')))
+    assert.ok(boosted.length > 0, 'on 模式下被加分的卡必须有「扩散加分」行')
+    // 没被加分的卡不该凭空多一行（否则「加分」和「没加分」在输出上不可区分）。
+    for (const item of result) {
+      const hasLine = item.explain.some((l) => l.includes('扩散加分'))
+      if (hasLine) continue
+      const plain = scoreCards([item.card], query, config, [])
+        .find((x) => x.card.id === item.card.id)
+      assert.deepEqual(
+        item.explain, plain?.explain,
+        `${item.card.id} 未被加分时 explain 不得被改动`,
+      )
+    }
+  })
+
+  it('explain 必须说出「因为想起了哪张卡」，不能只报数量', () => {
+    // 用户要的是「类似神经的突触效果」。突触效果的可感知形态不只是
+    // 「分数高了」，而是**能说出「因为想起 A，所以想起 B」**。
+    // 只显示「来自 2 张关联卡」时，读者知道有来源却不知道是哪两张，
+    // 扩散在观感上仍是「莫名加分」。
+    const { config, cards, edges, query } = explainFixture('on')
+    const result = scoreCards(cards, query, config, edges)
+    const line = result.flatMap((x) => x.explain).find((l) => l.includes('扩散加分'))
+    assert.ok(line !== undefined, '前提：必须有扩散加分行')
+    assert.ok(
+      line.includes('因为想起了'),
+      `扩散加分行必须说出是哪张卡（实际：${line}）`,
+    )
+    // 必须真的带上来源卡的文本，而不是只有「因为想起了：」这个空壳。
+    const seedText = cards.find((c) => c.id === 'a')?.text
+    assert.ok(
+      seedText !== undefined && line.includes(seedText.slice(0, 4)),
+      `来源卡文本必须出现在解释里（实际：${line}）`,
+    )
+  })
+
+  it('explainSourceChars 控制来源文本长度，0 退回只报数量', () => {
+    const zero = explainFixture('on')
+    const cfg = { ...zero.config, spread: { ...zero.config.spread, explainSourceChars: 0 } }
+    const line = scoreCards(zero.cards, zero.query, cfg, zero.edges)
+      .flatMap((x) => x.explain).find((l) => l.includes('扩散加分'))
+    assert.ok(line !== undefined, '前提：必须有扩散加分行')
+    assert.ok(
+      !line.includes('因为想起了') && line.includes('张关联卡'),
+      `explainSourceChars = 0 时必须退回只报数量（实际：${line}）`,
+    )
+  })
+
+  it('影子模式不得出现「扩散加分」行——它没生效，写了就是撒谎', () => {
+    // 与上一条配对：on 模式必须有这一行，shadow 模式必须没有。
+    // 只有前者没有后者的话，「必须有」可能只是因为它被无条件加上了。
+    const { config, cards, edges, query } = explainFixture('shadow')
+    const result = scoreCards(cards, query, config, edges)
+    for (const item of result) {
+      assert.ok(
+        !item.explain.some((l) => l.includes('扩散加分')),
+        `影子模式不得在 explain 里出现「扩散加分」（${item.card.id}）`,
+      )
+    }
+  })
+})
+
+describe('扩散解释只能进人读渲染，绝不能进注入上下文（起源 L17）', () => {
+  // 起源 L17（无编号·上下文污染）：「上下文被无关信息污染」是本系统要解决的
+  // 问题。给 explain 加「因为想起了哪张卡」是为了让人**看得见**突触效果，
+  // 但这段文字一旦漏进注入文本，就等于拿 token 预算去污染模型上下文——
+  // 而且它是给人看的，对模型毫无用处。
+  //
+  // 两条路径必须分清：
+  //   注入路径 `renderFocusPack(pack, time)` → 进 systemPrompt.context()
+  //   人读路径 `renderFocusPackExplain(pack, candidates)` → 进 /memory explain 与 CLI
+  //
+  // 这个文件此前只测了 `scoreCards` 的数学性质，没测过「注入文本里有什么」，
+  // 所以「解释漏进上下文」这类回归它抓不到。
+
+  /**
+   * 三张卡 + 一条 a→b 边的最小扩散场景。
+   *
+   * 必须在本 describe 内定义：上一个 describe 的 `explainFixture`
+   * 是局部函数，跨 describe 取不到。这个错我在同一个文件里
+   * 犯了两次（第一次是 `shadowFixture`）。
+   *
+   * @param mode - 扩散模式。
+   * @returns 配置、卡片、边、查询。
+   */
+  function leakFixture(mode: MemoryConfig['spread']['mode']): {
+    config: MemoryConfig
+    cards: ReturnType<typeof makeCard>[]
+    edges: MemoryEdge[]
+    query: ReturnType<typeof makeQuery>
+  } {
+    const config = spreadConfig({ mode, maxBoost: 0.2 })
+    const cards = [
+      makeCard({ id: 'a', text: 'Cordis 版本' }),
+      makeCard({ id: 'b', text: 'Cordis' }),
+      makeCard({ id: 'c', text: 'Cordis 版本 3.2' }),
+    ]
+    const edges = [edge('a', 'b', 'same-entity', 1)]
+    return { config, cards, edges, query: makeQuery('Cordis 版本', config, 1000) }
+  }
+
+  /** 固定时间状态，避免时间维度让输出漂移。 */
+  const time: TimeState = {
+    now: 1000, timeZone: 'Asia/Shanghai', localDate: '1970-01-01',
+    sinceLastSession: null, sinceLastTurn: null, sessionStartedAt: null, due: [],
+  }
+
+  it('注入文本不得出现「扩散」「因为想起了」「关联卡」', () => {
+    const { config, cards, edges, query } = leakFixture('on')
+    const scored = scoreCards(cards, query, config, edges)
+    const pack = buildFocusPack(scored, query, config)
+    // 前提：这一轮必须真的有卡被扩散加分，否则「没泄漏」是空转。
+    assert.ok(
+      pack.cards.some((c) => c.explain.some((l) => l.includes('扩散加分'))),
+      '前提：焦点包里必须有被扩散加分的卡',
+    )
+    const injected = renderFocusPack(pack, time)
+    for (const word of ['扩散', '因为想起了', '关联卡', '权重 1.000']) {
+      assert.ok(
+        !injected.includes(word),
+        `注入文本不得包含「${word}」（会污染上下文，起源 L17）：\n${injected}`,
+      )
+    }
+  })
+
+  it('人读渲染必须有这段解释——否则它等于没算', () => {
+    // 与上一条配对。只有「注入不得含」没有「人读必须有」的话，
+    // 把解释整个删掉也能让上一条变绿。
+    const { config, cards, edges, query } = leakFixture('on')
+    const scored = scoreCards(cards, query, config, edges)
+    const pack = buildFocusPack(scored, query, config)
+    const human = renderFocusPackExplain(pack, scored.length)
+    assert.ok(
+      human.includes('因为想起了'),
+      `人读渲染必须说出「因为想起了谁」，实际：\n${human}`,
     )
   })
 })
