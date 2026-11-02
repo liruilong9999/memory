@@ -56,7 +56,7 @@ import type { DeepPartial, MemoryConfig } from '../core/config.ts'
  * 与日志一样**放在子目录**而不是数据目录顶层：顶层是事件日志分片
  * （`journal-<数字>.jsonl`）的地盘，任何「按 `.jsonl` 扫顶层」的外部工具
  * （备份脚本、日志采集器、用户自己 `ls *.jsonl`）都会把旁路文件当成事件日志。
- * 这条教训来自诊断日志改名（见 AGENTS.md 真缺陷十一）。
+ * 这条教训来自诊断日志改名（见 `docs/7-缺陷复盘.md` 真缺陷十一）。
  */
 export const CONFIG_LEDGER_DIR = 'config'
 
