@@ -612,6 +612,35 @@ describe('runMemoryCommand', () => {
     assert.match(text, /索引已重建/u)
   })
 
+  it('explain 暴露分数构成（FR-B4 可解释）', async () => {
+    const dir = tempDir()
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(dir))
+
+    // 先写一条记忆，再问「为什么想起它」。
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我决定用 Alembic 管理数据库迁移，不要手写 SQL'),
+      assistantEvent('好的，Alembic 会自动生成迁移脚本。'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    const text = host.commands[0]?.handler?.('explain 数据库迁移') as string
+    assert.match(text, /焦点包/u, '应报告焦点包规模')
+    // explain 的价值就在于把每个分项摆出来，而不是只给一个总分。
+    assert.match(text, /语义相关/u)
+    assert.match(text, /权重/u)
+    assert.match(text, /总分/u)
+  })
+
+  it('explain 在没有命中时给出明确说明', async () => {
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(tempDir()))
+    const text = host.commands[0]?.handler?.('explain 完全不相干的查询') as string
+    assert.match(text, /没有命中/u)
+  })
+
   it('未知子命令返回可用列表', async () => {
     const host = makeHost()
     await apply(host.ctx, baseConfig(tempDir()))

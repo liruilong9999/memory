@@ -474,7 +474,24 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
       engine.sinceLastSession(),
     ].join('\n')
   }
-  return `未知子命令「${command}」，可用：status / health / rebuild`
+  if (command === 'explain') {
+    // FR-B4「可解释」：`ScoredCard.explain` 一直算出来了却没有任何出口，
+    // 等于「算了但没暴露」。这个子命令把每个候选的分数构成摆出来，
+    // 让「为什么想起这张卡」可以被人核对。
+    const result = engine.recall(trimmed.slice('explain'.length).trim())
+    if (result.pack.cards.length === 0) {
+      return `没有命中任何记忆（候选 ${result.candidates} 张）`
+    }
+    const lines: string[] = [`焦点包 ${result.pack.cards.length} 张，候选 ${result.candidates} 张`]
+    for (const scored of result.pack.cards) {
+      lines.push('')
+      lines.push(`■ ${scored.card.text}`)
+      lines.push(`  总分 ${scored.score.total.toFixed(3)}${scored.conflict ? '（有冲突）' : ''}`)
+      for (const line of scored.explain) lines.push(`  ${line}`)
+    }
+    return lines.join('\n')
+  }
+  return `未知子命令「${command}」，可用：status / health / rebuild / explain`
 }
 
 /** 插件默认配置，供宿主 patch 引用。 */
