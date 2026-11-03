@@ -13,7 +13,7 @@
  */
 
 import type { MemoryConfig } from '../core/config.ts'
-import { extractMemoryCards, looksConflicting } from '../core/extraction.ts'
+import { extractMemoryCards } from '../core/extraction.ts'
 import type { TurnInput } from '../core/extraction.ts'
 import {
   buildFocusPack, formatDuration, formatTime, makeQuery, renderFocusPack, scoreCards,
@@ -22,10 +22,8 @@ import type { RecallQuery } from '../core/scoring.ts'
 import type {
   ConsolidationReport, FocusPack, MemoryCard, MemoryEdge, MemoryLogEntry, TimeState,
 } from '../core/types.ts'
-import { cardSimilarity } from '../consolidate/dedupe.ts'
 import { aggregateMetrics } from '../core/metrics.ts'
 import { normalizeText } from '../core/text.ts'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import { readLastConsolidationAt, writeLastConsolidationAt } from '../store/meta.ts'
@@ -33,7 +31,9 @@ import type { MemoryStore } from '../store/store.ts'
 import {
   buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
 } from '../time/clock.ts'
-import { nextDueAfter, parseDue } from '../time/due.ts'
+import { DiagnosticLog } from './engine/diagnostics.ts'
+import { applyDueSpecs, nextDueAt, renderDueReminderText } from './engine/reminders.ts'
+import { markConflicts } from './engine/conflicts.ts'
 
 /** 引擎参数。 */
 export interface EngineOptions {
@@ -85,8 +85,8 @@ export class MemoryEngine {
   private readonly clock: () => number
   private readonly onLog: ((entry: MemoryLogEntry) => void) | undefined
 
-  /** 诊断日志落盘路径（FR-F1）；`null` 表示不落盘。 */
-  private readonly logFilePath: string | null
+  /** 诊断日志（FR-F1）。落盘路径为 `null` 时只在内存回调里出现。 */
+  private readonly diagnostics: DiagnosticLog
   /** 上一轮的时刻，用于计算 `sinceLastTurn`。 */
   private lastTurnAt: number | null = null
   /** 上次会话结束时刻（本次启动时为上次写入的最后时刻）。 */
@@ -130,10 +130,14 @@ export class MemoryEngine {
     // 必须用 store.dir（已 resolve 成绝对路径）而不是 config.storage.dataDir：
     // 后者可能是相对路径，而相对谁取决于进程 cwd——同一个库在宿主与 CLI 里
     // 会写到两个不同位置，且两边都「成功」，事后无从判断该看哪个。
-    this.logFilePath =
-      options.config.storage.logFile.length === 0
-        ? null
-        : join(options.store.dir, options.config.storage.logFile)
+    this.diagnostics = new DiagnosticLog({
+      path:
+        options.config.storage.logFile.length === 0
+          ? null
+          : join(options.store.dir, options.config.storage.logFile),
+      maxEntries: options.config.storage.logMaxEntries,
+      onLog: options.onLog,
+    })
     this.sessionStartedAt = this.clock()
     this.lastSessionEndAt = this.detectLastActivity()
     // 从磁盘恢复：进程重启后不应把「上次整理」忘成 null，否则夜整理每次
@@ -153,29 +157,15 @@ export class MemoryEngine {
   writeTurn(input: TurnInput): WriteSummary {
     const cards = extractMemoryCards(input, this.config)
     // FR-D3 / 起源 L21：把「明天下午三点提醒我」这类句子解析成确定的到期时刻。
-    // 解析在时间层（src/time/due.ts），这里只负责把结果填进卡片。
-    for (const card of cards) {
-      if (card.kind !== 'promise' && card.kind !== 'event') continue
-      const spec = parseDue(
-        card.text, input.at, this.timeZone, 9, this.config.reminder.cronSearchDays,
-      )
-      if (spec !== null) {
-        card.dueAt = spec.dueAt
-        // FR-D3：**只存 dueAt 是不够的**。曾经这里只取 spec.dueAt 就把
-        // spec.repeat 丢掉，于是「每天早上九点提醒我喝水」在库里与
-        // 「一次性提醒」完全无法区分——提醒响过一次、markReminded 记下
-        // (id, dueAt) 之后，第二天 dueNow 仍返回同一个 dueAt，被过滤掉，
-        // 永久静默。探针实测：第 2 天 dueNow = 0 张，dueAt 始终停在第一天。
-        card.dueRepeat = spec.repeat
-        // cron 表达式也必须落盘：'cron' 不含「什么时候再响」的信息，
-        // 提醒响过之后手上只有卡片、没有原始语境，无法重新解析用户那句话。
-        if (spec.cronExpression !== undefined) card.cronExpression = spec.cronExpression
-      }
-    }
+    // 解析细节在 `engine/reminders.ts`，这里只负责触发。
+    applyDueSpecs(cards, input.at, this.timeZone, this.config)
     // FR-B5 / SC-4：写入时就标出冲突，而不是等到召回的渲染阶段。
     // 只算不写等于没做——`looksConflicting` 此前零调用点，`conflictOf` 恒为空，
     // 于是真实数据里永远不会出现冲突警告。冲突必须在写入时落到卡上。
-    const conflicts = this.markConflicts(cards, input.at)
+    const conflicts = markConflicts(
+      cards, this.store.listCards({ status: 'active' }), this.config.dedup.relatedSimilarity, input.at,
+    )
+    for (const patched of conflicts) this.store.putCard(patched)
     const written: MemoryCard[] = []
     let skipped = 0
     for (const card of cards) {
@@ -185,7 +175,7 @@ export class MemoryEngine {
     }
     this.lastTurnAt = input.at
     if (written.length > 0) {
-      this.log({
+      this.diagnostics.record({
         kind: 'write',
         at: input.at,
         sessionId: input.sessionId,
@@ -205,45 +195,6 @@ export class MemoryEngine {
       cards: written,
       signals: [...new Set(written.flatMap((c) => c.tags))],
     }
-  }
-
-  /**
-   * 给新写入的卡片标出与既有记忆的冲突（FR-B5 / SC-4 / 起源 L19「感受经验」）。
-   *
-   * 冲突判定：共享实体（在谈同一个对象）+ 文本相似度低（说法明显不同）
-   * 就说明两句话对同一件事给出了不同说法，需要并列展示而不是悄悄合并。
-   *
-   * 两个方向都要标：既有卡是已落盘的不可变对象，所以这里返回需要**回写**的
-   * 既有卡（带新 `conflictOf`），由调用方落库；新卡则原地标。
-   *
-   * @param cards - 本轮新抽取的卡片（会被原地修改）。
-   * @param at - 写入时刻。
-   * @returns 需要回写的既有卡片（`conflictOf` 已更新）。
-   */
-  private markConflicts(cards: MemoryCard[], at: number): MemoryCard[] {
-    const updated: MemoryCard[] = []
-    if (cards.length === 0) return updated
-    const related = this.config.dedup.relatedSimilarity
-    const existing = this.store.listCards({ status: 'active' })
-    for (const card of cards) {
-      for (const other of existing) {
-        if (other.id === card.id) continue
-        const similarity = cardSimilarity(card, other)
-        if (!looksConflicting(card, other, similarity, related)) continue
-        if (!card.conflictOf.includes(other.id)) card.conflictOf.push(other.id)
-        if (!other.conflictOf.includes(card.id)) {
-          // 既有卡是不可变对象，复制一份再改，避免就地修改已落盘状态。
-          const patched: MemoryCard = {
-            ...other,
-            conflictOf: [...other.conflictOf, card.id],
-            updatedAt: at,
-          }
-          updated.push(patched)
-        }
-      }
-    }
-    for (const patched of updated) this.store.putCard(patched)
-    return updated
   }
 
   /**
@@ -273,7 +224,7 @@ export class MemoryEngine {
         actualRank: item.shadowSpread!.actualRank,
         hypotheticalRank: item.shadowSpread!.hypotheticalRank,
       }))
-    this.log({
+    this.diagnostics.record({
       kind: 'recall',
       at,
       summary: `召回 ${result.pack.cards.length} 条（候选 ${result.candidates}，token ${result.pack.tokens}）`
@@ -371,7 +322,7 @@ export class MemoryEngine {
       written += 1
     }
     if (written > 0) {
-      this.log({
+      this.diagnostics.record({
         kind: 'recall',
         at: now,
         summary: `确认使用 ${written} 条记忆（强度 +${boost}）`,
@@ -478,14 +429,14 @@ export class MemoryEngine {
       //
       // 不要因为「反正幂等」就把这条删掉——幂等说的是结果正确，
       // 不是说不值得知道。
-      this.log({
+      this.diagnostics.record({
         kind: 'error',
         at: now,
         summary: `夜整理已完成，但整理时刻落盘失败：${error instanceof Error ? error.message : String(error)}`,
         detail: { phase: 'writeMeta', dir: this.store.dir, error: String(error) },
       })
     }
-    this.log({
+    this.diagnostics.record({
       kind: 'consolidate',
       at: now,
       summary: `整理完成：合并 ${report.merged} 组，归档 ${report.archived} 张`,
@@ -557,30 +508,13 @@ export class MemoryEngine {
    * 而 `dueAt` 永远不推进，跨天之后仍然只有那一个时刻。
    * 把新时刻**落盘**才让「每日提醒」在重启后依然正确。
    *
-   * ## 一次性提醒不推进
-   *
-   * `repeat` 为 `'once'` / 缺省时 {@link nextDueAfter} 返回 `null`，
-   * 这里只清掉内存标记，`dueAt` 保持不变——由夜整理的
-   * `releaseExpiredDue` 负责把它置 null，让卡片能正常参与衰减归档。
-   *
    * @param card - 刚投递过提醒的卡片。
    * @param now - 投递时刻。
    */
   private advanceDue(card: MemoryCard, now: number): void {
-    const repeat = card.dueRepeat ?? 'once'
-    if (repeat === 'once') return
-    if (typeof card.dueAt !== 'number') return
-    // 推进基准取 max(now, dueAt)：下一次必须**同时**晚于当前到期时刻和
-    // 投递时刻。只用 now 时，若调用方传的 now 早于 dueAt（时钟回拨、
-    // 或调用方忘了传而默认取 clock()），nextDueAfter 会原样返回 dueAt，
-    // 推进变成空操作——而它「没有报错」，看起来像成功了。
-    // 只用 dueAt 时，宿主停摆数天后无法一次跳到未来，会连续补发。
-    const next = nextDueAfter(card.dueAt, repeat, Math.max(now, card.dueAt), this.timeZone, {
-      cronExpression: card.cronExpression,
-      cronSearchDays: this.config.reminder.cronSearchDays,
-    })
+    const next = nextDueAt(card, now, this.timeZone, this.config)
     if (next === null) return
-    // 只改 dueAt / updatedAt / strength 之外的到期字段。
+    // 只改 dueAt / updatedAt 之外的到期字段。
     // updatedAt 必须一并更新：它是「这张卡最近变过」的唯一依据，
     // 不改会让 ST-1 之外的地方（最近活动、排序）看到过期信息。
     this.store.putCard({ ...card, dueAt: next, updatedAt: now })
@@ -589,25 +523,15 @@ export class MemoryEngine {
   /**
    * 把到期事项渲染成一段可直接投递给模型的提醒文本（FR-D3）。
    *
-   * 措辞刻意包含「无需用户输入」的说明，因为这句话会作为一条新的用户消息
-   * 进入对话，模型需要知道它来自系统而不是人。
+   * 措辞细节在 `engine/reminders.ts`——它决定模型会不会把这条消息
+   * 误当作用户原话，所以必须能被单独测。
    *
    * @param cards - 已到期的卡片。
    * @param at - 提醒时刻。
    * @returns 提醒文本；`cards` 为空时返回空串。
    */
   renderDueReminder(cards: readonly MemoryCard[], at = this.clock()): string {
-    if (cards.length === 0) return ''
-    const lines: string[] = []
-    lines.push('## 到期提醒（由记忆系统定时投递，不是用户输入）')
-    lines.push(`当前时间：${formatTime(at, this.timeZone)}`)
-    lines.push('')
-    for (const card of cards) {
-      lines.push(`- ${card.text}`)
-    }
-    lines.push('')
-    lines.push('这些事项的约定时间已到，请主动提醒用户或继续推进；不需要等待用户再次开口。')
-    return lines.join('\n')
+    return renderDueReminderText(cards, at, this.timeZone)
   }
 
   /**
@@ -838,7 +762,7 @@ export class MemoryEngine {
     // 读**自己刚写的那个文件**，而不是另起一个计数器。
     // 两个来源（内存计数器 + 磁盘日志）必然漂移，而指标恰恰是用来
     // 判断「系统在做什么」的——一个会漂移的观测点比没有观测点更危险。
-    const entries = this.readOwnLog()
+    const entries = this.diagnostics.read()
     if (entries !== null) {
       const aggregated = aggregateMetrics(entries, this.store.count('active'))
       return {
@@ -861,34 +785,6 @@ export class MemoryEngine {
       lastConsolidationAt: this.lastConsolidationAt,
       source: 'memory',
     }
-  }
-
-  /**
-   * 读回本引擎落盘的诊断日志。
-   *
-   * @returns 日志条目；落盘关闭或文件不存在时 `null`。
-   */
-  private readOwnLog(): MemoryLogEntry[] | null {
-    const path = this.logFilePath
-    if (path === null || !existsSync(path)) return null
-    let raw: string
-    try {
-      raw = readFileSync(path, 'utf8')
-    } catch {
-      // 读不回来不是「零召回」，是「读不到」——退回内存计数并标 source。
-      return null
-    }
-    const entries: MemoryLogEntry[] = []
-    for (const line of raw.split(String.fromCharCode(10))) {
-      if (line.length === 0) continue
-      try {
-        entries.push(JSON.parse(line) as MemoryLogEntry)
-      } catch {
-        // 单行损坏跳过（进程被杀时最后一行常是半条）。
-        continue
-      }
-    }
-    return entries
   }
 
   /**
@@ -919,77 +815,4 @@ export class MemoryEngine {
     return latest
   }
 
-  /**
-   * 记录一条结构化日志（FR-F1）。
-   *
-   * @param entry - 日志条目。
-   */
-  private log(entry: MemoryLogEntry): void {
-    this.onLog?.(entry)
-    this.persistLog(entry)
-  }
-
-  /**
-   * 把一条诊断日志追加到磁盘（FR-F1），并按 `logMaxEntries` 做环形截断。
-   *
-   * ## 为什么必须落盘
-   *
-   * 在此之前 `onLog` 是**唯一**出口，而它只在 CLI 里被接成「攒进数组、
-   * `--verbose` 时打印」。也就是说：宿主跑一整天，`write` / `recall` /
-   * `consolidate` 这些记录**一条都没留下**，重启即清零。
-   * FR-F1 要的是「最近 N 次操作可回溯」，一个只在当次进程内存在的数组
-   * 满足不了它——出问题时恰恰是「上一次运行发生了什么」查不到。
-   *
-   * ## 为什么不进事件日志
-   *
-   * journal 是唯一真相源（P2），诊断日志是**可丢弃**的旁路数据。
-   * 混进去会让重放依赖一堆只用于观测的记录，也让日志体积失控。
-   *
-   * ## 写失败不能影响主流程
-   *
-   * 观测能力坏掉（磁盘满、权限不足）不该让召回失败。但**也不能静默**：
-   * 通过 `onLog` 发一条 `error` 记录说明落盘失败。
-   * 这里不抛异常，因为日志是旁路。
-   *
-   * @param entry - 日志条目。
-   */
-  private persistLog(entry: MemoryLogEntry): void {
-    const path = this.logFilePath
-    if (path === null) return
-    try {
-      const dir = path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')))
-      if (dir.length > 0 && !existsSync(dir)) mkdirSync(dir, { recursive: true })
-      appendFileSync(path, `${JSON.stringify(entry)}\n`, 'utf8')
-      this.trimLog(path)
-    } catch {
-      // 落盘失败：只在**内存回调**里报，不再尝试落盘（否则递归）。
-      this.onLog?.({
-        kind: 'error',
-        at: entry.at,
-        summary: '诊断日志落盘失败，本次记录只存在于内存',
-        detail: { path },
-      })
-    }
-  }
-
-  /**
-   * 环形截断：只保留最后 `logMaxEntries` 条。
-   *
-   * `logMaxEntries <= 0` 表示不限制。**不建议**：长期运行的记忆库会攒出
-   * 几百 MB 的旁路文件，而 FR-F1 要的是「最近 N 次」。
-   *
-   * 实现上「先读全部再写回」在这个规模下是可接受的（默认 500 条），
-   * 不值得为它引入游标或分片——那是 journal 才需要的复杂度。
-   *
-   * @param path - 日志文件路径。
-   */
-  private trimLog(path: string): void {
-    const limit = this.config.storage.logMaxEntries
-    if (limit <= 0) return
-    const text = readFileSync(path, 'utf8')
-    const lines = text.split('\n').filter((line) => line.length > 0)
-    if (lines.length <= limit) return
-    // 保留最后 limit 条：最早的那些是「已经没人会看」的记录。
-    writeFileSync(path, `${lines.slice(-limit).join('\n')}\n`, 'utf8')
-  }
 }

@@ -20,15 +20,38 @@
 ```text
 src/
   core/      纯函数内核：契约、配置、文本、打分、抽取。禁止 IO、禁止依赖宿主
+    config/    配置的类型 / 默认值 / 校验 / 合并（config.ts 是 barrel）
+    scoring/   打分 / 扩散 / 装包 / 渲染（scoring.ts 是 barrel）
   store/     数据面：事件日志、持久化、重放、查询索引。只依赖 core
   consolidate/ 巩固面：去重、合并、降权、归档。只依赖 core + store
   host/      适配面：DSH/Cordis 接线。唯一允许 import 宿主包的地方
+    engine/    引擎的纯逻辑（冲突标记 / 诊断日志 / 到期提醒）
+    plugin/    插件接线的纯逻辑（常量 / 消息解析 / 轮次缓冲 / 唤醒 / 渲染 / 命令）
   cli/       离线命令行：查询、导出、重建
+    commands/  各子命令实现（query / export / mutate / observe / config）
 tests/       与 src 同构的单元测试
 docs/        设计文档（中文）
 ```
 
 **依赖方向单向**：`core ← store ← consolidate ← host`。反向 import 一律视为错误。
+
+### 大文件必须拆，但入口必须保留为 barrel
+
+单文件超过约 600 行就按单一职责拆到同名子目录（`config.ts` → `config/`）。
+**拆完 `src/<x>.ts` 必须仍是 barrel，re-export 它原先导出的每一个名字**，
+这样 34 个 `config.ts` 消费者、7 个 `scoring.ts` 消费者一行都不用改。
+
+三条纪律：
+
+1. **只搬移，不改逻辑、不改字面量、不改注释内容**；注释跟着它解释的代码走，
+   一行都不许丢——注释里记的是缺陷根因，丢了等于把修复理由一起删掉。
+2. **拆完先跑 `.tmp/verify-refactor.mjs`**：它从 `HEAD` 取旧文件、抽出全部
+   声明导出名，与新 barrel 逐名比对，并双向核对运行时键集合。
+   （写这个脚本时踩过两个坑：跨行 `export { a,\n b }` 逐行正则会误报缺失；
+   Windows 绝对路径不能直接给 `import()`，必须 `pathToFileURL`。**两个都是误报**，
+   而误报会让人去修不存在的问题。）
+3. **并行拆多个文件时，tsc 报错会混在一起**，约定「只对自己写范围内的错误负责」，
+   但提交前必须全仓零错误。
 
 ## 三、硬性约定
 
@@ -398,6 +421,13 @@ if (mutated === original) {
 - [x] 适配面 `src/host/` + `src/index.ts` + `cordis.patch.yml`
 - [x] 离线 CLI `src/cli/`（query / export / rebuild / health / consolidate / logs / report / config）
 - [x] bundle 展示资源（`icon.svg` / `locale/zh.json` / `locale/en.json`）
+- [x] **按单一职责拆分过长文件**（纯搬移、零行为变更、入口全部保留为 barrel）：
+      `memoryctl.ts` 1575→266、`config.ts` 1288→46、`scoring.ts` 970→26、
+      `index.ts` 737→329、`engine.ts` 996→819（另抽 `engine/{conflicts,diagnostics,reminders}.ts`）。
+      拆完 `npx tsc --noEmit` 零错误、1103 条测试全绿，
+      5 个入口的声明导出名单由 `.tmp/verify-refactor.mjs` 逐名比对，**缺失 0**。
+      最大的 `config/types.ts` 767 行是 13 个配置接口的契约声明，不再拆——
+      **接口按主题聚在一起才能一眼看出配置面有多宽，切成碎片反而更难维护。**
 
 ### 真缺陷（每条都有探针 + 反向验证 + 测试）
 
