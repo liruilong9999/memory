@@ -466,3 +466,73 @@ describe('validateConfig 的 spread.seedRatio', () => {
     assert.ok(result.errors.some((e) => e.includes('seedRatio')))
   })
 })
+
+/**
+ * 可塑性未接线：打开它必须**加载期失败**，而不是静默空转（缺陷三十三）。
+ *
+ * 为什么这组测试存在：`plasticityEnabled` 的字段注释写着「关掉时边权停在
+ * 建立时的初始值」，这句话暗示「打开就会变化」。实测打开与关闭各跑 10 夜
+ * 整理，边权与边数**逐位相同**——它是个空操作。
+ *
+ * 配置项的名字就是承诺。静默接受一个打开了也没用的开关，比拒绝它更坏：
+ * 它会让人以为突触学习已经生效，从而永远不去查它从未生效。
+ */
+describe('可塑性未接线：打开必须报错（缺陷三十三）', () => {
+  /** 造一份合法配置，供各用例按需破坏单个字段。 */
+  function base(): typeof DEFAULT_CONFIG {
+    return mergeConfig(DEFAULT_CONFIG)
+  }
+
+  it('plasticityEnabled=true 必须让校验失败，且报错指向这个字段', () => {
+    const config = base()
+    config.spread.plasticityEnabled = true
+    const result = validateConfig(config)
+    assert.equal(result.ok, false, '打开未接线的能力必须失败，不能静默通过')
+    assert.ok(
+      result.errors.some((e) => e.includes('spread.plasticityEnabled')),
+      `报错必须指向 spread.plasticityEnabled，实际：${result.errors.join('; ')}`,
+    )
+  })
+
+  it('报错必须说清「没有效果」而不是只说「非法」（否则用户会以为是取值范围问题）', () => {
+    const config = base()
+    config.spread.plasticityEnabled = true
+    const result = validateConfig(config)
+    const line = result.errors.find((e) => e.includes('plasticityEnabled')) ?? ''
+    assert.ok(
+      line.includes('未接线') || line.includes('不会产生任何效果'),
+      `报错必须说明「打开也没效果」，否则用户会去调参数。实际：${line}`,
+    )
+  })
+
+  it('默认配置必须能通过校验（不能把出厂配置判成非法）', () => {
+    const result = validateConfig(DEFAULT_CONFIG)
+    assert.equal(result.ok, true, `出厂配置必须合法：${result.errors.join('; ')}`)
+    assert.equal(DEFAULT_CONFIG.spread.plasticityEnabled, false, '可塑性默认必须关闭')
+  })
+
+  it('可塑性参数**无条件**校验，不再挂在开关下面', () => {
+    // 这条守的是一个具体的坑：这段校验以前包在 `if (sp.plasticityEnabled)` 里，
+    // 理由是「关着的时候配错值不该拦住整个配置」。那个理由本身没错，但开关
+    // 一旦必须为 false，整块校验就变成了**不可达代码**——
+    // 「校验写了」和「校验会执行」成了两件事。
+    const bad = [
+      { field: 'reinforceDelta', value: 0 },
+      { field: 'maxEdgeWeight', value: 1.5 },
+      { field: 'decayFactor', value: 1.5 },
+      { field: 'pruneThreshold', value: 2 },
+      { field: 'maxPrunePerRun', value: -1 },
+    ] as const
+    for (const { field, value } of bad) {
+      const config = base()
+      assert.equal(config.spread.plasticityEnabled, false, '前提：开关必须是关的')
+      ;(config.spread as unknown as Record<string, number>)[field] = value
+      const result = validateConfig(config)
+      assert.equal(result.ok, false, `${field}=${value} 在开关关闭时也必须被拦住`)
+      assert.ok(
+        result.errors.some((e) => e.includes(field)),
+        `报错必须指向 ${field}，实际：${result.errors.join('; ')}`,
+      )
+    }
+  })
+})

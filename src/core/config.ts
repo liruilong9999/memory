@@ -659,7 +659,19 @@ export interface SpreadPolicy {
   /**
    * 是否启用边权可塑性。
    *
-   * 关掉时边权停在建立时的初始值，只有扩散生效。
+   * ## 当前**必须为 `false`**，写 `true` 会被 `validateConfig` 拒绝
+   *
+   * 三个可塑性纯函数（`reinforceEdges` / `decayEdges` / `prunableEdges`）已实现
+   * 且通过测试，但**没有任何生产代码调用它们**。实测打开与关闭各跑 10 夜整理，
+   * 边权与边数逐位相同——写 `true` 的实际效果是「什么都没发生」。
+   *
+   * 这个字段留着而不是删掉，是因为它记录的是一个**有明确接线条件的能力**：
+   * 驱动信号必须是可审计的「共激活」（这两张卡被一起用上了）。当前唯一入口
+   * `Engine.confirmRecall` 零调用方，四个替代信号全部违反起源 L29
+   * （第 5 条·专注当前位置）——「被一起召回」是「看见」不是「使用」。
+   *
+   * 因此现在的行为是：写 `true` ⇒ 加载期失败并说明原因。**静默接受一个
+   * 打开了也没用的开关，比拒绝它更坏**——它让人以为突触学习已经生效。
    */
   plasticityEnabled: boolean
   /** 共激活时边权增量（赫布学习：一起被用到的连接变强）。 */
@@ -1047,25 +1059,50 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (sp.maxAffected > config.recall.maxCards) {
     errors.push('spread.maxAffected 不得大于 recall.maxCards（受影响面不该超过焦点包容量）')
   }
-  // 可塑性参数只在启用时才要求合法：关着的时候配错值不该拦住整个配置。
+  // ## 可塑性尚未接线，打开它必须响亮失败（缺陷三十三）
+  //
+  // `reinforceEdges` / `decayEdges` / `prunableEdges` 三个纯函数已实现且通过测试，
+  // 但 `src/` 下**没有任何生产代码调用它们**。实测：`plasticityEnabled` 打开与
+  // 关闭各跑 10 夜整理，边权逐位相同、边数相同——这个开关是空操作。
+  //
+  // 为什么不能静默接受：**配置项的名字就是承诺**。用户写 `true` 是想要「一起被
+  // 用到的连接变强」，实际行为却是「什么都没发生」。这比报错更坏，因为它会让
+  // 人以为突触学习已经生效，从而永远不去查它从未生效。
+  //
+  // 为什么现在不接线：可塑性的驱动信号是「共激活」（这两张卡被一起用上了）。
+  // 唯一能提供该信号的入口 `Engine.confirmRecall` 零调用方，而四个看起来可用的
+  // 替代信号全部违反起源 L29（第 5 条·专注当前位置）——「被一起召回」是「看见」
+  // 不是「使用」，用它驱动强化会让焦点包自我固化。详见 `src/core/spread.ts`
+  // 头部注释与 `docs/3-架构设计.md` §7.2。
   if (sp.plasticityEnabled) {
-    if (sp.reinforceDelta <= 0) errors.push('spread.reinforceDelta 必须 > 0（否则强化永不发生）')
-    if (sp.maxEdgeWeight <= 0 || sp.maxEdgeWeight > 1) {
-      errors.push('spread.maxEdgeWeight 必须落在 (0, 1]')
-    }
-    // 衰减乘数必须落在 (0,1)：等于 1 永不衰减（剪枝永远不会触发），
-    // 等于 0 一次巩固就清零（所有边瞬间失效）。
-    if (sp.decayFactor <= 0 || sp.decayFactor >= 1) {
-      errors.push('spread.decayFactor 必须落在 (0, 1)（等于 1 永不衰减，等于 0 一次清空）')
-    }
-    // 剪枝阈值必须小于边权上限，否则「上限本身就在剪枝区间里」，
-    // 新建立的边会立刻被判失效。
-    if (sp.pruneThreshold >= sp.maxEdgeWeight) {
-      errors.push('spread.pruneThreshold 必须小于 spread.maxEdgeWeight')
-    }
-    if (!Number.isInteger(sp.maxPrunePerRun) || sp.maxPrunePerRun < 0) {
-      errors.push('spread.maxPrunePerRun 必须是 ≥ 0 的整数')
-    }
+    errors.push(
+      'spread.plasticityEnabled 必须为 false：可塑性（边权随共激活变化）尚未接线，'
+      + '打开它不会产生任何效果。已实现的只有扩散激活（spread.mode）。'
+      + '接线前提是确认信号有可审计来源，见 docs/3-架构设计.md §7.2',
+    )
+  }
+  // 下面四个参数当前**不参与任何生产逻辑**（可塑性未接线），但仍然是配置里的值，
+  // 必须**无条件**校验：一个将来会炸的值，现在就报出来比留到接线那天好。
+  //
+  // 这段以前挂在 `if (sp.plasticityEnabled)` 里，注释写的是「关着的时候配错值
+  // 不该拦住整个配置」。那个理由本身没错，但它让「校验写了」和「校验会执行」
+  // 变成了两件事——开关一旦必须为 false，整块校验就成了不可达代码。
+  if (sp.reinforceDelta <= 0) errors.push('spread.reinforceDelta 必须 > 0（否则强化永不发生）')
+  if (sp.maxEdgeWeight <= 0 || sp.maxEdgeWeight > 1) {
+    errors.push('spread.maxEdgeWeight 必须落在 (0, 1]')
+  }
+  // 衰减乘数必须落在 (0,1)：等于 1 永不衰减（剪枝永远不会触发），
+  // 等于 0 一次巩固就清零（所有边瞬间失效）。
+  if (sp.decayFactor <= 0 || sp.decayFactor >= 1) {
+    errors.push('spread.decayFactor 必须落在 (0, 1)（等于 1 永不衰减，等于 0 一次清空）')
+  }
+  // 剪枝阈值必须小于边权上限，否则「上限本身就在剪枝区间里」，
+  // 新建立的边会立刻被判失效。
+  if (sp.pruneThreshold >= sp.maxEdgeWeight) {
+    errors.push('spread.pruneThreshold 必须小于 spread.maxEdgeWeight')
+  }
+  if (!Number.isInteger(sp.maxPrunePerRun) || sp.maxPrunePerRun < 0) {
+    errors.push('spread.maxPrunePerRun 必须是 ≥ 0 的整数')
   }
   return { ok: errors.length === 0, errors }
 }
