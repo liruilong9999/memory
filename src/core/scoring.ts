@@ -424,10 +424,36 @@ function mergeSpread(
   // 门槛 = 本轮候选池最高分 × seedRatio。无量纲，自动跟随本轮分数分布：
   // 查询精确时门槛高，模糊时门槛低。它衡量的不是「够不够格」，而是
   // 「在本轮里够不够强」——那才是「值得把激活撒出去」的判据。
-  const maxScore = scored.reduce((m, item) => (item.score.total > m ? item.score.total : m), 0)
+  // ## 种子判据必须与护栏同尺（缺陷三十二）
+  //
+  // 上面刚说过「护栏与被护栏的量必须在同一把尺子上」——而**种子判据曾经不是**。
+  // 它拿 `total` 算相对门槛，护栏拿 `relevance`，于是两道闸各用一把尺子：
+  //
+  //   total     有 0.48 的权重（importance / recency / confidence）与查询无关，
+  //             它给每张卡垫了一层共同地板，把相对离散度压平。
+  //             实测同质语料 最小/最大 = 0.9059，异质语料 0.9655。
+  //   relevance 是纯相关性，离散度 0.7237 / 0.8158。
+  //
+  // `seedRatio = 0.85` 落在 `total` 的离散区间（0.91~0.97）**之下**，
+  // 于是「所有卡都是种子」，受益者恒为 0，扩散在数学上又恒为空。
+  // 实测 off / shadow / on 三种模式的总分**逐位相同**、影子观察值 0 条——
+  // 和缺陷二十六之前那次恒为空**表现完全一样**，但根因在另一半。
+  //
+  // 同一个教训：「阈值换尺子之后，所有拿它做乘数的护栏都要逐个复查，
+  // 而它们的失效方式一律是恒真。」缺陷二十六只复查了护栏那一半，
+  // 种子这一半漏了。**两道闸用两把尺子，恒空只是时间问题。**
+  //
+  // 换成 relevance 后实测：同质语料种子 3/7、受益者 4；异质语料种子 2/3、
+  // 受益者 1。注意 `maxScore` 也必须取 relevance 的最大值，否则门槛与
+  // 判据又不同尺。
+  const maxScore = scored.reduce((m, item) => (item.score.relevance > m ? item.score.relevance : m), 0)
   const seedFloor = maxScore * config.spread.seedRatio
   const seeds = scored
-    .filter((item) => item.score.total >= seedFloor)
+    .filter((item) => item.score.relevance >= seedFloor)
+    // 种子的能量仍用 `total`：那是「这张卡有多强」的完整度量，
+    // 撒出去的激活量应该按它算，而不是按相关分量算。
+    // 判据用 relevance（够不够格当种子），能量用 total（能撒多少）——
+    // 两个用途不同，用不同的量是**刻意的**，不是又一处尺子错配。
     .map((item) => ({ id: item.card.id, score: item.score.total }))
   // 邻接表按**全部边**构造，但结果只对候选池内的卡生效。
   //

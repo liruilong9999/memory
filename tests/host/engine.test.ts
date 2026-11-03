@@ -13,7 +13,7 @@
 import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_CONFIG } from '../../src/core/config.ts'
+import { DEFAULT_CONFIG, mergeConfig } from '../../src/core/config.ts'
 import type { MemoryConfig } from '../../src/core/config.ts'
 import type { MemoryLogEntry } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
@@ -23,6 +23,10 @@ import type { MemoryStore } from '../../src/store/store.ts'
 import { makeCard, makeTempDir, removeDirContents } from '../store/helpers.ts'
 import { makeConfig } from '../consolidate/fixtures.ts'
 import { pickDue } from '../../src/time/clock.ts'
+import { makeQuery as makeRecallQuery, scoreCards as scoreCardsForProbe } from '../../src/core/scoring.ts'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const TZ = 'Asia/Shanghai'
 const T0 = 1_700_000_000_000
@@ -1296,6 +1300,174 @@ describe('情绪记忆必须真的进库并能被召回（起源 L3 / L11 端到
     assert.equal(
       store.listCards({}).length, 0,
       '寒暄不得入库：情绪通道不能把长度闸整个取消掉',
+    )
+    store.close()
+  })
+})
+
+describe('扩散激活必须真的改变焦点包成员（缺陷三十二）', () => {
+  /**
+   * 判别性 fixture：让 `total` 与 `relevance` 两把尺子给出**不同**的种子集合。
+   *
+   * ## 为什么必须是这个形状（这条 fixture 是被反向验证逼出来的）
+   *
+   * 第一版 fixture 用的是「新/旧混合 + 多词项查询」。它在 `relevance` 判据下
+   * 扩散生效，但把实现改回 `total` 判据后**测试依然全绿**——因为那份语料里
+   * `total` 恰好也有足够离散度。**靠巧合绿的测试抓不住它声称要抓的缺陷。**
+   *
+   * 现在这个形状让两把尺子的差别成为**结构性的**：
+   * 全部卡在**同一时刻**写入，`recency` / `importance` / `confidence`
+   * 三个与查询无关的维度几乎相同（合计权重 0.48）⇒ `total` 被压平到
+   * `[0.4508, 0.4981]`，`seedRatio = 0.85` 的门槛 `0.4234` **落在值域之下**
+   * ⇒ `total` 判据下「所有卡都是种子」，受益者恒为 0，扩散恒空。
+   * 而 `relevance` 是纯相关分量，值域 `[0.2221, 0.3069]`，门槛 `0.2609`
+   * 正好切在中间 ⇒ 种子 3、受益者 4。
+   *
+   * 实测对照：
+   *
+   * ```text
+   * relevance 判据：种子 3/7，受益者 4   ← 扩散生效
+   * total     判据：种子 7/7，受益者 0   ← 扩散恒空（缺陷三十二原样）
+   * ```
+   *
+   * 前提：边只在夜整理里产出，所以必须走 writeTurn + consolidate。
+   */
+  function synapseLibrary(): { engine: InstanceType<typeof MemoryEngine>; store: ReturnType<typeof openStore> } {
+    const config = mergeConfig(DEFAULT_CONFIG, { spread: { mode: 'on' } })
+    const dir = mkdtempSync(join(tmpdir(), 'synapse-'))
+    const store = openStore({ config, dataDir: dir })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+    const rounds = [
+      '部署脚本用的是 pnpm build 然后 rsync 到服务器。',
+      '部署前必须先在本地跑一遍 pnpm test 验证。',
+      '上次部署失败是因为 node 版本不对，我改成了 20。',
+      '部署完要检查 nginx 的 reload 有没有报错。',
+      '记得部署后看一遍 access.log 有没有 502。',
+      '发布窗口只在周四晚上，其它时间不动线上。',
+      '回滚就是 git revert 到上一个 tag 再重新部署。',
+    ]
+    rounds.forEach((text, i) => {
+      // 同一时刻写入：这是让 `total` 失去离散度的**唯一**手段，
+      // 也是本 fixture 有判别力的全部原因。别改成递增时刻。
+      engine.writeTurn({
+        sessionId: 'sess-synapse', turn: i + 1, step: 1, seq: i + 1,
+        userText: text, assistantText: '',
+        domain: 'work', at: T0,
+      })
+    })
+    engine.consolidate(T0 + 2000)
+    return { engine, store }
+  }
+
+  const QUERY = '部署怎么做'
+
+  it('前提：这个库里必须同时有种子和受益者，否则测的是空气', () => {
+    // 这条前提断言是**必须**的。没有它，下面几条会在「受益者集合为空」
+    // 时依然绿——而那正是缺陷三十二的表现：机制恒空、测试全绿。
+    const { engine, store } = synapseLibrary()
+    const res = engine.peek(QUERY)
+    const scored = res.pack.cards.map((c) => c.score)
+    assert.ok(scored.length > 0, '前提：得先召回到卡')
+    const maxRel = Math.max(...scored.map((s) => s.relevance))
+    const seedFloor = maxRel * DEFAULT_CONFIG.spread.seedRatio
+    const seeds = scored.filter((s) => s.relevance >= seedFloor)
+    const beneficiaries = scored.filter(
+      (s) => s.relevance < seedFloor && s.relevance >= DEFAULT_CONFIG.recall.absoluteThreshold,
+    )
+    assert.ok(seeds.length > 0, `前提：必须有种子，实际 0（maxRel=${maxRel}）`)
+    assert.ok(
+      beneficiaries.length > 0,
+      `前提：必须有受益者，实际 0——受益者区间是 [${DEFAULT_CONFIG.recall.absoluteThreshold}, ${seedFloor})`,
+    )
+    assert.ok(store.allEdges().length > 0, '前提：必须有图谱边，否则扩散无从发生')
+    store.close()
+  })
+
+  it('扩散真的给受益者加了分，且能说出「因为想起了谁」（突触效果的可感知形态）', () => {
+    const { engine, store } = synapseLibrary()
+    const res = engine.peek(QUERY)
+    const boosted = res.pack.cards.filter((c) => c.explain.some((l) => l.includes('扩散加分')))
+    assert.ok(
+      boosted.length > 0,
+      'on 模式下必须有卡拿到扩散加分——否则「突触效果」只是一句宣传语',
+    )
+    // 只断言「加了分」是半个测试：分数高了但说不出理由，从用户视角看
+    // 就是「莫名高了一点」，和噪声没有区别。突触效果的可感知形态是
+    // **能说出「因为想起 A，所以想起 B」**。
+    for (const item of boosted) {
+      const line = item.explain.find((l) => l.includes('扩散加分'))!
+      assert.match(
+        line, /因为想起了：/u,
+        `扩散加分必须说明来源，实际：${line}`,
+      )
+      assert.ok(
+        line.replace(/^.*因为想起了：/u, '').trim().length > 0,
+        `来源列表不得为空，实际：${line}`,
+      )
+    }
+    store.close()
+  })
+
+  it('on 与 off 的排序必须不同（证明扩散真的参与了排序，不是只算不用）', () => {
+    // 「算了但没接进排序」和「根本没算」在用户视角下完全一样。
+    // 唯一能区分的是：两种模式的输出必须有差异。
+    const { engine, store } = synapseLibrary()
+    const onRes = engine.peek(QUERY)
+    const onTotals = onRes.pack.cards.map((c) => c.score.total)
+
+    const offConfig = mergeConfig(DEFAULT_CONFIG, { spread: { mode: 'off' } })
+    const query = makeRecallQuery(QUERY, offConfig, T0)
+    const cards = store.listCards({}).filter((c) => c.status === 'active')
+    const offScored = scoreCardsForProbe(cards, query, offConfig, [])
+    const offTotals = offScored.slice(0, onTotals.length).map((c) => c.score.total)
+
+    assert.notDeepEqual(
+      onTotals, offTotals,
+      'on 与 off 的总分序列不得相同——相同即扩散没生效（缺陷三十二就是这样）',
+    )
+    store.close()
+  })
+
+  it('影子模式：算出真账但不动排序，且观察值非零', () => {
+    // 影子模式的全部价值在于它算的是**真账**。若它观察到的永远是 0，
+    // 用它攒出来的「打开后会怎样」的证据一文不值。
+    const shadowConfig = mergeConfig(DEFAULT_CONFIG, { spread: { mode: 'shadow' } })
+    const dir = mkdtempSync(join(tmpdir(), 'synapse-shadow-'))
+    const store = openStore({ config: shadowConfig, dataDir: dir })
+    const engine = new MemoryEngine({ store, config: shadowConfig, timeZone: TZ, clock: () => T0 })
+    const rounds = [
+      '部署脚本用的是 pnpm build 然后 rsync 到服务器。',
+      '部署前必须先在本地跑一遍 pnpm test 验证。',
+      '上次部署失败是因为 node 版本不对，我改成了 20。',
+      '部署完要检查 nginx 的 reload 有没有报错。',
+      '记得部署后看一遍 access.log 有没有 502。',
+      '发布窗口只在周四晚上，其它时间不动线上。',
+      '回滚就是 git revert 到上一个 tag 再重新部署。',
+    ]
+    rounds.forEach((text, i) => {
+      engine.writeTurn({
+        sessionId: 'sess-synapse', turn: i + 1, step: 1, seq: i + 1,
+        userText: text, assistantText: '',
+        domain: 'work', at: T0,
+      })
+    })
+    engine.consolidate(T0 + 2000)
+    const res = engine.peek(QUERY)
+    const withShadow = res.pack.cards.filter((c) => c.shadowSpread !== undefined)
+    assert.ok(
+      withShadow.length > 0,
+      '影子模式必须产出观察值——观察值为 0 说明「打开后会怎样」的证据是空的',
+    )
+    // 影子模式不得改动排序。判据用**同一份数据在 off 模式下的总分序列**，
+    // 而不是拿 `total` 和它自己相减（那是同义反复，永远成立）。
+    const offConfig = mergeConfig(DEFAULT_CONFIG, { spread: { mode: 'off' } })
+    const query = makeRecallQuery(QUERY, offConfig, T0)
+    const cards = store.listCards({}).filter((c) => c.status === 'active')
+    const offScored = scoreCardsForProbe(cards, query, offConfig, [])
+    assert.deepEqual(
+      res.pack.cards.map((c) => c.score.total),
+      offScored.slice(0, res.pack.cards.length).map((c) => c.score.total),
+      '影子模式不得把观察值折进 total（否则它就不是影子，是 on）',
     )
     store.close()
   })

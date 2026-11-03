@@ -101,20 +101,44 @@ function seedStore(dir: string): void {
  *
  * @param dir - 数据目录。
  */
+/**
+ * 扩散 fixture 的查询词。
+ *
+ * **必须是多词项。** 单个词项（如 `'Redis'`）会让 `relevance` 呈断崖分布：
+ * 命中簇 0.69，其余全 0.00，中间没有卡 ⇒ 受益者集合为空 ⇒ 扩散在数学上
+ * 无从发生。这不是代码问题，是**查询词把梯度抹平了**。
+ *
+ * 用四个词项后 `relevance` 有真实梯度（0.58 / 0.52 / 0.23 / 0.17），
+ * 受益者区间 `[absoluteThreshold, max × seedRatio)` 才非空。
+ */
+const SYNAPSE_QUERY = 'Redis 缓存 一致性 方案'
+
 function seedSynapseStore(dir: string): void {
-  const store = openStore({ config: DEFAULT_CONFIG, dataDir: dir })
+  // 这个 fixture 必须让扩散**真的产生加分**，否则「on 模式下必须看见扩散加分」
+  // 测的是空气。两个条件缺一不可，而且第二个是缺陷三十二之后才成立的：
+  //
+  //   ① 库里要有边（走 writeTurn + consolidate，边只在夜整理里产出）；
+  //   ② 边两端必须**一强一弱**——强的是种子，弱的是受益者。
+  //
+  // 原语料是「Cordis / Redis / PostgreSQL」三个互不相干的簇，查询 'Redis' 时
+  // `relevance` 呈断崖分布（命中簇 0.69，其余全是 0.00），中间没有一张卡，
+  // 于是「受益者集合」是空的，扩散**在数学上无从发生**。
+  //
+  // 现在改用多词项查询 `Redis 缓存 一致性 方案`，让 `relevance` 有真实梯度：
+  // 两张种子（0.58 / 0.52）+ 两张中等相关的受益者（0.23 / 0.17）。
+  // 判据与护栏同尺之后（缺陷三十二），受益者才拿得到加分。
+  const config = mergeConfig(DEFAULT_CONFIG, { spread: { mode: 'on' } })
+  const store = openStore({ config, dataDir: dir })
   const engine = new MemoryEngine({
-    store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock,
+    store, config, timeZone: TZ, clock: fixedClock,
   })
   const sentences = [
-    '决定把 Cordis 版本升到 4，插件按新 API 改写',
-    '结论是 Cordis 的 bundle patch 语法要重新适配',
+    '约定 Redis 和 PostgreSQL 的数据一致性方案',
     '方案是用 Redis 做缓存，结论已定',
     '约定 Redis 的过期时间设成 300 秒',
-    '约定 Redis 和 PostgreSQL 的数据一致性方案',
-    '决定数据库选 PostgreSQL，这条和框架无关',
-    '架构上 Cordis 插件加载顺序会影响启动时间',
-    '约定 Cordis 插件命名用中划线，注意统一',
+    '缓存击穿要用互斥锁，不能只靠过期时间',
+    '方案已经评审通过，下周开始实现',
+    '一致性哈希的虚拟节点数设成 150 比较稳',
   ]
   sentences.forEach((text, i) => {
     engine.writeTurn({
@@ -753,7 +777,7 @@ describe('CLI 与宿主必须用同一份配置（真缺陷九）', () => {
     let hostHasBoost = false
     try {
       const engine = new MemoryEngine({ store, config: hostConfig, timeZone: TZ, clock: fixedClock })
-      const peek = engine.peek('Redis')
+      const peek = engine.peek(SYNAPSE_QUERY)
       hostTotals = peek.pack.cards.map((scored) => scored.score.total)
       hostHasBoost = peek.pack.cards.some((c) => c.explain.some((l) => l.includes('扩散加分')))
     } finally {
@@ -765,7 +789,7 @@ describe('CLI 与宿主必须用同一份配置（真缺陷九）', () => {
     assert.equal(hostHasBoost, true, '前提：这个库里扩散必须真的发生过，否则本条测试没测到东西')
 
     // CLI：真实入口
-    const result = runCli(['query', 'Redis', '--data-dir', dir, '--json'], { now: fixedClock })
+    const result = runCli(['query', SYNAPSE_QUERY, '--data-dir', dir, '--json'], { now: fixedClock })
     const payload = JSON.parse(result.stdout) as {
       cards: { score: { total: number }; explain: string[] }[]
     }
