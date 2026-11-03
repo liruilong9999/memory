@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=11',
+  'configVersion=12',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -130,7 +130,7 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'forgetting.neverArchiveKinds[3]=experience',
   'graph.topicFloor=0.08',
   'graph.topicNeighbors=3',
-  'recall.absoluteThreshold=0.18',
+  'recall.absoluteThreshold=0.06',
   'recall.candidateLimit=400',
   'recall.maxCardChars=160',
   'recall.maxCards=7',
@@ -197,7 +197,12 @@ describe('摘要配置的默认值与版本', () => {
     //  11 → **新增** graph 分区（topicFloor / topicNeighbors）。图谱连边原先借用
     //       dedup.relatedSimilarity，而那个数值是为去重标定的、且被冲突判定
     //       反向共用；拆出独立分区是修缺陷二十四的前提。详见 docs/7。
-    assert.equal(MEMORY_CONFIG_VERSION, 11, '新增 graph 分区后版本应为 11')
+    //  12 → `recall.absoluteThreshold` **改了语义**（缺陷二十六）：它比对的
+    //       不再是 `total`，而是新增的相关分量 `relevance`；数值从 0.18 改为 0.06
+    //       （两把尺子的刻度不同，不能沿用旧值）。同时删除 `capConflictPenalty`。
+    //       语义变更比新增字段更需要递增版本：旧快照里写着 `absoluteThreshold: 0.18`
+    //       的人以为那是「总分阈值」，回滚回来会得到一个清空焦点包的值。
+    assert.equal(MEMORY_CONFIG_VERSION, 12, '绝对阈值改语义后版本应为 12')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

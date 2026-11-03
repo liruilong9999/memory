@@ -902,6 +902,87 @@ describe('扩散激活的端到端链路（FR-G1 / 起源 L15）', () => {
 })
 
 /**
+ * FR-B2「全低分时不硬塞」的端到端验收（缺陷二十六的最终守门）。
+ *
+ * ## 为什么要单独一组端到端用例
+ *
+ * 缺陷二十六的本质是：`absoluteThreshold` 比对 `total`，而 `total` 里有
+ * 0.48 权重与查询无关，于是一张**完全无关但新鲜**的卡也能拿 0.32 以上，
+ * 阈值无论调多少都拦不住它。单测层面已经证明了这个数学性质
+ * （`tests/core/scoring.test.ts` 的 `无关但新鲜的卡` 那条），但单测
+ * **自己构造打分结果**，跳过了「候选池是怎么来的」「闸门在链路里有没有被调用」
+ * 这两步——而缺陷经常恰好在那一层。
+ *
+ * 这组用例走真实链路：写入 → 夜整理产边 → `engine.recall` → 焦点包。
+ * 它守的是用户能直接观察到的那个事实：**问一件库里完全没提过的事，
+ * 焦点包必须是空的**，而不是被塞满无关卡。
+ */
+describe('无关查询不得硬塞焦点包（FR-B2 / 缺陷二十六端到端）', () => {
+  /** 造一个只谈部署、与「量子色动力学」毫无关系的库。 */
+  function deployLibrary(mode: MemoryConfig['spread']['mode']): {
+    store: MemoryStore
+    engine: MemoryEngine
+  } {
+    const config = makeConfig({ spread: { mode } })
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+    const rounds = [
+      '部署脚本一直报错，原因是环境变量没有配置，我们决定以后部署前先跑一次自检。',
+      '部署方案最终选了蓝绿发布，原因是要能一键回滚，结论是先起绿环境验证再切流量。',
+      '我们决定把回滚流程写进运维手册，约定每次部署之后都要演练一次。',
+    ]
+    for (let i = 0; i < rounds.length; i += 1) {
+      engine.writeTurn(turnInput({ userText: rounds[i]!, turn: i + 1, at: T0 - (3 - i) * 86_400_000 }))
+    }
+    engine.consolidate(T0 + 2000)
+    return { store, engine }
+  }
+
+  it('问库里完全没提过的事，焦点包必须为空（不许靠新鲜度混进来）', () => {
+    // 三种扩散模式都要过：`on` 模式下「有个强邻居」也不能把无关卡推进来，
+    // 因为绝对闸看 `relevance`，而扩散加分只进 `total`。
+    for (const mode of ['off', 'shadow', 'on'] as const) {
+      const { store, engine } = deployLibrary(mode)
+      // 前提：库里确实有卡，否则「空包」可能只是因为库是空的。
+      assert.ok(store.listCards({ status: 'active' }).length > 0, '前提：库里必须有卡')
+      // 前提：候选池必须非空，否则「空包」可能只是因为倒排一张都没召回。
+      // 这一条很关键：它把「闸门挡住了」和「根本没有候选」区分开。
+      const probe = engine.recall('部署')
+      assert.ok(
+        probe.candidates > 0,
+        `前提（mode=${mode}）：查询「部署」必须召回候选，实际 ${probe.candidates}`,
+      )
+
+      const result = engine.recall('量子色动力学的渐近自由')
+      assert.equal(
+        result.pack.cards.length,
+        0,
+        `mode=${mode}：问库里完全没提过的事，焦点包必须为空。`
+        + `实际硬塞了：${result.pack.cards.map((c) => `「${c.card.text.slice(0, 20)}」(rel=${c.score.relevance.toFixed(3)}, total=${c.score.total.toFixed(3)})`).join(' | ')}`,
+      )
+      // 注入文本也不能编造内容（ST-5 不编造）。
+      assert.equal(result.text, '', `mode=${mode}：空包时注入文本必须为空串`)
+      store.close()
+    }
+  })
+
+  it('反向对照：问库里确实谈过的事，焦点包必须非空', () => {
+    // 只测「该空的空」是半个测试——把 `applyThresholds` 改成恒返回 `[]`
+    // 也能让上一条全绿。这条守另一半：闸门不是无条件清空。
+    const { store, engine } = deployLibrary('on')
+    const result = engine.recall('上次部署是怎么做的')
+    assert.ok(
+      result.pack.cards.length > 0,
+      '库里确实谈过部署，问它时必须召回；若为空说明阈值把真相关卡也挡住了',
+    )
+    // 更要紧的：召回的内容必须真的和部署有关，不是随便塞一张。
+    const texts = result.pack.cards.map((c) => c.card.text).join(' ')
+    assert.match(texts, /部署|回滚|蓝绿/u, `召回内容必须与部署相关，实际：${texts.slice(0, 80)}`)
+    store.close()
+  })
+})
+
+/**
  * 影子观察值必须有人看得到（FR-G1 / FR-F1 可观测）。
  *
  * 影子模式的全部价值在于「先看它想做什么，再决定要不要开」。算完不暴露，

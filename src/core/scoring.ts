@@ -216,55 +216,48 @@ export function scoreCard(card: MemoryCard, query: RecallQuery, config: MemoryCo
     + goal * w.goal
     + confidence * w.confidence
   const normalized = positiveWeight > 0 ? positive / positiveWeight : 0
-  const penalty = capConflictPenalty(rawPenalty, normalized, config)
+
+  // 相关分量：只由**与查询有关**的维度合成（semantic + goal），供闸门使用。
+  // 详见 `ScoreBreakdown.relevance` 的注释：total 上不存在能分开相关/无关的阈值。
+  const relevantWeight = w.semantic + w.goal
+  const relevance = relevantWeight > 0
+    ? clamp01((semantic * w.semantic + goal * w.goal) / relevantWeight)
+    : 0
+
+  // 冲突惩罚**不再按 absoluteThreshold 封顶**，直接扣总分。
+  //
+  // 原来的封顶写法是 `penalty ≤ (normalized − absoluteThreshold) / w.conflict`，
+  // 目的是让冲突「只降权、不淘汰」（FR-B5）。它确实做到了，但代价是：
+  //
+  // 1. 任何带冲突且冲突够重的卡，`total` 被**精确钳在 `absoluteThreshold` 上**。
+  //    实测 10 张卡总分完全相同（0.180000000），封顶前它们分布在
+  //    0.3457~0.3767，那 0.0310 的分辨力被整个丢弃。排序退化成按 `id`
+  //    （内容哈希）——与相关性无关。
+  // 2. 语义分 0.180 的卡与语义分 0.000 的卡拿到**完全相同**的总分。
+  //    封顶注释里写「降权的语义完整保留」，而实际发生的是「降权让区分度归零」。
+  // 3. 它把 `absoluteThreshold` 当成了分数地板，于是那道闸对所有卡恒真。
+  //
+  // FR-B5 的「冲突不隐藏」现在由**结构**保证，不再靠封顶这个补丁：
+  // 闸门看的是 `relevance`，而 `relevance` **完全不含冲突项**，
+  // 所以冲突在数学上不可能影响一张卡的去留，只影响它排第几。
+  // 这比「算一个恰好不越界的上限」更可靠——后者依赖两个参数的具体数值。
+  const penalty = rawPenalty
   const total = clamp01(normalized - penalty * w.conflict)
 
   const score: ScoreBreakdown = {
-    semantic, importance, recency, goal, confidence, conflictPenalty: penalty, total,
+    semantic, importance, recency, goal, confidence, conflictPenalty: penalty, relevance, total,
   }
   return {
     card,
     score,
-    explain: buildExplain(score, config, {
-      goalApplied,
-      conflictCapped: penalty < rawPenalty,
-    }),
-    // `conflict` 判据用**原始惩罚**而不是封顶后的值：只要这张卡真的挂着冲突，
-    // 就必须标 CONFLICT（FR-B5）。若用封顶值，边界情况下会算出 0 而漏标。
+    // 不再有「封顶」这回事：惩罚原样扣进 `total`，而闸门看的是 `relevance`，
+    // 后者完全不含冲突项，所以冲突在结构上无法影响去留（FR-B5）。
+    explain: buildExplain(score, config, { goalApplied }),
+    // `conflict` 判据用原始惩罚：只要这张卡真的挂着冲突就必须标 CONFLICT（FR-B5）。
     conflict: rawPenalty > 0,
   }
 }
 
-/**
- * 给冲突惩罚封顶，保证它**只改排序、不改去留**。
- *
- * 需求 FR-B5 的原文是「冲突不隐藏，但要降权」——降权是排序手段，
- * 不是淘汰手段。原来的实现直接把 `penalty × w.conflict` 从总分里减掉，
- * 而 `w.conflict`（0.25）比 `absoluteThreshold`（0.18）还大：一条冲突数
- * 达到 3 的卡最多被扣 0.25，足以把它从阈值上方打到下方。结果就是
- * **互相冲突的两张卡一起消失**——恰恰是 FR-B5 要防的「隐藏」，
- * 而且是最坏的一种隐藏：模型连「这里存在矛盾」都不知道。
- *
- * 封顶的做法是让惩罚最多消耗「离绝对阈值还剩多少余量」，即
- * `penalty × w.conflict ≤ normalized − absoluteThreshold`。
- * 这样：只要一条卡本来能进包，冲突就绝不会让它掉出包外；
- * 但它仍会因此排在无冲突的同分卡之后——降权的语义完整保留。
- *
- * @param raw - 原始冲突惩罚（0..1）。
- * @param normalized - 归一化后的正向分（0..1，未扣冲突）。
- * @param config - 配置，提供冲突权重与绝对阈值。
- * @returns 封顶后的惩罚（0..1）。
- */
-function capConflictPenalty(raw: number, normalized: number, config: MemoryConfig): number {
-  if (raw <= 0) return 0
-  const weight = config.weights.conflict
-  // 权重为 0 时惩罚不进总分，封顶无从谈起；原样报出供 explain 显示真实冲突程度。
-  if (weight <= 0) return raw
-  const headroom = normalized - config.recall.absoluteThreshold
-  // 本来就在阈值下方：惩罚已无「淘汰」可言，报 0 避免 explain 出现误导性的扣分。
-  if (headroom <= 0) return 0
-  return Math.min(raw, headroom / weight)
-}
 
 /**
  * 有效半衰期：情绪与访问频次会延长记忆寿命。
@@ -296,13 +289,12 @@ export function effectiveHalfLife(card: MemoryCard, config: MemoryConfig): numbe
  * @param config - 配置，用于展示权重。
  * @param options - 渲染选项。
  * @param options.goalApplied - 目标维度是否参与计算；`false` 时标为未启用。
- * @param options.conflictCapped - 冲突惩罚是否被封顶过；`true` 时补一句说明。
  * @returns 解释行数组。
  */
 export function buildExplain(
   score: ScoreBreakdown,
   config: MemoryConfig,
-  options: { goalApplied?: boolean; conflictCapped?: boolean } = {},
+  options: { goalApplied?: boolean } = {},
 ): string[] {
   const w = config.weights
   const goalApplied = options.goalApplied ?? true
@@ -316,9 +308,12 @@ export function buildExplain(
     `置信度   ${fmt(score.confidence)} × 权重 ${fmt(w.confidence)} = ${fmt(score.confidence * w.confidence)}`,
   ]
   if (score.conflictPenalty > 0) {
-    const capped = options.conflictCapped === true ? '（已封顶，冲突只影响排序不决定去留）' : ''
-    lines.push(`冲突惩罚 -${fmt(score.conflictPenalty)} × 权重 ${fmt(w.conflict)} = -${fmt(score.conflictPenalty * w.conflict)}${capped}`)
+    lines.push(`冲突惩罚 -${fmt(score.conflictPenalty)} × 权重 ${fmt(w.conflict)} = -${fmt(score.conflictPenalty * w.conflict)}`)
   }
+  // 相关分量必须显式列出：它是**决定去留**的那个数，而总分只决定排序。
+  // 不列出来，用户看到「总分 0.45 却没进焦点包」会觉得系统坏了——
+  // 实际是 relevance 不够。FR-B4 要求分数可解释，这一行是解释的核心。
+  lines.push(`相关分量 ${fmt(score.relevance)}（闸门判据，阈值 ${fmt(config.recall.absoluteThreshold)}）`)
   lines.push(`总分 ${fmt(score.total)}`)
   return lines
 }
@@ -399,7 +394,16 @@ export function scoreCards(
 function mergeSpread(
   scored: readonly ScoredCard[], edges: readonly MemoryEdge[], config: MemoryConfig,
 ): ScoredCard[] {
-  const selfScores = new Map(scored.map((item) => [item.card.id, item.score.total]))
+  // 护栏判据装的是 **relevance**，不是 total。
+  //
+  // 扩散护栏问的是「这张卡本身有没有资格被加分」，而资格 = 与查询有关系，
+  // 那正是 `relevance` 的语义。用 `total` 会让一张「无关但新鲜」的卡
+  // 凭新鲜度通过护栏——护栏就又变成了恒真（这正是它坏过两次的方式）。
+  //
+  // 顺带一个结构性的好处：`selfScores` 里没有的卡（池外邻居）依然被挡掉，
+  // 而池外邻居按构造 semantic 恒为 0（见下方注释），所以「挡掉池外邻居」
+  // 与「挡掉无关卡」在这里是同一件事。
+  const selfScores = new Map(scored.map((item) => [item.card.id, item.score.relevance]))
   // 种子判据用 **seedRatio**，且门槛是**相对本次最高分**，不是绝对阈值。
   //
   // ## 这里曾经让整个机制在数学上恒为空（被实测抓出的设计缺陷）
@@ -425,8 +429,33 @@ function mergeSpread(
   const seeds = scored
     .filter((item) => item.score.total >= seedFloor)
     .map((item) => ({ id: item.card.id, score: item.score.total }))
-  // 邻接表按**全部边**构造：扩散才能从候选卡走到「本轮没被检索命中」的邻居。
-  // 但结果只对候选池内的卡生效——`selfScores` 里没有的卡会被护栏挡掉。
+  // 邻接表按**全部边**构造，但结果只对候选池内的卡生效。
+  //
+  // ## 这条注释的前半句曾经承诺了一个实现没有的能力
+  //
+  // 原文写的是「扩散才能从候选卡走到『本轮没被检索命中』的邻居」——
+  // 读起来像是「池外邻居也能被扩散召回」。实际不会：`selfScores` 只含候选池，
+  // `spreadActivation` 里 `selfScore === undefined` 的卡直接被护栏挡掉。
+  // 前半句承诺能力、后半句取消它，等于把缺陷写成了事实。
+  //
+  // ## 不是缺陷，是**结构性必然**（已实测，别再试图「修」它）
+  //
+  // 候选池 = `store.search(query.tokens)` 的倒排命中，而 `semanticScore` 也基于
+  // 词项重合。于是：
+  //
+  //   不在池内 ⟺ 倒排未命中 ⟺ 与查询零词项重合 ⟺ semantic 必然 = 0
+  //
+  // 实测 78 张卡 / 45 条边：池外邻居 33 个，**semantic 为 0 的 33 个（100%）**，
+  // 大于 0 的 0 个。所以「让扩散拉入池外邻居」不是找回被漏掉的相关记忆，
+  // 而是往焦点包塞**必然无关**的卡——正是 FR-B2「全低分时不硬塞」要防的事。
+  //
+  // 反事实重排也证实了这一点：把池外邻居强行加进池后，新增的 10 张卡
+  // semantic 全是 0.000，而被挤掉的 2 张 semantic 是 0.090——净变差。
+  //
+  // 唯一理论上合法的扩池场景是 `distills` 边（感受卡文本是模板，与查询
+  // 零重合却真的相关，起源 L11）。实测该语料下 `distills` 边产出 0 条，
+  // 没有可验证的场景，因此**不实现**：与其写一个没有真实输入能走到的分支，
+  // 不如把这个边界写清楚。
   const adjacency = buildAdjacency(edges)
   const boosts = spreadActivation(seeds, adjacency, selfScores, config)
   // 没有任何卡获得扩散加分时，返回入参本身而不是拷贝：调用方拿到的是同一份
@@ -601,6 +630,20 @@ function attachShadow(
  * 需求 FR-B2：绝对阈值 + 相对阈值 + 硬上限，三者取最严。
  * 「全低分时不硬塞」——宁可空包，也不给模型一堆无关记忆（FR-B6）。
  *
+ * ## 闸门看 `relevance`，不看 `total`（这是修缺陷二十六的核心）
+ *
+ * 原来的闸门是 `total >= absoluteThreshold`。它在真实数据上**恒真**：
+ * `total` 里 0.48 权重给了与查询无关的维度，一张完全无关但新鲜的卡
+ * 也有约 0.32。实测（161 张卡 × 19 个查询）无关卡总分区间
+ * 0.3131~0.3767 与相关卡区间 0.3452~ 重叠 33.3%，
+ * **任何阈值都分不开**，于是「全低分时不硬塞」这条验收不可能失败。
+ *
+ * 换成 `relevance` 后，同一个完全无关的查询下它精确为 0，
+ * 闸门立刻能拒绝（实测「深海鮟鱇鱼」查询从硬塞 4 张变为空包），
+ * 而真相关的卡一张都没掉（实测 19 个查询全部无召回损失）。
+ *
+ * **排序仍按 `total`**：那是「值不值得想起」，与「有没有关系」是两件事。
+ *
  * @param scored - 已按总分降序排序的结果。
  * @param config - 配置。
  * @returns 通过阈值的卡片。
@@ -609,11 +652,26 @@ export function applyThresholds(scored: readonly ScoredCard[], config: MemoryCon
   if (scored.length === 0) return []
   const top = scored[0]
   if (top === undefined) return []
+  // 两道闸用**两把不同的尺子**，这是修缺陷二十六时定下来的，别再合并：
+  //
+  // - 绝对闸 → `relevance`（只含 semantic + goal）。它回答「有没有关系」，
+  //   是 FR-B2「全低分时不硬塞」的判据。扩散加分不进 relevance，
+  //   所以「有个强邻居」在结构上无法把无关卡推过这道闸。
+  // - 相对闸 → `total`。它回答「比本轮最好的差多少」，而「值不值得想起」
+  //   本来就该含新鲜度/重要性。扩散加分进 total，所以扩散**天然**能改变
+  //   成员，不需要任何豁免补丁。
+  //
+  // 曾经把相对闸也挪到 relevance（觉得「两把尺子不统一」），实测立刻误伤：
+  // SC-2 场景里目标卡 relevance 0.1113、相对闸 0.1121，**差 0.0008 被挡出包**，
+  // 而它在 total 尺度上（0.3925 vs 闸 0.2522）本该轻松通过。
+  // 根因是 relevance 的相对离散度比 total 大（同批候选 0.546 vs 0.856），
+  // 同一个 `relativeThreshold` 在 relevance 尺度上苛刻得多。
+  // ⇒ **两把尺子不是不一致，是两道闸问的问题不同。**
   const relativeFloor = top.score.total * config.recall.relativeThreshold
   const picked: ScoredCard[] = []
   for (const item of scored) {
     if (picked.length >= config.recall.maxCards) break
-    if (item.score.total < config.recall.absoluteThreshold) continue
+    if (item.score.relevance < config.recall.absoluteThreshold) continue
     if (item.score.total < relativeFloor) continue
     picked.push(item)
   }

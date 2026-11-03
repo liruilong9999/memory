@@ -101,24 +101,29 @@ describe('扩散激活（FR-G1）', () => {
     assert.equal(boosts[0]?.boost, 0.12, '必须精确等于上限，而不是原始累加值')
   })
 
-  it('护栏：自身分数低于绝对阈值的卡，扩散不给它加分', () => {
-    // b 自身 0.05，绝对阈值 0.18 → 低于阈值，扩散应拒绝它。
+  it('护栏：自身相关分低于绝对阈值的卡，扩散不给它加分', () => {
+    // `selfScores` 里装的是**相关分量**（`relevance`），不是总分——这一点是
+    // 修缺陷二十六时改的，改之前装的是 `total`，而 `total` 有 0.48 权重与
+    // 查询无关，于是「无关但新鲜」的卡也能过这道护栏，护栏恒真。
+    // 现在护栏与被护栏的量在同一把尺子上（都是 `relevance`），判据才有意义。
     const config = spreadConfig()
     const adjacency = buildAdjacency([edge('a', 'b')])
     const seeds: SpreadSeed[] = [{ id: 'a', score: 0.9 }]
-    const boosts = spreadActivation(seeds, adjacency, new Map([['b', 0.05]]), config)
+    // 取一个严格低于门槛的值，不写死数字——阈值调整后这条不会变成假绿。
+    const belowFloor = config.recall.absoluteThreshold * config.spread.minSelfScoreRatio - 0.001
+    assert.ok(belowFloor >= 0, '前提：门槛必须留有可用下界')
+    const boosts = spreadActivation(seeds, adjacency, new Map([['b', belowFloor]]), config)
     assert.deepEqual(boosts, [], '不合格的卡不能靠邻居混进来（否则阈值语义被稀释）')
   })
 
-  it('护栏的边界：恰好等于绝对阈值的卡可以通过', () => {
-    // minSelfScoreRatio = 1 时，门槛 = absoluteThreshold × 1 = 0.18。
-    // 恰好 0.18 必须通过 —— 防止将来有人把 `>=` 写成 `>`。
+  it('护栏的边界：恰好等于门槛的卡可以通过', () => {
+    // minSelfScoreRatio = 1 时，门槛 = absoluteThreshold × 1。
+    // 恰好等于门槛必须通过 —— 防止将来有人把 `>=` 写成 `>`。
     const config = spreadConfig()
     const adjacency = buildAdjacency([edge('a', 'b')])
     const seeds: SpreadSeed[] = [{ id: 'a', score: 0.9 }]
-    const boosts = spreadActivation(
-      seeds, adjacency, new Map([['b', config.recall.absoluteThreshold]]), config,
-    )
+    const floor = config.recall.absoluteThreshold * config.spread.minSelfScoreRatio
+    const boosts = spreadActivation(seeds, adjacency, new Map([['b', floor]]), config)
     assert.equal(boosts.length, 1, '恰好等于门槛必须通过')
   })
 
@@ -439,6 +444,18 @@ describe('把扩散结果合并进打分（FR-G1 / FR-B2）', () => {
     //
     // 现在断言**严格上升**，并且同时断言「谁被加分」符合种子规则：
     // 只有过了 seedRatio 门槛的最高分卡当种子，其余卡才是受益者。
+    //
+    // ## 缺陷二十六之后：护栏的尺子换了，`c` 不再获得加分
+    //
+    // `selfScores` 从 `total` 换成了 `relevance`（见 `mergeSpread` 的注释）。
+    // 于是 `c`（「无关的做饭记录」，relevance = 0）不再拿到扩散加分——
+    // **这正是护栏终于有牙的证据**：它以前恒真，是因为 `total` 有 0.48
+    // 权重与查询无关，一张无关卡也能拿 0.32，任何门槛都拦不住。
+    //
+    // 所以本用例现在守两件事，缺一不可：
+    // ① 相关卡 b 必须**严格上升**（扩散确实在工作）；
+    // ② 无关卡 c 必须**完全不变**（护栏确实在拦）。
+    // 只守 ① 的话，把护栏整个删掉它也全绿。
     const config = spreadConfig({ maxBoost: 0.12, seedRatio: 0.85 })
     const a = makeCard({ id: 'a', text: 'Cordis 版本' })
     const b = makeCard({ id: 'b', text: 'Cordis' })
@@ -451,6 +468,8 @@ describe('把扩散结果合并进打分（FR-G1 / FR-B2）', () => {
     ])
     const total = (list: typeof noSpread, id: string) =>
       list.find((x) => x.card.id === id)?.score.total ?? 0
+    const relevance = (list: typeof noSpread, id: string) =>
+      list.find((x) => x.card.id === id)?.score.relevance ?? 0
 
     // 前提：a 必须是唯一够格当种子的卡（否则下面的断言守不住种子规则）。
     const maxScore = Math.max(...noSpread.map((x) => x.score.total))
@@ -459,14 +478,23 @@ describe('把扩散结果合并进打分（FR-G1 / FR-B2）', () => {
       total(noSpread, 'b') < maxScore * config.spread.seedRatio,
       '前提：b 必须够不到种子门槛，才可能是扩散的受益者',
     )
+    // 前提：b 的相关分必须过护栏下限，否则它也会被挡，① 就无从验证。
+    assert.ok(
+      relevance(noSpread, 'b') >= config.recall.absoluteThreshold * config.spread.minSelfScoreRatio,
+      `前提：b 的相关分必须过扩散护栏，实际 ${relevance(noSpread, 'b')}`,
+    )
+    // 前提：c 必须真的无关（relevance = 0），否则 ② 测的不是护栏。
+    assert.equal(relevance(noSpread, 'c'), 0, '前提：c 必须与查询零相关')
 
     assert.ok(
       total(withSpread, 'b') > total(noSpread, 'b'),
       `b 的分数必须严格上升：${total(noSpread, 'b')} → ${total(withSpread, 'b')}`,
     )
-    assert.ok(
-      total(withSpread, 'c') > total(noSpread, 'c'),
-      `c 的分数必须严格上升：${total(noSpread, 'c')} → ${total(withSpread, 'c')}`,
+    // ② 护栏有牙：无关卡哪怕连着一条 weight=0.9 的边，也不许被加分。
+    assert.equal(
+      total(withSpread, 'c'), total(noSpread, 'c'),
+      `无关卡 c 不得因扩散加分（否则「有个强邻居」就能把无关卡塞进焦点包，违反 FR-B2）。`
+      + `实际 ${total(noSpread, 'c')} → ${total(withSpread, 'c')}`,
     )
     // 种子自己不因扩散加分（否则等于「命中自己还额外奖励」，重复计分）。
     assert.equal(

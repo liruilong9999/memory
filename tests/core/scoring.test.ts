@@ -158,22 +158,65 @@ test('冲突只降排序、不淘汰：双方互相冲突时仍至少有一条�
   assert.match(rendered, /PostgreSQL|MySQL|不在本次焦点包内|不在活跃记忆中/u)
 })
 
-test('冲突惩罚封顶：扣分不会把卡从阈值上方打到下方', () => {
-  // 直接验封顶的数学性质，不经过渲染。三个区间的行为都必须钉住：
-  // 1) 无冲突 → 0；2) 在阈值下方 → 0（本来就没得淘汰，报 0 免得 explain 误导）；
-  // 3) 在阈值上方 → 最多扣到阈值边上，绝不压穿。
+test('冲突惩罚原样扣分，不按绝对阈值封顶（缺陷二十六）', () => {
+  // 这条测试替换掉原来的 `冲突惩罚封顶：扣分不会把卡从阈值上方打到下方`。
+  //
+  // ## 原测试为什么必须删掉
+  //
+  // 它断言的是：
+  //   `total >= absoluteThreshold - 1e-9 || normalized <= absoluteThreshold`
+  // 后半句是**同义反复**——`total = normalized - penalty`，而 penalty ≥ 0，
+  // 所以 `normalized <= 阈值` 时 `total` 必然也 ≤ 阈值，前半句就无所谓了；
+  // 而 `normalized > 阈值` 时封顶逻辑保证前半句成立。于是**两个分支恒真**，
+  // 这条断言在任何实现下都绿。它守的是一个已经被判定为缺陷的行为，
+  // 而且守的方式是恒真。
+  //
+  // ## 现在的契约（FR-B5「冲突必须显式暴露」的正确实现方式）
+  //
+  // 冲突**只降排序、不决定去留**，但不许靠「封顶到阈值」来实现——
+  // 那样会让 `absoluteThreshold` 变成分数地板，导致它对所有卡恒真（缺陷二十六）。
+  // 正确的实现是靠**结构**：闸门看 `relevance`，而 `relevance` 完全不含冲突项。
+  //
+  // 所以这里要钉住两件事：
+  // ① 惩罚是**原样**扣的：`total = normalized - penalty × w.conflict`，精确成立；
+  // ② 改 `absoluteThreshold` 不改变任何一张卡的 `total`（证明它不再是分数地板）。
   const now = 1_700_000_000_000
   const query = makeQuery('Qt5 项目', config, now)
   const clean = scoreCard(makeCard({ id: 'clean' }), query, config)
   const conflicted = scoreCard(makeCard({ id: 'cf', conflictOf: ['x', 'y', 'z'] }), query, config)
   assert.equal(clean.score.conflictPenalty, 0, '无冲突时惩罚为 0')
   assert.ok(conflicted.score.conflictPenalty > 0, '有冲突时惩罚为正')
-  // 封顶的实质：扣掉的分数 ≤ 距绝对阈值的余量。
-  const normalizedOfConflicted = conflicted.score.total + conflicted.score.conflictPenalty * config.weights.conflict
+
+  // ① 惩罚原样扣分：从 total 反推出的归一化分，与各分项加权和必须逐位吻合。
+  const w = config.weights
+  const positiveWeight = w.semantic + w.importance + w.recency + w.goal + w.confidence
+  const s = conflicted.score
+  const expectedNormalized = (s.semantic * w.semantic + s.importance * w.importance
+    + s.recency * w.recency + s.goal * w.goal + s.confidence * w.confidence) / positiveWeight
   assert.ok(
-    conflicted.score.total >= config.recall.absoluteThreshold - 1e-9
-      || normalizedOfConflicted <= config.recall.absoluteThreshold,
-    `冲突不得把本来够格的卡压到阈值下方，实际总分 ${conflicted.score.total}`,
+    Math.abs(s.total - (expectedNormalized - s.conflictPenalty * w.conflict)) < 1e-12,
+    `冲突惩罚必须原样扣分：期望 ${expectedNormalized - s.conflictPenalty * w.conflict}，实际 ${s.total}`,
+  )
+
+  // ② 关键：把绝对阈值改到任意值，同一张卡的 total 必须**完全不变**。
+  // 这是「绝对阈值不再是分数地板」的直接证明。若有人把封顶装回去，
+  // 这条会红——因为封顶公式里有 `normalized - absoluteThreshold`。
+  for (const threshold of [0.01, 0.06, 0.18, 0.5]) {
+    const cfg = { ...config, recall: { ...config.recall, absoluteThreshold: threshold } }
+    const again = scoreCard(makeCard({ id: 'cf', conflictOf: ['x', 'y', 'z'] }), query, cfg)
+    assert.equal(
+      again.score.total,
+      s.total,
+      `改 absoluteThreshold 到 ${threshold} 后 total 必须不变（实际 ${s.total} → ${again.score.total}）——`
+      + '变了就说明它又被当成分数地板用了，那道闸会对所有卡恒真',
+    )
+  }
+
+  // ③ 冲突不得影响去留：`relevance` 完全不含冲突项，所以挂不挂冲突它都一样。
+  assert.equal(
+    conflicted.score.relevance,
+    clean.score.relevance,
+    '冲突不得影响 relevance——闸门看的就是它，冲突因此无法决定去留（FR-B5）',
   )
 })
 
@@ -250,9 +293,89 @@ test('applyThresholds 低于绝对阈值被丢弃', () => {
   // 归一化分母一动（哪怕是修 bug）它就会翻绿变红——这种测试是「靠运气绿」，
   // 绿的时候说明不了任何事。现在把该给零的分项都压到零，让结论由规则决定：
   // 语义 0（查询词与卡片无交集）、时间 0（100 个半衰期）、置信度 0、重要性压到最低。
+  //
+  // ## 缺陷二十六之后的修改：前提断言换了尺子
+  //
+  // 原前提是 `total < absoluteThreshold`。现在绝对闸比对 `relevance`，
+  // 那条前提既不该再拿 `total` 比，也**必然**红——这张死透的卡 `total`
+  // 仍有 0.17 左右（0.48 权重与查询无关，见 `ScoreBreakdown.relevance` 的注释），
+  // 而阈值已是 0.06。这不是回归，是前提断言本身选错了尺度。
+  //
+  // 改成断言 `relevance === 0`：它比「小于阈值」更强，且能直接说明
+  // 「这张卡与查询毫无关系」，而不是「它刚好没够到某个数字」。
+  //
+  // 语料也要换：原版用「完全无关的内容」对「完全无关的查询词」——
+  // 这两句**共享 4 个 bigram**（完全/全无/无关/关的），relevance 实测 0.3323，
+  // 根本不「无关」。那是又一条「靠巧合」的构造。现在用两组毫无共同字符的文本。
   const now = 1_700_000_000_000
-  const query = makeQuery('完全无关的查询词', config, now)
+  const query = makeQuery('量子色动力学的渐近自由', config, now)
   const dead = makeCard({
+    text: '今天午饭吃了番茄炒蛋',
+    normalized: '今天午饭吃了番茄炒蛋',
+    createdAt: now - 100 * config.forgetting.halfLifeMs,
+    confidence: 0,
+    salience: 0,
+    emotional: 0,
+  })
+  const scored = scoreCards([dead], query, config)
+  assert.equal(
+    scored[0]!.score.relevance,
+    0,
+    `前提：这张卡的相关分量必须精确为 0（查询词与卡片零词项交集），实际 ${scored[0]!.score.relevance}`,
+  )
+  // 注意：这里**不能**再断言「total 高于阈值」。这张卡各分项全零（100 个半衰期、
+  // 置信度 0、重要性 0），total 约 1e-31，任何尺度的阈值都拦得住它——
+  // 那正是它作为「死透」样本的意义。`total` 尺度的漏洞要由**另一条**用例证明：
+  // 一张「无关但新鲜、高置信」的卡 total 能到 0.32 以上，见下一条。
+  assert.equal(applyThresholds(scored, config).length, 0)
+})
+
+test('无关但新鲜的卡：total 拦不住它，relevance 必须拦住（缺陷二十六的核心）', () => {
+  // 这是缺陷二十六的**直接**回归测试，也是「为什么闸门必须看 relevance」的证明。
+  //
+  // 构造：一张与查询零词项交集、但**新鲜、高置信、高显著性**的卡。
+  // 它在 total 尺度上分数很高（importance + recency + confidence 共 0.48 权重，
+  // 全部与查询无关），所以旧闸门（`total >= 0.18`）**永远拦不住它**。
+  //
+  // 实测（161 张真实卡 × 19 个查询）：无关卡 total 区间 0.3131~0.3767，
+  // 相关卡 0.3452~，重叠 33.3%；全量 2595 个样本低于 0.18 的 **0 个**。
+  // 也就是说 FR-B2 的验收「全低分时不硬塞」在旧闸门下**在数学上不可能失败**。
+  const now = 1_700_000_000_000
+  const query = makeQuery('量子色动力学的渐近自由', config, now)
+  const freshButIrrelevant = makeCard({
+    text: '今天午饭吃了番茄炒蛋',
+    normalized: '今天午饭吃了番茄炒蛋',
+    createdAt: now,          // 新鲜 → recency = 1
+    confidence: 1,           // 高置信
+    salience: 1,             // 高重要
+  })
+  const scored = scoreCards([freshButIrrelevant], query, config)
+  const s = scored[0]!
+  // 前提一：确实无关。这一条若红了，说明构造失效（语料又有词项重合），不是实现有问题。
+  assert.equal(s.score.relevance, 0, `前提：这张卡必须与查询零相关，实际 relevance=${s.score.relevance}`)
+  // 前提二：它在旧尺子上**过得了**旧阈值。这条证明「旧闸门拦不住」，是缺陷本身。
+  assert.ok(
+    s.score.total > 0.3,
+    `前提：这张无关卡的 total 必须很高（实测约 0.32~0.38），实际 ${s.score.total}`,
+  )
+  // 结论：新闸门必须把它挡在外面。
+  assert.equal(
+    applyThresholds(scored, config).length,
+    0,
+    `无关但新鲜的卡不能进焦点包（FR-B2 全低分时不硬塞）。`
+    + `它的 total=${s.score.total} 很高，但 relevance=${s.score.relevance} 为 0`,
+  )
+})
+
+test('applyThresholds 的死卡丢弃不是「全都丢」：同批放一张相关卡必须留下', () => {
+  // 配对阳性对照。只测「该死掉的死掉了」这一半，等于没测——
+  // 整个 `applyThresholds` 改成 `return []` 也能让上一条全绿。
+  // 这条守的是另一半：闸门真的在按内容分辨，不是无条件清空。
+  const now = 1_700_000_000_000
+  const queryText = '幂等键必须包含边权'
+  const query = makeQuery(queryText, config, now)
+  const dead = makeCard({
+    id: 'dead',
     text: '完全无关的内容',
     normalized: '完全无关的内容',
     createdAt: now - 100 * config.forgetting.halfLifeMs,
@@ -260,12 +383,19 @@ test('applyThresholds 低于绝对阈值被丢弃', () => {
     salience: 0,
     emotional: 0,
   })
-  const scored = scoreCards([dead], query, config)
-  assert.ok(
-    scored[0]!.score.total < config.recall.absoluteThreshold,
-    `前提：这张卡的总分必须真的低于绝对阈值，实际 ${scored[0]!.score.total}`,
+  const alive = makeCard({
+    id: 'alive',
+    text: '结论是幂等键必须包含边权，否则改边权会被静默丢弃',
+    normalized: '结论是幂等键必须包含边权，否则改边权会被静默丢弃',
+    createdAt: now,
+  })
+  const scored = scoreCards([dead, alive], query, config)
+  const pack = applyThresholds(scored, config)
+  assert.deepEqual(
+    pack.map((s) => s.card.id),
+    ['alive'],
+    '相关卡必须留下、无关卡必须丢弃——同批里两种卡并存才能证明闸门在按内容分辨',
   )
-  assert.equal(applyThresholds(scored, config).length, 0)
 })
 
 test('applyThresholds 阈值刻度不随「是否提供目标」漂移（分母恒含 goal 权重）', () => {

@@ -28,9 +28,67 @@ export interface ScoringWeights {
 
 /** 阈值与焦点包参数。 */
 export interface RecallPolicy {
-  /** 绝对阈值：总分低于它一律不进焦点包（FR-B2）。 */
+  /**
+   * 绝对阈值：**相关分量（`relevance`）**低于它一律不进焦点包（FR-B2）。
+   *
+   * ## 它比对的不是 `total`，这一点是修缺陷二十六时改的
+   *
+   * 原来比对 `total`，而 `total` 里有 0.48 权重给了与查询无关的维度
+   * （importance 0.18 + recency 0.20 + confidence 0.10）。于是一张
+   * **完全无关但新鲜**的卡也能拿约 0.32，阈值无论调多少都拦不住它：
+   *
+   * - 实测无关卡总分区间 0.3131~0.3767，相关卡 0.3452~，**重叠 33.3%**；
+   * - 全量扫描 2595 个样本，低于 0.18 的 **0 个**，每个查询的最低分恰好 0.180000
+   *   （这个精确重复值暴露了 `capConflictPenalty` 把它当分数地板用）；
+   * - 结果：FR-B2 的验收「全低分时不硬塞」**在数学上不可能失败**。
+   *
+   * 现在比对 `relevance`（只由 semantic + goal 合成，两者都与查询有关），
+   * 同一个完全无关的查询下它精确为 0，闸门立刻能拒绝。
+   *
+   * **扩散无权越过这道闸**：扩散加分只进 `total`，不进 `relevance`，
+   * 所以「有个强邻居」永远不能把无关卡推进焦点包（见 `applyThresholds`）。
+   */
   absoluteThreshold: number
-  /** 相对阈值：低于「最高分 × 该比例」的不进焦点包（FR-B2）。 */
+  /**
+   * 相对阈值：**总分（`total`）**低于「本轮最高总分 × 该比例」的不进焦点包（FR-B2）。
+   *
+   * ## 它和 `absoluteThreshold` 用的是**两把不同的尺子**，这是故意的
+   *
+   * 两道闸回答的是不同的问题，合并成一把尺子会误杀真相关卡：
+   *
+   * | 闸门 | 尺子 | 回答的问题 |
+   * |---|---|---|
+   * | `absoluteThreshold` | `relevance` | 「这张卡和查询有没有关系」 |
+   * | `relativeThreshold` | `total` | 「比本轮最好的差多少」 |
+   *
+   * 相对闸必须看 `total`，因为「差多少」这件事本就该含新鲜度与重要性：
+   * 一条同样相关但更近、更重要的记忆，理应更容易留下。
+   *
+   * ## 曾经把它也挪到 `relevance`，被实测打回
+   *
+   * 我第一版把两道闸都挪到 `relevance`（理由「统一尺子」），实测立刻误伤：
+   * SC-2 场景的目标卡 `relevance = 0.1113`，相对闸 `0.1121`，
+   * **差 0.0008 被挡出包**；而同一张卡 `total = 0.3925`、相对闸 `0.2522`，
+   * 本该轻松通过。根因是 `relevance` 的相对离散度比 `total` 大
+   * （同批候选 0.546 vs 0.856），同一个比例值在 `relevance` 尺度上苛刻得多。
+   *
+   * 变体对照（161 张真实卡，19 个查询，含 5 个完全无关的）：
+   *
+   * | 变体 | 进包 | 噪声 | 无关组进包 | 空包 |
+   * |---|---|---|---|---|
+   * | A 旧（abs@total, rel@total） | 67 | 0 | 4 | 4 |
+   * | **B 现行（abs@relevance, rel@total）** | **61** | **0** | **0** | 5 |
+   * | C 全挪（abs@relevance, rel@relevance 0.55） | 47 | 0 | 0 | 5 |
+   *
+   * C 比 B 多丢 16 张，包括「幂等键必须包含边权」从 7 张降到 1 张，
+   * 以及 `semantic = 0.130` 的真相关卡。**⇒ 选 B。**
+   *
+   * ## 扩散在这里**不需要**豁免
+   *
+   * 扩散加分直接进 `total`，所以它天然能推动成员变化，不需要任何补丁。
+   * 曾经加过「被扩散推动的卡豁免此闸」的例外——那是为了救变体 C，
+   * 变体 B 下它是死代码，已删除。**少一个未测分支比多一个"看起来更安全"的分支好。**
+   */
   relativeThreshold: number
   /** 焦点包硬上限条数（FR-B2，默认 7）。 */
   maxCards: number
@@ -455,6 +513,25 @@ export interface SpreadPolicy {
    * 这是**护栏**：只靠邻居混进焦点包的卡，会把 `absoluteThreshold`
    * 的语义稀释掉（阈值本来是「这条记忆本身够不够格」）。取 1.0 表示
    * 「扩散可以帮忙排序，但不能让一张本来不合格的卡合格」。
+   *
+   * ## 它乘的阈值与被比的分必须**同一把尺子**
+   *
+   * 这条护栏坏过**两次**，两次都是单位/语义错，两次的表现都是「恒真」，
+   * 都不报错、不崩溃、日志正常：
+   *
+   * 1. **第一次**：`absoluteThreshold` 被 `capConflictPenalty` 当成了分数地板，
+   *    所有卡的总分都被抬到 ≥ 阈值，于是 `selfScore >= 阈值 × 1` 恒成立。
+   *    （封顶函数已删除，见缺陷二十六。）
+   * 2. **第二次**：缺陷二十六把 `absoluteThreshold` 的比对对象从 `total`
+   *    换成了 `relevance`（0.06），而护栏的 `selfScore` 还装着 `total`
+   *    （取值 0.31~0.47）。拿 0.06 去比 0.47，**又一次恒真**。
+   *
+   * 现在 `mergeSpread` 传给 `spreadActivation` 的 `selfScores` 装的就是
+   * `relevance`。**改这个参数或改 `absoluteThreshold` 的尺度时，
+   * 必须同时检查护栏两边是不是同一把尺子。**
+   *
+   * 顺带记一个反直觉的后果：护栏修对之后，「无关但有强邻居」的卡**不该**
+   * 再拿到扩散加分。任何断言它会被加分的测试都在保护旧的错误行为。
    */
   minSelfScoreRatio: number
   /**
@@ -565,7 +642,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 11,
+  configVersion: 12,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -575,7 +652,18 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     conflict: 0.25,
   },
   recall: {
-    absoluteThreshold: 0.18,
+    // 0.06 是**相关分量（relevance）**尺度上的值，不是总分尺度上的。
+    //
+    // 这个参数以前比对 `total`，而 `total` 上有 0.48 权重与查询无关，
+    // 无关卡也能拿约 0.32，导致阈值恒真、「全低分时不硬塞」不可失败。
+    // 详见 `RecallPolicy.absoluteThreshold` 与 `ScoreBreakdown.relevance`。
+    //
+    // 定标依据（161 张真实卡 × 19 个查询，含 5 个完全无关的）：
+    // - 0.06：无关组进包 0 张，真相关卡（semantic ≥ 0.18）零损失；
+    // - 0.10：无关组仍 0 张，但空包查询从 5 个升到 7 个（开始误伤）；
+    // - 0.15：开始丢真相关卡（3 张）。
+    // 取 0.06 = 既能挡住全部噪声，又不在边界上误伤。
+    absoluteThreshold: 0.06,
     relativeThreshold: 0.55,
     maxCards: 7,
     tokenBudget: 900,
@@ -711,7 +799,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 11
+export const MEMORY_CONFIG_VERSION = 12
 
 /** 配置校验结果。 */
 export interface ConfigValidation {

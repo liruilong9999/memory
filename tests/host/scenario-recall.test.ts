@@ -334,9 +334,21 @@ describe('SC-2 任务召回', () => {
       hit !== undefined,
       `「上次部署」必须召回那次部署的方案卡。实际召回：${result.pack.cards.map((s) => s.card.text.slice(0, 18)).join(' | ')}`,
     )
+    // 这道闸看的是 `relevance`，不是 `total`（缺陷二十六）。
+    // 原来这里写的是 `hit.score.total >= absoluteThreshold`——那是拿总分去比一个
+    // 相关分的阈值，属于「断言选错层次」：它当时能绿只是因为 0.06 太小，
+    // 换个阈值就会绿/红得毫无意义。
+    //
+    // 而且写成 `>=` 本身也没有牙：卡已经在焦点包里了，必然过了闸，这条恒真。
+    // 有牙的写法是证明它**靠相关性**进包，而不是靠新鲜度：
+    // 目标卡是 3 天前的，同批还有 1 天前的卡，若只看总分它可能被反超。
     assert.ok(
-      hit.score.total >= config.recall.absoluteThreshold,
-      `召回结果必须过绝对阈值（由规则决定，不是巧合）。实际 total=${hit.score.total}`,
+      hit.score.relevance > 0,
+      `目标卡必须靠相关性进包，不能靠新鲜度混进来。实际 relevance=${hit.score.relevance}`,
+    )
+    assert.ok(
+      hit.score.relevance >= config.recall.absoluteThreshold,
+      `召回结果必须过绝对闸。实际 relevance=${hit.score.relevance}`,
     )
     s.close()
   })

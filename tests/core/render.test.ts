@@ -60,6 +60,12 @@ function makeCard(text: string): MemoryCard {
 function makeScored(
   text: string, total: number, extra: Partial<ScoredCard> = {},
 ): ScoredCard {
+  // `relevance` 不是随手编的数：它必须与下面的 `semantic` / `goal` 自洽，
+  // 否则 fixture 会成为一个**假的真相源**——将来若有人给渲染加一行
+  // 「相关分量」，他会看到 0.6 的语义配一个不匹配的 relevance，
+  // 然后开始怀疑是渲染算错了。按 `scoreCard` 的公式反推：
+  //   (0.6×0.42 + 0×0.10) / (0.42 + 0.10) = 0.4846
+  // 权重取自 `DEFAULT_CONFIG.weights`。
   return {
     card: makeCard(text),
     score: {
@@ -70,6 +76,7 @@ function makeScored(
       importance: 0.7,
       confidence: 0.8,
       conflictPenalty: 0,
+      relevance: 0.6 * 0.42 / 0.52,
     },
     explain: ['recency 0.5 × 0.25 = 0.125', 'semantic 0.6 × 0.45 = 0.270'],
     conflict: false,

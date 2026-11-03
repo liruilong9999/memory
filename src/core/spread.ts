@@ -233,8 +233,18 @@ export function spreadActivation(
   if (sp.mode === 'off') return []
   if (seeds.length === 0) return []
 
-  // 护栏下限：自身分数必须达到 absoluteThreshold × minSelfScoreRatio。
-  // minSelfScoreRatio 由配置层保证 ≥ 1，所以这条下限**不会低于**绝对阈值。
+  // 护栏下限：自身**相关分量**必须达到 absoluteThreshold × minSelfScoreRatio。
+  //
+  // ## 这里曾经拿错了尺子（修缺陷二十六时一并改的）
+  //
+  // 原文是 `selfScore >= absoluteThreshold × ratio`，而 `selfScores` 里装的是
+  // **`total`**。绝对阈值搬去 relevance 尺度后，这行就变成了拿 0.06 去比
+  // 一个取值 0.31~0.47 的数——护栏恒真，等于没有。
+  // （它在更早的时候也恒真过，原因不同：那时 `absoluteThreshold` 被
+  //  `capConflictPenalty` 当成分数地板。**同一个护栏坏过两次，两次都是单位/语义错。**）
+  //
+  // 现在 `selfScores` 装的是 `relevance`（见 `mergeSpread` 的构造），
+  // 护栏与被护栏的量在同一把尺子上，判据才有意义。
   const selfFloor = config.recall.absoluteThreshold * sp.minSelfScoreRatio
 
   const accumulated = new Map<string, number>()
