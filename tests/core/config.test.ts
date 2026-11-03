@@ -16,6 +16,8 @@ import assert from 'node:assert/strict'
 
 import { DEFAULT_CONFIG, MEMORY_CONFIG_VERSION, mergeConfig, validateConfig } from '../../src/core/config.ts'
 import { EDGE_WEIGHT_STEP } from '../../src/core/graph.ts'
+import { decayEdges, reinforceEdges } from '../../src/core/spread.ts'
+import { makeEdge } from '../../src/core/graph.ts'
 
 describe('DEFAULT_CONFIG', () => {
   it('configVersion 与常量一致', () => {
@@ -543,21 +545,83 @@ describe('可塑性的参数必须有分辨率（缺陷三十三第二层）', (
     return mergeConfig(DEFAULT_CONFIG)
   }
 
-  it('默认参数必须让「一次共激活」不到上限（否则边权退化成常数）', () => {
+  /**
+   * 用**真实实现**跑夜迭代，而不是套用解析式，也不是在测试里重写一遍强化。
+   *
+   * 这条用例原来算的是教科书均衡点 `w*(n) = n × delta × factor / (1 − factor)`。
+   * 那个式子**与实测严重不符**：`delta=0.01, f=0.98, n=2` 时它给 0.98，
+   * 而真实动力学跑到 0.74（差 24 个百分点）。原因见 `reinforceDelta` 的
+   * 字段注释：`nextDecayedWeight` 带一条线性地板（修缺陷二十时加的），
+   * 且系统有多个吸引子，`w*(n)` 根本不是良定义函数。
+   *
+   * **第一版改法也是错的**：我在测试里手写了 `Math.min(cap, w + delta)` 和
+   * `nextDecayedWeight` 两步，等于替实现写了一份——实现改了，测试还在验自己
+   * 那份抄本。现在改成真的调 `reinforceEdges` / `decayEdges`。
+   *
+   * `reinforceEdges` 内部检查 `plasticityEnabled`，而 `validateConfig` 拒绝
+   * 打开它。这里**绕过校验直接调纯函数**是有意的：被测的是数学性质，
+   * 不是「配置能不能通过校验」（那由另一组用例守）。
+   *
+   * @param times - 每夜强化几次。
+   * @param from - 初值。
+   * @returns 迭代到不动点后的边权。
+   */
+  function settle(times: number, from: number): number {
     const c = base()
-    const sp = c.spread
-    // 均衡点 w*(n) = n × delta × factor / (1 − factor)
-    const atOne = (sp.reinforceDelta * sp.decayFactor) / (1 - sp.decayFactor)
+    // 打开开关才能让两个纯函数真的干活；不经过 validateConfig。
+    c.spread.plasticityEnabled = true
+    // 边必须跨夜携带权重：写在循环里会每晚从初值重来，永远到不了不动点。
+    let edges = [makeEdge('a', 'b', 'same-topic', from, 0)]
+    let w = from
+    for (let night = 0; night < 500; night += 1) {
+      for (let i = 0; i < times; i += 1) {
+        const next = reinforceEdges(edges, new Set(['a', 'b']), c)
+        if (next.length > 0) edges = next
+      }
+      const decayed = decayEdges(edges, c)
+      if (decayed.length > 0) edges = decayed
+      const nextW = edges[0]?.weight ?? w
+      if (nextW === w) return w
+      w = nextW
+    }
+    return w
+  }
+
+  it('默认参数下「用得多」必须比「用得少」停在更高档（用真实实现跑夜迭代）', () => {
+    const sp = base().spread
+    const once = settle(1, 0.10)
+    const twice = settle(2, 0.10)
+    // 前提断言：两个终值都必须真的在合法区间里，否则下面的比较可能是在比两个 0
+    assert.ok(once > 0 && once <= sp.maxEdgeWeight, `前提：n=1 的终值必须在 (0, ${sp.maxEdgeWeight}]，实际 ${once}`)
+    assert.ok(twice > 0 && twice <= sp.maxEdgeWeight, `前提：n=2 的终值必须在 (0, ${sp.maxEdgeWeight}]，实际 ${twice}`)
+    // 这条断言必须用 > 而不是 >=：>= 等于没断言（缺陷三十二的教训）
     assert.ok(
-      atOne < sp.maxEdgeWeight,
-      `前提：w*(n=1) 必须 < 上限 ${sp.maxEdgeWeight}，实际 ${atOne.toFixed(3)}。`
-      + '若这条失败，说明「每夜用一次」和「每夜用一百次」会落在同一个边权上',
+      twice > once,
+      `「每夜用两次」必须停在比「每夜用一次」更高的档：${once} vs ${twice}。`
+      + '若相等，说明默认参数下边权分不出使用频率',
     )
-    // 再验一遍「真的能分出 n=1 与 n=2」——只验不等式不足以说明有分辨率
-    const atTwo = (2 * sp.reinforceDelta * sp.decayFactor) / (1 - sp.decayFactor)
+  })
+
+  it('默认参数的档数上界受 N < (1−f)/0.01 限制（实测，不是解析式）', () => {
+    const sp = base().spread
+    // 从 0 起，每夜强化 n 次，收集 n=1..12 各自的终值，数有几个不同档
+    const terminals = new Set<number>()
+    for (let times = 1; times <= 12; times += 1) {
+      terminals.add(settle(times, 0))
+    }
+    const bound = Math.floor((1 - sp.decayFactor) / 0.01)
     assert.ok(
-      atTwo > atOne,
-      `n=1 与 n=2 的均衡点必须不同（${atOne.toFixed(3)} vs ${atTwo.toFixed(3)}）`,
+      terminals.size <= bound + 1,
+      `实测档数 ${terminals.size} 不应超过解析界 ${bound}+1（N < (1−f)/0.01）。`
+      + `终值集合：${[...terminals].sort((a, b) => a - b).join(', ')}`,
+    )
+    // 这条是**已知局限的显式记录**，不是期望行为：f=0.98 只够 3 档。
+    // 将来若换了强化模型让档数变多，这条会红，提醒重读 docs/8。
+    assert.ok(
+      terminals.size <= 4,
+      `默认 f=${sp.decayFactor} 下档数应 ≤ 4（实测 ${terminals.size} 档：`
+      + `${[...terminals].sort((a, b) => a - b).join(', ')}）。`
+      + '若这条红了说明强化模型变了，请重读 docs/8-可塑性数学不可行性题面.md',
     )
   })
 
@@ -589,6 +653,67 @@ describe('可塑性的参数必须有分辨率（缺陷三十三第二层）', (
     c.spread.decayFactor = 0.90
     const r = validateConfig(c)
     assert.equal(r.ok, true, `factor=0.90 时 w*(1)=${(0.05*0.9/0.1).toFixed(2)} 应合法，实际错误：${r.errors.join('; ')}`)
+  })
+
+  it('默认 delta 与衰减地板步长相等 ⇒ 每夜用一次是精确的零变化（新发现）', () => {
+    // 这条记录的是一个**比「档数不够」更根本**的结构事实，不是期望行为。
+    //
+    // 强化是 `w + delta`，衰减是 `nextDecayedWeight`，后者带一条线性地板：
+    // 比例衰减不足一格时强制 `-0.01`。而 `delta` 的默认值恰好也是 `0.01`。
+    // 于是在「比例衰减不足一格」的那段权重区间里，一步净变化**精确为零**：
+    //
+    //   w=0.10 → 强化 0.11 → 比例衰减 quantize(0.1078)=0.11 不小于 0.11
+    //          → 走地板 0.11-0.01 = 0.10  ← 回到原值
+    //
+    // 实测（默认 delta=0.01, f=0.98）：101 个格点里 **75 个净变化为零、
+    // 0 个上升**，只有 w ≥ 0.75 的 26 个格点会下降。
+    // 也就是说「每夜用一次」与「完全不用」在前 75 个格点上无法区分。
+    //
+    // 后果：一条新建的边（`makeEdge` 权重来自相似度，通常 0.1~0.3）若每夜
+    // 只被共激活一次，权重**永不增长**。要增长必须每夜 ≥ 2 次。
+    //
+    // 这不是标定失误，是「分辨率」与「响应性」的硬冲突：
+    // delta 取 0.01 才有最多档数，而 0.01 恰好等于地板步长 ⇒ 一次强化被
+    // 完全吃掉。delta 取 0.02 抵消消失，但档数界 (1−f)/delta 立刻减半。
+    // 详见 docs/8-可塑性数学不可行性题面.md 第四节事实六。
+    const c = base()
+    c.spread.plasticityEnabled = true
+    const edge0 = makeEdge('a', 'b', 'same-topic', 0.10, 0)
+    let edges = [edge0]
+    const reinforced = reinforceEdges(edges, new Set(['a', 'b']), c)
+    assert.equal(reinforced[0]?.weight, 0.11, '前提：强化确实 +0.01，否则下面的抵消无从谈起')
+    edges = reinforced
+    const decayed = decayEdges(edges, c)
+    assert.equal(
+      decayed[0]?.weight, 0.10,
+      `默认参数下「强化一次 + 衰减一次」必须精确回到原值 0.10，`
+      + `实际 ${decayed[0]?.weight}。若这条红了说明 delta 与地板步长不再相等，`
+      + '请重读 docs/8 第四节事实六再决定是好事还是坏事',
+    )
+  })
+
+  it('「用一次」与「不用」在前 75 个格点上无法区分（实测，记录已知局限）', () => {
+    const c = base()
+    c.spread.plasticityEnabled = true
+    let noop = 0
+    let up = 0
+    for (let i = 0; i <= 100; i += 1) {
+      const w0 = i / 100
+      let edges = [makeEdge('a', 'b', 'same-topic', w0, 0)]
+      const nx = reinforceEdges(edges, new Set(['a', 'b']), c)
+      if (nx.length > 0) edges = nx
+      const d = decayEdges(edges, c)
+      if (d.length > 0) edges = d
+      const w1 = edges[0]?.weight ?? w0
+      if (w1 === w0) noop += 1
+      if (w1 > w0) up += 1
+    }
+    assert.equal(up, 0, '默认参数下「每夜用一次」不应该让任何格点上升——这是已知局限，不是期望')
+    assert.ok(
+      noop >= 70,
+      `实测零变化格点数应 ≥ 70（实测 ${noop}）。若这条红了说明参数变了，`
+      + '请重读 docs/8 第四节事实六',
+    )
   })
 
   it('delta 必须是量化格的整数倍，否则强化会被圆整掉（缺陷二十同类）', () => {
