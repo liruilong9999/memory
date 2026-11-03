@@ -233,6 +233,67 @@ test('scoreCards 按总分降序且同分按 id 升序', () => {
   assert.equal(sorted[2]?.card.id, 'ccc')
 })
 
+/**
+ * FR-B3：确定性 = 同状态 + 同查询 ⇒ 逐位相同的结果。
+ *
+ * 与 ST-1 的关系：ST-1 是「连续 10 次」的验收口径，FR-B3 是它背后的**规则**。
+ * 这里补两条**显式带 FR-B3 编号**的用例，因为按编号审计时 ST-1 名下那些
+ * 用例是查不到的（`docs/6` 曾因此把 FR-B3 标成「无任何测试」）。
+ *
+ * 两条的分工：
+ * - 第一条守「重复调用一致」；
+ * - 第二条守**「一致的依据是 id，不是输入顺序」**——这一条才有牙。
+ *   只测前者的话，`sort` 里把 id 作为次级排序键删掉、改成依赖 `Array.sort`
+ *   的实现稳定性（Node 的 sort 自 ES2019 起稳定，会保留输入顺序），
+ *   测试照样绿。而输入顺序取决于 `store.search()` 返回的迭代顺序，
+ *   换个索引实现就会变 ⇒ **那不叫确定性，叫巧合**。
+ */
+test('FR-B3 确定性：同状态同查询，重复调用逐位相同（不是「条数相同」）', () => {
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目 cmake', config, now)
+  const cards = [
+    makeCard({ id: 'a', text: '这个项目用 Qt5 开发', normalized: '这个项目用 qt5 开发' }),
+    makeCard({ id: 'b', text: '项目沿用现有 cmake 配置', normalized: '项目沿用现有 cmake 配置' }),
+    makeCard({ id: 'c', text: 'Qt5 项目的 cmake 配置在这里', normalized: 'qt5 项目的 cmake 配置在这里' }),
+  ]
+  const first = scoreCards(cards, query, config)
+  const second = scoreCards(cards, query, config)
+  // 逐字段比，不只比 id 序列：total 若带时间戳或随机项，只比 id 会漏掉。
+  assert.deepEqual(second, first, '两次调用的完整结果必须逐位相同')
+  // 前提断言：这三张卡必须真的都被打了分，否则「两次都空」也会绿。
+  assert.equal(first.length, 3, '前提：三张卡都参与打分')
+})
+
+test('FR-B3 确定性：同分卡按 id 升序定序，与输入顺序无关', () => {
+  const now = 1_700_000_000_000
+  // 查询文本与三张卡完全无交集 ⇒ 三张卡的 relevance 都是 0，必然同分。
+  // 用同分来测「定序规则」，比用不同分来测「排序是否生效」更严格：
+  // 同分时唯一能定序的只有 id，任何依赖输入顺序的实现都会露馅。
+  const query = makeQuery('zzz 完全不相关的话题', config, now)
+  const make3 = (id: string) =>
+    makeCard({ id, text: `卡片 ${id} 的正文内容`, normalized: `卡片 ${id} 的正文内容` })
+
+  const forward = scoreCards([make3('aaa'), make3('bbb'), make3('ccc')], query, config)
+  const reversed = scoreCards([make3('ccc'), make3('bbb'), make3('aaa')], query, config)
+
+  // 前提断言：三张卡必须真的同分。若分数不同，「按 id 定序」根本没被测到
+  // ——排序会先按分数排，id 只在前者相等时才起作用。
+  assert.equal(forward.length, 3, '前提：三张卡都参与打分')
+  assert.equal(forward[0]!.score.total, forward[1]!.score.total, '前提：第 1、2 张同分')
+  assert.equal(forward[1]!.score.total, forward[2]!.score.total, '前提：第 2、3 张同分')
+
+  assert.deepEqual(
+    forward.map((s) => s.card.id),
+    ['aaa', 'bbb', 'ccc'],
+    '同分时按 id 升序',
+  )
+  assert.deepEqual(
+    reversed.map((s) => s.card.id),
+    ['aaa', 'bbb', 'ccc'],
+    '输入顺序反转后结果必须不变——顺序由 id 决定，不由输入决定',
+  )
+})
+
 test('scoreCards 确定性：两次调用结果一致', () => {
   const now = 1_700_000_000_000
   const query = makeQuery('Qt5 项目', config, now)
