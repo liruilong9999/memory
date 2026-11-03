@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=13',
+  'configVersion=14',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -196,7 +196,7 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'spread.mode=shadow',
   'spread.plasticityEnabled=false',
   'spread.pruneThreshold=0.1',
-  'spread.reinforceDelta=0.05',
+  'spread.reinforceDelta=0.01',
   'spread.seedRatio=0.85',
   'storage.configSnapshotMaxEntries=200',
   'storage.dataDir=.dsh-memory',
@@ -245,7 +245,13 @@ describe('摘要配置的默认值与版本', () => {
     //       （两把尺子的刻度不同，不能沿用旧值）。同时删除 `capConflictPenalty`。
     //       语义变更比新增字段更需要递增版本：旧快照里写着 `absoluteThreshold: 0.18`
     //       的人以为那是「总分阈值」，回滚回来会得到一个清空焦点包的值。
-    assert.equal(MEMORY_CONFIG_VERSION, 13, '情绪通道加入抽取后版本应为 13')
+    //  13 → **新增** extraction.emotionalGateThreshold / emotionalStrongKeywords /
+    //       emotionalMediumKeywords（缺陷二十八）：情绪不再是硬编码正则，改成配置。
+    //  14 → `spread.reinforceDelta` **改默认值** 0.05 → 0.01（缺陷三十三第二层）：
+    //       0.05 配 `decayFactor=0.98` 的均衡点是 `n × 2.45`，`n=1` 就撞上限，
+    //       边权分不出使用频率。改默认值必须递增版本——旧快照里写着 0.05 的人
+    //       回滚回来会得到一个「全部等强」的图谱。
+    assert.equal(MEMORY_CONFIG_VERSION, 14, '可塑性参数分辨率修正后版本应为 14')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

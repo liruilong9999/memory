@@ -15,6 +15,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { DEFAULT_CONFIG, MEMORY_CONFIG_VERSION, mergeConfig, validateConfig } from '../../src/core/config.ts'
+import { EDGE_WEIGHT_STEP } from '../../src/core/graph.ts'
 
 describe('DEFAULT_CONFIG', () => {
   it('configVersion 与常量一致', () => {
@@ -534,5 +535,70 @@ describe('可塑性未接线：打开必须报错（缺陷三十三）', () => {
         `报错必须指向 ${field}，实际：${result.errors.join('; ')}`,
       )
     }
+  })
+})
+
+describe('可塑性的参数必须有分辨率（缺陷三十三第二层）', () => {
+  function base(): typeof DEFAULT_CONFIG {
+    return mergeConfig(DEFAULT_CONFIG)
+  }
+
+  it('默认参数必须让「一次共激活」不到上限（否则边权退化成常数）', () => {
+    const c = base()
+    const sp = c.spread
+    // 均衡点 w*(n) = n × delta × factor / (1 − factor)
+    const atOne = (sp.reinforceDelta * sp.decayFactor) / (1 - sp.decayFactor)
+    assert.ok(
+      atOne < sp.maxEdgeWeight,
+      `前提：w*(n=1) 必须 < 上限 ${sp.maxEdgeWeight}，实际 ${atOne.toFixed(3)}。`
+      + '若这条失败，说明「每夜用一次」和「每夜用一百次」会落在同一个边权上',
+    )
+    // 再验一遍「真的能分出 n=1 与 n=2」——只验不等式不足以说明有分辨率
+    const atTwo = (2 * sp.reinforceDelta * sp.decayFactor) / (1 - sp.decayFactor)
+    assert.ok(
+      atTwo > atOne,
+      `n=1 与 n=2 的均衡点必须不同（${atOne.toFixed(3)} vs ${atTwo.toFixed(3)}）`,
+    )
+  })
+
+  it('delta 大到一次共激活就撞顶时必须被拒绝，且报错说清「分不出使用频率」', () => {
+    const c = base()
+    // 0.05 是修复前的默认值：w*(1) = 2.45，远超上限 1
+    c.spread.reinforceDelta = 0.05
+    const r = validateConfig(c)
+    assert.equal(r.ok, false, 'w*(1) 超过上限的参数必须被拒绝')
+    const hit = r.errors.filter((e) => e.includes('reinforceDelta'))
+    assert.equal(hit.length, 1, '必须恰好一条指向 reinforceDelta，而不是被别的错误顶上')
+    assert.ok(
+      hit[0]?.includes('无法区分使用频率') || hit[0]?.includes('分不出'),
+      `报错必须说清后果，而不只是说「太大了」：${hit[0]}`,
+    )
+    // 报错里要给出可用的上界，否则用户只能猜
+    assert.ok(
+      hit[0]?.includes('0.0204'),
+      `报错必须给出具体上界（(1−factor)/factor = 0.0204）：${hit[0]}`,
+    )
+  })
+
+  it('配对反向对照：把 decayFactor 调小之后，同样的 delta 就合法了', () => {
+    // 只测「该拒绝的拒绝」是半个测试。同一个 delta，在更快的衰减下必须通过——
+    // 证明拒绝的依据真的是「分辨率」而不是「delta 有个固定上限」。
+    const c = base()
+    c.spread.reinforceDelta = 0.05
+    assert.equal(validateConfig(c).ok, false, '前提：factor=0.98 时 0.05 非法')
+    c.spread.decayFactor = 0.90
+    const r = validateConfig(c)
+    assert.equal(r.ok, true, `factor=0.90 时 w*(1)=${(0.05*0.9/0.1).toFixed(2)} 应合法，实际错误：${r.errors.join('; ')}`)
+  })
+
+  it('delta 必须是量化格的整数倍，否则强化会被圆整掉（缺陷二十同类）', () => {
+    const c = base()
+    const step = EDGE_WEIGHT_STEP
+    const ratio = c.spread.reinforceDelta / step
+    assert.ok(
+      Math.abs(ratio - Math.round(ratio)) < 1e-9,
+      `reinforceDelta=${c.spread.reinforceDelta} 必须是 EDGE_WEIGHT_STEP=${step} 的整数倍，`
+      + '否则每次强化的增量小于半格、被圆整回原值，机制在数学上停摆',
+    )
   })
 })

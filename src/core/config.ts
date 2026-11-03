@@ -674,7 +674,29 @@ export interface SpreadPolicy {
    * 打开了也没用的开关，比拒绝它更坏**——它让人以为突触学习已经生效。
    */
   plasticityEnabled: boolean
-  /** 共激活时边权增量（赫布学习：一起被用到的连接变强）。 */
+  /**
+   * 共激活时边权增量（赫布学习：一起被用到的连接变强）。
+   *
+   * ## 这个值不是随便定的：它必须让「一次共激活」不到上限
+   *
+   * 强化是加性的（每次 `+delta`），衰减是乘性的（每夜 `×decayFactor`）。
+   * 每天 n 次共激活、每夜一次衰减时，边权的均衡点是
+   *
+   * ```text
+   * w*(n) = n × delta × decayFactor / (1 − decayFactor)
+   * ```
+   *
+   * 要让边权携带「用得多还是少」的信息，**至少**得满足 `w*(1) < maxEdgeWeight`
+   * ——否则「每夜被一起用一次」和「每夜被一起用一百次」落在同一个值上，
+   * 机制退化成常数。这条判据没有任何可调的自由参数（`n = 1` 是恒真的下界）。
+   *
+   * 当前 `decayFactor = 0.98` 时上界是 `0.0204`，所以取 `0.01`（同时它是
+   * `EDGE_WEIGHT_STEP` 的整数倍，不会被量化格圆整掉，见缺陷二十）。
+   *
+   * 注意这只是**必要条件**，不是充分条件：它只保证「n=1 不与 n=∞ 混同」，
+   * 不保证能分辨 n=1..10。要分辨更细的区间必须换强化模型（饱和式）或放宽
+   * 量化格，见 `docs/7-缺陷复盘.md` 缺陷三十三。
+   */
   reinforceDelta: number
   /** 边权上限，防止无限增长到「一条边压过一切」。 */
   maxEdgeWeight: number
@@ -707,7 +729,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 13,
+  configVersion: 14,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -869,7 +891,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     maxAffected: 5,
     distillBidirectional: true,
     plasticityEnabled: false,
-    reinforceDelta: 0.05,
+    reinforceDelta: 0.01,
     maxEdgeWeight: 1,
     decayFactor: 0.98,
     pruneThreshold: 0.1,
@@ -880,7 +902,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 13
+export const MEMORY_CONFIG_VERSION = 14
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -1088,6 +1110,28 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   // 不该拦住整个配置」。那个理由本身没错，但它让「校验写了」和「校验会执行」
   // 变成了两件事——开关一旦必须为 false，整块校验就成了不可达代码。
   if (sp.reinforceDelta <= 0) errors.push('spread.reinforceDelta 必须 > 0（否则强化永不发生）')
+  // 分辨率判据（缺陷三十三）：一次共激活就撞顶的参数，等于让边权变成常数。
+  //
+  // 均衡点 w*(n) = n × delta × decayFactor / (1 − decayFactor)。要求
+  // w*(1) < maxEdgeWeight —— 这是必要条件而非充分条件，但它的好处是
+  // **没有可调自由参数**（n=1 是恒真的下界），所以可以硬校验。
+  //
+  // 没有这条校验时，默认值 (delta=0.05, factor=0.98) 的 w*(1) = 2.45，
+  // n=1..100 全部落在上限上：机制「实现齐全、测试全绿、配置齐备」，
+  // 但一旦接线就只会产出「全部等强」的图谱。
+  else if (sp.decayFactor > 0 && sp.decayFactor < 1) {
+    const equilibriumAtOne = (sp.reinforceDelta * sp.decayFactor) / (1 - sp.decayFactor)
+    if (equilibriumAtOne >= sp.maxEdgeWeight) {
+      errors.push(
+        'spread.reinforceDelta 过大：单次共激活的均衡边权'
+        + ` ${equilibriumAtOne.toFixed(3)} 已达到或超过上限 ${sp.maxEdgeWeight}，`
+        + '边权将无法区分使用频率（用一次和用一百次同一个值）。'
+        + ` 需满足 reinforceDelta < maxEdgeWeight × (1 − decayFactor) / decayFactor`
+        + ` = ${(sp.maxEdgeWeight * (1 - sp.decayFactor) / sp.decayFactor).toFixed(4)}，`
+        + '见 docs/7-缺陷复盘.md 缺陷三十三',
+      )
+    }
+  }
   if (sp.maxEdgeWeight <= 0 || sp.maxEdgeWeight > 1) {
     errors.push('spread.maxEdgeWeight 必须落在 (0, 1]')
   }
