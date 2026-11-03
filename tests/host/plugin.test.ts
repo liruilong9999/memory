@@ -308,6 +308,157 @@ describe('apply 的注入接线（FR-E2 / C4 / C7）', () => {
   })
 })
 
+/**
+ * FR-E4：压缩后自动重建焦点包。
+ *
+ * **这一节测的是我们能测的那一半。** 规格原文（`docs/1-需求规格.md:169`）要求
+ * 「压缩后自动重建焦点包，不丢焦点、不报错」，它由两个独立的事实拼成：
+ *
+ * | 那一半 | 由谁保证 | 这里能测吗 |
+ * |---|---|---|
+ * | 宿主压缩后**真的会重新调用** `text()` | 宿主 agent-loop | ❌ 测不了 |
+ * | 被调用时 `text()` 仍返回**完整**焦点包、不抛错、不丢卡 | 本插件 | ✅ 这里测 |
+ *
+ * 机制来自 C4/C7（`docs/1-需求规格.md:108`/`:110`）：`text` 是函数，宿主每轮
+ * 重新求值，所以压缩不需要任何钩子——**压缩后的下一个 step 天然会再调一次**。
+ * 我们唯一能保证的是「再调一次的时候它还是对的」。
+ *
+ * 为什么**不能**只断言「不抛错」：`assert.doesNotThrow` 对一个返回空串的实现
+ * 同样成立，而空串正是「丢了焦点」。所以每条都配「焦点包里有真实记忆内容」。
+ */
+describe('压缩后重建焦点包（FR-E4）', () => {
+  /** 投递一次压缩的完整三事件序列（宿主真实顺序：start → summary → end）。 */
+  async function emitCompaction(host: RecordingHost): Promise<void> {
+    await host.emit('session/event', { id: 'sess-test' }, {
+      type: 'compaction/start',
+      data: { compactionId: 'c1', shadowedRange: { start: 1, end: 3 } },
+    })
+    await host.emit('session/event', { id: 'sess-test' }, {
+      type: 'compaction/summary',
+      data: {
+        compactionId: 'c1',
+        summary: [{ type: 'text', text: '用户决定了缓存方案。' }],
+        shadowedRange: { start: 1, end: 3 },
+        shadowedSeqs: [1, 2, 3],
+        shadowedTokenCount: 120,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+      },
+    })
+    await host.emit('session/event', { id: 'sess-test' }, {
+      type: 'compaction/end',
+      data: { compactionId: 'c1' },
+    })
+  }
+
+  /** 先写一条记忆进去，返回宿主与数据目录。 */
+  async function hostWithMemory(): Promise<{ host: RecordingHost; dir: string }> {
+    const host = makeHost()
+    const dir = tempDir()
+    await apply(host.ctx, baseConfig(dir))
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我决定用 Redis 做缓存，因为一致性要求不高，能接受最终一致'),
+      assistantEvent('好的，那就用 Redis，注意设置合理的过期时间。'),
+    ])
+    await host.emit('agent/turn-stopping', { agent: makeAgent(), turn: 1 })
+    return { host, dir }
+  }
+
+  /** 从磁盘重放读活跃卡（必须读磁盘：幂等键影响的是「日志里有没有这条记录」）。 */
+  function readCards(dir: string): { text: string }[] {
+    const store = openStore({ dataDir: dir })
+    const cards = store.listCards({ status: 'active' })
+    store.close()
+    return cards
+  }
+
+  it('压缩后 text() 仍返回完整焦点包（含真实记忆内容）', async () => {
+    const { host } = await hostWithMemory()
+    const before = host.render()
+    // 前提断言：压缩前焦点包里必须有这张卡，否则「压缩后还有」测不出任何东西。
+    assert.match(before, /Redis/u, '前提：压缩前焦点包必须含这条记忆')
+
+    await emitCompaction(host)
+
+    const after = host.render()
+    assert.match(after, /Redis/u, '压缩后焦点包不能丢卡')
+    assert.match(after, /时间读数/u, '压缩后时间读数不能丢')
+  })
+
+  it('压缩后重复调用 text() 结果稳定', async () => {
+    const { host } = await hostWithMemory()
+    await emitCompaction(host)
+    const renders = Array.from({ length: 10 }, () => host.render())
+    // ST-1 的同一把尺子：同状态同查询，10 次必须完全一致。
+    assert.equal(new Set(renders).size, 1, '压缩后 10 次求值必须逐字符相同')
+    assert.match(renders[0] ?? '', /Redis/u)
+  })
+
+  it('压缩事件本身不改变记忆库（不丢卡、不重复写）', async () => {
+    const { host, dir } = await hostWithMemory()
+    const cardsBefore = readCards(dir).length
+    // 压缩是宿主侧动作，插件只是被通知；它不应该动数据面。
+    const before = host.render()
+    // 前提断言：before 必须非空且含真实内容。
+    // 没有它，这条在「渲染器整体返回空串」时也绿（"" === ""）——
+    // 而「压缩后什么都不记得了」恰恰是 FR-E4 最该抓的失效形态。
+    // 这不是假想：反向验证的 M1 变异（渲染器 return ''）第一轮就是绿在这里的。
+    assert.match(before, /Redis/u, '前提：压缩前焦点包必须非空且含这条记忆')
+    assert.ok(cardsBefore > 0, '前提：库里必须真的有卡')
+
+    await emitCompaction(host)
+
+    assert.equal(host.render(), before, '压缩不应改变焦点包内容')
+    assert.equal(readCards(dir).length, cardsBefore, '压缩不应增删卡片')
+  })
+
+  it('库为空时压缩后 text() 不抛错', async () => {
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(tempDir()))
+    await emitCompaction(host)
+    assert.doesNotThrow(() => host.render())
+    // 空库也必须有时间读数——这是 FR-D1 与「不报错」的交集。
+    assert.match(host.render(), /时间读数/u)
+  })
+
+  it('压缩摘要作为合成来源消息投递时也不进库（白名单直测）', async () => {
+    // 这条是**白名单唯一能证明的地方**，也是反向验证逼出来的。
+    //
+    // 我原本还写了一条「投递 compaction/summary 事件后摘要不进库」，反向验证
+    // 的 M6 变异（放行 compaction/* 类型）让它 fail=0——**它是装饰**。原因：
+    // `compaction/summary` 的载荷是 `{ compactionId, summary: [...], shadowedSeqs }`，
+    // 没有 `content` 字段，`messageText` 取不到文本，于是即使放行类型也写不进卡。
+    // 也就是说「type 过滤」和「载荷形状」两层防护的观测值完全一样，那条用例
+    // 守不住其中任何一层，已删除。
+    //
+    // 真正需要白名单的是**这条路径**：宿主压缩后把摘要作为 `user/message`
+    // 落盘（`source.kind === 'compact-checkpoint'`），它形状合法、`content`
+    // 齐全，只有 `source.kind` 能识别它。这正是缺陷三十四的原始形态。
+    const host = makeHost()
+    const dir = tempDir()
+    await apply(host.ctx, baseConfig(dir))
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我决定用 Redis 做缓存，因为一致性要求不高，能接受最终一致'),
+      // 压缩摘要以 user/message 投递，来源是 compact-checkpoint。
+      userEvent('用户决定了缓存方案，选择 Redis。', 'compact-checkpoint'),
+      assistantEvent('好的，那就用 Redis，注意设置合理的过期时间。'),
+    ])
+    await host.emit('agent/turn-stopping', { agent: makeAgent(), turn: 1 })
+
+    const cards = readCards(dir)
+    assert.ok(cards.length > 0, '前提：人类那句必须写进去')
+    const polluted = cards.filter((card) => card.text.includes('用户决定了缓存方案'))
+    assert.equal(polluted.length, 0, `压缩摘要不得变成记忆卡，实际产出：${polluted.map((c) => c.text).join(' | ')}`)
+    // 配对对照：人类那句必须在库里，证明白名单没挡过头。
+    assert.ok(
+      cards.some((card) => card.text.includes('Redis 做缓存')),
+      '配对对照：人类输入必须照常写入',
+    )
+  })
+})
+
 describe('apply 的写路径（FR-A1）', () => {
   it('订阅了 agent/turn-stopping', async () => {
     const host = makeHost()
