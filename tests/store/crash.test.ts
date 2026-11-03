@@ -59,6 +59,38 @@
  * 最后一条用例把「产不出残片」这个局限本身钉成断言，防止将来有人误以为
  * `crash.test.ts` 覆盖了撕裂修复而去删掉 `journal.test.ts` 那两条手工用例。
  *
+ * ## 第二个重要发现：`okSeqs` 是**管道水位**，不是磁盘真相
+ *
+ * 最初这里断言的是 `readRecords(dir).length === okSeqs.length`——「重开解出的
+ * 条数必须等于强杀前已确认的条数」。这条断言**断言了测试装置无法保证的时序**，
+ * 会时红时绿（实测在 40 次基线里没撞上，但在变异后连跑里撞上过 1/5 次，
+ * 而那个变异与崩溃路径毫无关系——**绿得可疑、红得也无关**，正是判据选错的形态）。
+ *
+ * 机制：父进程收到 `OK N` 后调 `child.kill('SIGKILL')`，而 **kill 是异步的**。
+ * 子进程的执行顺序是「`append()` 落盘 → `writeSync(1, 'OK N')`」，所以
+ * 在「第 N+1 条已落盘」与「父进程读到 `OK N+1`」之间存在一个窗口：
+ * 信号若落在窗口里，磁盘上有 N+1 条，而 `okSeqs` 只有 N 条。
+ *
+ * 直接验证（`.tmp/probe-kill-window.mjs`，把 kill 主动延后以撑开窗口）：
+ *
+ * | kill 延迟 | 观测到的（确认数, 磁盘数） |
+ * |---|---|
+ * | 0 ms × 18 | 恒为 (3,3) / (5,5) / (6,6)——窗口太窄，撞不上 |
+ * | **10 ms × 6** | **(15,15) (15,15) (16,16) (16,17) (17,17) (17,17)** |
+ *
+ * 那条 `(16,17)` 就是确凿证据：**磁盘上比已确认多一条**。
+ * 这不是实现缺陷（没有丢记录、没有缺口、没有重复），而是**测试装置在断言
+ * 一个它无法保证的性质**。
+ *
+ * 所以判据改成三件事，每一件都是 ST-3 真正要的，且都不依赖那个窗口：
+ *
+ * 1. `磁盘条数 >= 已确认条数`——**已确认的一条不少**（这是 ST-3 的原话）。
+ * 2. 磁盘序号**从 1 起严格连续**——有缺口就是丢记录，有重复就是重写。
+ * 3. `journal.count()` / `lastSeq()` 与**磁盘实测**一致，而不是与管道水位一致。
+ *
+ * 少的那一半（「不多」）在这里**明确放弃断言**：在异步 kill 下它不可能被
+ * 可靠观测。硬要断言它，得到的不是安全性，而是随负载飘的假红。
+ *
  * @module tests/store/crash
  */
 
@@ -77,7 +109,14 @@ const WRITER = new URL('./crash-writer.ts', import.meta.url).pathname.replace(/^
 
 /** 强杀观测结果。 */
 interface KillOutcome {
-  /** 强杀前子进程已确认落盘（`append` 返回 `appended: true`）的序号。 */
+  /**
+   * 强杀前父进程**从管道读到**的 `OK` 序号。
+   *
+   * **这是管道水位，不是磁盘真相。** `kill` 是异步的，信号送达前子进程
+   * 完全可能又落盘一条（它已经 `append` 完成、只是 `OK` 还没被父进程读到）。
+   * 所以只能断言「磁盘条数 >= 这个长度」，不能断言相等。
+   * 详见文件头部「`okSeqs` 是管道水位」一节。
+   */
   okSeqs: number[]
   /** 子进程收到的信号。 */
   signal: NodeJS.Signals | null
@@ -169,6 +208,54 @@ function hasPartialTail(dir: string): boolean {
   return false
 }
 
+/**
+ * 强杀后校验磁盘自洽，并返回磁盘实测记录。
+ *
+ * 判据只有两条，但**必须成对**：
+ *
+ * 1. `磁盘条数 >= 管道水位`——ST-3 原话「已确认写入完整」。
+ *    单看这一条是无牙的：`>=` 在实现把记录写丢时仍然成立（条数少了也满足
+ *    「不少于 0」这种退化情形），所以它不能单独用。
+ * 2. **磁盘序号必须从 1 起严格连续**——这才是真正有牙的那条：
+ *    丢任何一条已确认记录都会在序列里留下缺口，重写任何一条都会产生重复，
+ *    两种情况都会让 `deepEqual(seqs, [1..M])` 变红。
+ *
+ * 合起来：`>=` 守住「不少」，连续性守住「不丢不重」，两条互不替代。
+ *
+ * **为什么不断言「不多」**：`okSeqs` 是管道水位，`kill` 异步，磁盘上可能比
+ * 水位多一条（见文件头部实测表）。断言相等会得到随负载飘的假红。
+ */
+function assertDiskConsistent(
+  dir: string,
+  okSeqs: number[],
+  label: string,
+): JournalRecord[] {
+  const records = readRecords(dir)
+
+  assert.ok(
+    records.length >= okSeqs.length,
+    `${label}：已确认落盘 ${okSeqs.length} 条，重开只解出 ${records.length} 条——`
+    + '丢了已确认的写入（这是 ST-3 的直接违例）',
+  )
+
+  const seqs = records.map((record) => record.seq)
+  assert.deepEqual(
+    seqs, Array.from({ length: seqs.length }, (_, i) => i + 1),
+    `${label}：磁盘序号必须从 1 起严格连续（无缺口 = 没丢，无重复 = 没重写）。`
+    + `实际解出 ${records.length} 条，序号 ${JSON.stringify(seqs.slice(0, 12))}`,
+  )
+
+  // 幂等键与序号一一对应（子进程每条用 `crash-key-${seq}`），
+  // 于是「条数对得上」这件事由序号连续性直接守住，不必再数一遍。
+  const keys = records.map((record) => record.idempotencyKey)
+  assert.equal(
+    new Set(keys).size, keys.length,
+    `${label}：幂等键必须两两不同，实际 ${keys.length} 条里有 ${keys.length - new Set(keys).size} 条重复`,
+  )
+
+  return records
+}
+
 describe('ST-3 真实强杀', () => {
   test('写入过程中被 SIGKILL 后重开：已确认写入一条不少、无半条记录', async () => {
     const dir = makeTempDir('dsh-crash-')
@@ -183,17 +270,8 @@ describe('ST-3 真实强杀', () => {
         + '若为 0，说明测的是「空库重开」，和崩溃恢复无关',
       )
 
-      // ---- 真正的断言：重开后每一行都能解码，且与确认数逐条一致 ----
-      const records = readRecords(dir)
-      assert.equal(
-        records.length, killed.okSeqs.length,
-        `已确认落盘 ${killed.okSeqs.length} 条，重开解出 ${records.length} 条。`
-        + '少于确认数 = 丢已确认的写入；多于确认数 = 出现了没被确认的记录',
-      )
-      assert.deepEqual(
-        records.map((record) => record.seq), killed.okSeqs,
-        '重开后的序号序列必须与强杀前逐条确认的完全一致（同序、同值、无多余）',
-      )
+      // ---- 真正的断言：磁盘自洽（见 assertDiskConsistent 的注释） ----
+      const records = assertDiskConsistent(dir, killed.okSeqs, '强杀重开')
 
       // ---- 「无半条记录」：凡是落盘的行都必须完整 ----
       // 注意这里**不断言「一定有残片被修掉」**：本平台强杀产不出残片
@@ -210,12 +288,12 @@ describe('ST-3 真实强杀', () => {
         'open() 之后所有分片都必须以换行结尾：残片要么本来就没有，要么已被 repairTail 截掉',
       )
       assert.equal(
-        journal.count(), killed.okSeqs.length,
-        'open() 报告的条数必须等于强杀前已确认的条数',
+        journal.count(), records.length,
+        'open() 报告的条数必须等于磁盘实测条数（不是管道水位）',
       )
       assert.equal(
-        journal.lastSeq(), killed.okSeqs.length,
-        'maxSeq 水位必须等于已确认的最大序号，不能因为残片而虚高或回退',
+        journal.lastSeq(), records.length,
+        'maxSeq 水位必须等于磁盘最大序号，不能因为残片而虚高或回退',
       )
       journal.close()
     } finally {
@@ -268,19 +346,7 @@ describe('ST-3 真实强杀', () => {
       const killed = await killDuringWrite(dir, 4)
       assert.ok(killed.okSeqs.length >= 4, `前提：至少要 4 条，实际 ${killed.okSeqs.length}`)
 
-      const records = readRecords(dir)
-      // 子进程每条用不同幂等键，所以出现重复只可能是「同一条被写了两遍」
-      // ——比如重开时水位恢复错、把旧记录又追加一次。
-      const keys = records.map((record) => record.idempotencyKey)
-      assert.equal(
-        new Set(keys).size, keys.length,
-        `幂等键必须两两不同，实际 ${keys.length} 条里有 ${keys.length - new Set(keys).size} 条重复`,
-      )
-      const seqs = records.map((record) => record.seq)
-      assert.equal(
-        new Set(seqs).size, seqs.length,
-        `序号必须两两不同，实际 ${seqs.length} 条里有 ${seqs.length - new Set(seqs).size} 条重复`,
-      )
+      const records = assertDiskConsistent(dir, killed.okSeqs, '强杀重开（幂等键）')
 
       // 重开后幂等键集合必须从磁盘恢复：拿一个已存在的 key 再写，
       // 必须被判为重复丢弃，而不是当成新记录追加。
@@ -343,7 +409,12 @@ describe('ST-3 真实强杀', () => {
         readFileSync(path, 'utf8').startsWith(original),
         '截断后文件必须以原内容开头（只删尾部残片，不能改前面的字节）',
       )
-      assert.equal(readRecords(dir).length, killed.okSeqs.length, '完整记录条数不能变')
+      const beforeRepair = readRecords(dir).length
+      assert.ok(
+        beforeRepair >= killed.okSeqs.length,
+        `前提：手工追加残片前，完整记录数 ${beforeRepair} 必须不少于已确认数 ${killed.okSeqs.length}`,
+      )
+      assert.equal(readRecords(dir).length, beforeRepair, '完整记录条数不能变')
     } finally {
       removeDirContents(dir)
     }
@@ -396,9 +467,7 @@ describe('ST-3 真实强杀', () => {
         `前提：必须真的滚动了多个分片（实际 ${files.length} 个），否则这条和单片用例重复`,
       )
 
-      const records = readRecords(dir)
-      assert.equal(records.length, killed.okSeqs.length, '多分片下条数必须仍与确认数一致')
-      assert.deepEqual(records.map((record) => record.seq), killed.okSeqs, '多分片下序号序列必须逐条一致')
+      const records = assertDiskConsistent(dir, killed.okSeqs, '多分片强杀重开')
       assert.equal(hasPartialTail(dir), false, '所有分片都必须以换行结尾')
       assert.deepEqual(
         records.map((record) => record.seq),
