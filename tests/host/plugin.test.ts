@@ -212,14 +212,29 @@ async function emitSessionEvents(host: RecordingHost, events: { type: string; da
   }
 }
 
-/** 造一条用户消息事件。 */
-function userEvent(text: string): { type: string; data: unknown } {
-  return { type: 'user/message', data: { content: [{ type: 'text', text }] } }
+/**
+ * 造一条用户消息事件。
+ *
+ * **必须带 `source.kind`**：宿主真实投递的 `user/message` 载荷就是
+ * `UserMessage`（`packages/core/session/src/types.ts`），`source` 是必填字段。
+ * 生产代码按 `source.kind === 'user'` 白名单过滤合成上下文（见 `src/index.ts`
+ * 的 `HUMAN_SOURCE_KIND`），所以假宿主不补这个字段就不再是「真实载荷」，
+ * 而是「一个宿主永远不会发出的载荷」——那样测试会绿在一个不存在的场景上。
+ *
+ * @param text - 消息正文。
+ * @param kind - 来源类别，默认人类输入。
+ * @returns 会话事件。
+ */
+function userEvent(text: string, kind = 'user'): { type: string; data: unknown } {
+  return { type: 'user/message', data: { content: [{ type: 'text', text }], source: { kind } } }
 }
 
-/** 造一条助手消息事件。 */
+/** 造一条助手消息事件（`source.kind` 恒为 `model`）。 */
 function assistantEvent(text: string): { type: string; data: unknown } {
-  return { type: 'assistant/message', data: { content: [{ type: 'text', text }] } }
+  return {
+    type: 'assistant/message',
+    data: { content: [{ type: 'text', text }], source: { kind: 'model' } },
+  }
 }
 
 /** 造一条轮次起点事件。 */
@@ -378,6 +393,212 @@ describe('apply 的写路径（FR-A1）', () => {
     const cards = store.listCards({ status: 'active' })
     store.close()
     assert.equal(cards.length, 0)
+  })
+})
+
+describe('合成来源不得当成用户原话（起源 L17 上下文污染）', () => {
+  /**
+   * 这组用例守的是**一个曾经完全不存在**的判据。
+   *
+   * 宿主把 `systemPrompt.context()` 的全部贡献拼成一条 `user/message` 落盘
+   * （`packages/core/agent-loop/src/runtime-context.ts` 的 `project()`，
+   * 由 `session.append('user/message', context, { surfaceOp: 'append' })` 提交），
+   * `source.kind === 'runtime-context'`。**本插件注入的焦点包就在这条消息里**，
+   * 且因为它带时间读数、每轮都变，所以每轮都会重新 append 一次。
+   *
+   * 修复前 `accumulateEvent` 只看 `event.type`，于是：
+   * 焦点包 → 当成用户原话累积 → 写卡时把里面的卡片行再抽一遍 → 新卡更多
+   * → 下一轮焦点包更长 → 再抽一遍。实测 6 轮（用户每轮说的话**完全相同**）
+   * 活跃卡 20 张，其中一半是 `- [事件] - [事件] - [事件] Current runtime context…`
+   * 这种嵌套自我引用；对照组（不回送快照）是 6 张。**这是自我复制，不是噪声。**
+   *
+   * 为什么旧测试全绿：假宿主的 `userEvent()` 不带 `source` 字段，
+   * 而生产代码从不读 `source`——「测试不带」和「实现不读」互相掩护，
+   * 谁都不会红。所以这组用例的 `userEvent` 必须带 `source.kind`。
+   */
+
+  it('runtime-context 快照不写进记忆库（焦点包不被吃回去）', async () => {
+    const dir = tempDir()
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(dir))
+
+    const agent = makeAgent()
+    // 先灌一张真卡，让焦点包含有卡片行（否则快照里只有时间读数，
+    // 抽不出东西，测试会绿在一个不可能放大的前提上）。
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我决定这个项目必须用 PostgreSQL，JSONB 支持最好'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    const storeBefore = openStore({ dataDir: dir })
+    const before = storeBefore.count('active')
+    storeBefore.close()
+    assert.equal(before, 1, '前提：先有一张真卡，焦点包才会带卡片行')
+
+    // 第 2 轮：只投递宿主回送的快照，用户一个字都不说。
+    const snapshot = `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${host.render()}`
+    assert.ok(snapshot.includes('[承诺]'), '前提：快照里必须真的带卡片行')
+    await emitSessionEvents(host, [
+      turnStartEvent(2),
+      userEvent(snapshot, 'runtime-context'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 2 })
+
+    const storeAfter = openStore({ dataDir: dir })
+    const cards = storeAfter.listCards({ status: 'active' })
+    storeAfter.close()
+    assert.equal(cards.length, before, '合成来源不应产出任何新卡')
+    // 更强的一条：库里不得出现快照前缀。只比条数的话，
+    // 「写了一张又合并掉一张」也能让它变绿。
+    for (const card of cards) {
+      assert.ok(
+        !card.text.includes('Current runtime context'),
+        `卡片文本不得含快照前缀，实际：${card.text.slice(0, 80)}`,
+      )
+    }
+  })
+
+  it('压缩摘要消息不写进记忆库（compact-checkpoint 来源）', async () => {
+    // 压缩摘要也是 `user/message`，source.kind === 'compact-checkpoint'
+    // （`packages/compaction/compaction/src/checkpoint.ts` 的
+    // `COMPACT_CHECKPOINT_MARKER`）。它是模型写的摘要，不是用户说的话。
+    const dir = tempDir()
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(dir))
+
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('压缩摘要：我决定用 Alembic 管理数据库迁移，不要手写 SQL。', 'compact-checkpoint'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    const store = openStore({ dataDir: dir })
+    const cards = store.listCards({ status: 'active' })
+    store.close()
+    assert.equal(cards.length, 0, '压缩摘要不是用户输入，不应产出卡片')
+  })
+
+  it('人类输入仍然照常写入（配对对照：白名单不能挡过头）', async () => {
+    // 只测「合成来源被挡住」是半个测试：把 accumulateEvent 整个改成
+    // 直接 return，上面两条也会绿，但记忆系统彻底不工作了。
+    // 必须有这条配对用例证明 `source.kind === 'user'` 仍然放行。
+    const dir = tempDir()
+    const host = makeHost()
+    await apply(host.ctx, baseConfig(dir))
+
+    const agent = makeAgent()
+    await emitSessionEvents(host, [
+      turnStartEvent(1),
+      userEvent('我决定用 Alembic 管理数据库迁移，不要手写 SQL'),
+    ])
+    await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+    const store = openStore({ dataDir: dir })
+    const cards = store.listCards({ status: 'active' })
+    store.close()
+    assert.ok(cards.length > 0, '人类输入必须照常写入')
+    assert.ok(
+      cards.some((card) => card.text.includes('Alembic')),
+      '写入的卡应来自用户原话',
+    )
+  })
+
+  it('同一轮里合成来源与人类输入混合时，只取人类那段（两种到达顺序）', async () => {
+    // 真实轮次里两者**同时**到达，且**顺序是宿主定的**。
+    // 宿主 agent-loop 的实际代码（`packages/core/agent-loop/src/agent.ts`）是：
+    //
+    //     for (const message of decision.messages)
+    //       if (message.source.kind === 'runtime-context') { …append context… }
+    //       else this.session.append('user/message', message, { surfaceOp: 'append' })
+    //     if (context !== undefined && !contextAdmitted)
+    //       this.session.append('user/message', context, { surfaceOp: 'append' })
+    //
+    // 即**用户消息先、快照后**。这一点是判据的一部分：
+    // 若过滤写成「遇到合成来源就把整轮缓冲清空」，在真实顺序下会把已经累积的
+    // 用户文本一起丢掉（实测：混合轮产出 0 张卡）。所以两种顺序都必须验，
+    // 而且必须**分别**验——只验一种的话，另一种顺序下的过度修复照样全绿。
+    const HUMAN = '我决定用 Alembic 管理数据库迁移，不要手写 SQL'
+    const orders: { label: string; events: (snapshot: string) => { type: string; data: unknown }[] }[] = [
+      {
+        // 宿主真实顺序：用户消息在前，快照在后。
+        label: '用户先、快照后（宿主真实顺序）',
+        events: (snapshot) => [turnStartEvent(1), userEvent(HUMAN), userEvent(snapshot, 'runtime-context')],
+      },
+      {
+        // 反过来的顺序：宿主若改了实现，判据不应因此失效。
+        label: '快照先、用户后',
+        events: (snapshot) => [turnStartEvent(1), userEvent(snapshot, 'runtime-context'), userEvent(HUMAN)],
+      },
+    ]
+
+    for (const order of orders) {
+      const dir = tempDir()
+      const host = makeHost()
+      await apply(host.ctx, baseConfig(dir))
+      const agent = makeAgent()
+      const snapshot = `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${host.render()}`
+      await emitSessionEvents(host, order.events(snapshot))
+      await host.emit('agent/turn-stopping', { agent, turn: 1 })
+
+      const store = openStore({ dataDir: dir })
+      const cards = store.listCards({ status: 'active' })
+      store.close()
+      assert.ok(cards.length > 0, `${order.label}：同一轮里的人类输入必须写入`)
+      assert.ok(
+        cards.some((card) => card.text.includes('Alembic')),
+        `${order.label}：写入的卡应来自人类原话`,
+      )
+      for (const card of cards) {
+        assert.ok(
+          !card.text.includes('Current runtime context'),
+          `${order.label}：不得把快照写进卡：${card.text.slice(0, 80)}`,
+        )
+      }
+    }
+  })
+
+  it('逐轮回送快照不会让卡片自我复制（6 轮同话，卡数不放大）', async () => {
+    // 这条是缺陷的**原始观测**：用户每轮说的话完全相同，只有快照在变。
+    // 修复前 A 组 20 张 / B 组 6 张；修复后两组都是 6 张。
+    // 断言写成「两组相等」而不是「小于某个数」——后者靠巧合，
+    // 而且 maxCardsPerTurn 一调就变成在测别的东西。
+    const SAME_TEXT = '我决定这个项目必须用 PostgreSQL，JSONB 支持最好'
+
+    async function runRounds(sendSnapshot: boolean): Promise<number> {
+      const dir = tempDir()
+      const host = makeHost()
+      await apply(host.ctx, baseConfig(dir))
+      const agent = makeAgent()
+      for (let turn = 1; turn <= 6; turn += 1) {
+        const events: { type: string; data: unknown }[] = [turnStartEvent(turn)]
+        if (sendSnapshot) {
+          const snapshot = `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${host.render()}`
+          events.push(userEvent(snapshot, 'runtime-context'))
+        }
+        events.push(userEvent(SAME_TEXT))
+        await emitSessionEvents(host, events)
+        await host.emit('agent/turn-stopping', { agent, turn })
+      }
+      const store = openStore({ dataDir: dir })
+      const count = store.count('active')
+      store.close()
+      return count
+    }
+
+    const withSnapshot = await runRounds(true)
+    const withoutSnapshot = await runRounds(false)
+    // 前提断言：两组都必须**真的产出过卡**。没有这一条的话，
+    // 「相等」在 0 === 0 时也成立——实测把判据改反（人类输入被挡、快照放行）
+    // 时两组都是 0，这条断言照样绿。**等式断言必须配非零前提才有牙。**
+    assert.ok(withoutSnapshot > 0, `对照组必须产出卡片，实际 ${withoutSnapshot}`)
+    assert.ok(withSnapshot > 0, `回送组必须产出卡片，实际 ${withSnapshot}`)
+    assert.equal(
+      withSnapshot,
+      withoutSnapshot,
+      `回送快照不应改变产出卡数（有回送 ${withSnapshot}，无回送 ${withoutSnapshot}）`,
+    )
   })
 })
 

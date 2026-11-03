@@ -63,6 +63,45 @@ const CONTEXT_NAME = 'memory:focus-pack'
 /** 换行符：消息片段之间用换行拼接。 */
 const NL = String.fromCharCode(10)
 
+/**
+ * 宿主 `user/message` 事件里「真的是人说的」那一个 `source.kind`。
+ *
+ * 宿主的 `user/message` **不只有人类输入**。同一个事件类型还承载：
+ * - `runtime-context`：所有 `systemPrompt.context()` 贡献拼成的快照
+ *   （`packages/core/agent-loop/src/runtime-context.ts` 的 `project()`，
+ *   由 `session.append('user/message', context, { surfaceOp: 'append' })` 落盘）。
+ *   **本插件注入的焦点包就在这一类里**，且因为它带时间读数、每轮都变，
+ *   所以每轮都会被重新 append 一次。
+ * - `compact-checkpoint`：压缩摘要消息
+ *   （`packages/compaction/compaction/src/checkpoint.ts` 的
+ *   `COMPACT_CHECKPOINT_MARKER = { kind: 'compact-checkpoint' }`）。
+ * - `schedule` / `agent-instructions` / `goal` / `user-approval` /
+ *   `user-question-reply` 等合成来源。
+ *
+ * 判据必须是**白名单**而不是黑名单：合成来源在宿主里是开放集合（各插件自带
+ * `source.kind`），挡得完一个挡不完下一个。只有 `user` 是人类直接输入。
+ *
+ * 起源 L17（无编号·上下文污染）：「模型搜索记忆等也可能有问题？污染上下文？」
+ * ——把注入出去的焦点包再吃回来，正是它说的那件事。
+ */
+const HUMAN_SOURCE_KIND = 'user'
+
+/**
+ * 判断一条宿主消息是不是人类直接输入。
+ *
+ * 缺 `source` 时按**非人类输入**处理：宁可少记一条，也不要把合成上下文
+ * 当用户原话写进记忆——写进去会被当成事实长期留存，而且会自我复制。
+ *
+ * @param message - 宿主消息对象。
+ * @returns 是 `source.kind === 'user'` 时为 `true`。
+ */
+function isHumanSource(message: unknown): boolean {
+  if (typeof message !== 'object' || message === null) return false
+  const source = (message as { source?: unknown }).source
+  if (typeof source !== 'object' || source === null) return false
+  return (source as { kind?: unknown }).kind === HUMAN_SOURCE_KIND
+}
+
 /** 插件名，宿主日志与 loader 诊断用。 */
 export const name = 'memory'
 
@@ -199,8 +238,13 @@ function readTurnText(buffers: TurnBuffers, sessionId: string): { userText: stri
  *
  * 只关心三类事件：
  * - `turn/start`：开新轮，清空缓冲（上一轮已经处理过）。
- * - `user/message`：追加用户文本。
- * - `assistant/message`：追加助手文本。
+ * - `user/message`：追加用户文本（**仅 `source.kind === 'user'` 的人类输入**）。
+ * - `assistant/message`：追加助手文本（仅 `source.kind === 'model'` 的模型回复）。
+ *
+ * 为什么必须按 `source.kind` 过滤，见 `HUMAN_SOURCE_KIND` 的文档块：
+ * 宿主的 `user/message` 同时承载 `runtime-context` 快照（**本插件自己注入的
+ * 焦点包**）和 `compact-checkpoint` 压缩摘要。不过滤的话，焦点包会被当成
+ * 用户原话写回记忆库，并把里面的卡片行再抽取一遍，形成逐轮放大的自我复制。
  *
  * @param buffers - 各会话的累积器。
  * @param sessionId - 会话 id。
@@ -217,6 +261,9 @@ function accumulateEvent(buffers: TurnBuffers, sessionId: string, event: unknown
     return
   }
   if (type !== 'user/message' && type !== 'assistant/message') return
+  // 只有 `user/message` 会混进合成来源（`runtime-context` / `compact-checkpoint`
+  // 等）。`assistant/message` 的 source 恒为 `model`，不需要过滤。
+  if (type === 'user/message' && !isHumanSource(unwrapMessage(record.data))) return
   const text = messageText(record.data)
   if (text.length === 0) return
   let buffer = buffers.get(sessionId)
@@ -243,13 +290,7 @@ function accumulateEvent(buffers: TurnBuffers, sessionId: string, event: unknown
  */
 function messageText(data: unknown): string {
   if (typeof data !== 'object' || data === null) return ''
-  const record = data as { content?: unknown; message?: unknown }
-  // assistant/message 把真正的消息包在 message 字段里，先剥一层。
-  const inner =
-    record.content === undefined && typeof record.message === 'object' && record.message !== null
-      ? record.message
-      : record
-  const content = (inner as { content?: unknown }).content
+  const content = (unwrapMessage(data) as { content?: unknown }).content
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
   const parts: string[] = []
@@ -259,6 +300,30 @@ function messageText(data: unknown): string {
     if (item.type === 'text' && typeof item.text === 'string') parts.push(item.text)
   }
   return parts.join(NL)
+}
+
+/**
+ * 剥掉 `assistant/message` 外面那层事件包装，取出真正的消息对象。
+ *
+ * 两种载荷形状都要认（见 `packages/core/session/src/types.ts`）：
+ * - `user/message` 的 data **就是** `UserMessage`，`content` 与 `source` 在顶层；
+ * - `assistant/message` 的 data 是 `{ turn, step, message, stream, usage }`，
+ *   `content` 与 `source` 在 `message` 里。
+ *
+ * 抽成函数是为了让「取文本」和「判来源」用**同一个**剥离规则：
+ * 两处各写一遍剥法，迟早在其中一个上漂移，而漂移的表现是「文本取到了、
+ * 来源判成空」，正好会静默把合成消息当人类输入放过去。
+ *
+ * @param data - 消息事件数据。
+ * @returns 消息对象；无法识别时原样返回。
+ */
+function unwrapMessage(data: unknown): unknown {
+  if (typeof data !== 'object' || data === null) return data
+  const record = data as { content?: unknown; message?: unknown }
+  if (record.content === undefined && typeof record.message === 'object' && record.message !== null) {
+    return record.message
+  }
+  return record
 }
 
 /**
