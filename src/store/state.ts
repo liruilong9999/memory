@@ -506,6 +506,34 @@ export interface MemoryFilter {
 }
 
 /**
+ * 单张卡片是否满足查询条件。
+ *
+ * 抽出来的理由不是「复用方便」，而是**判据只能有一份**：
+ * {@link filterCards} 对整张状态表筛，召回链路对「已经拿到手的一张卡」筛，
+ * 两处若各写一遍 `filter.domain !== card.domain` 这样的比较，就是两个真相源。
+ * 而两个真相源的分歧不会报错——它表现为「同一条过滤条件，`query` 命令和
+ * 召回链路给出的结果不一样」，查起来极费人（缺陷二十五的形状：判据写了两处，
+ * 两处各自都对，合起来互相矛盾）。
+ *
+ * @param card - 待判定的卡片。
+ * @param filter - 查询条件；全部字段可选，同时给出时按「与」组合。
+ * @returns 满足条件时 `true`。
+ */
+export function matchesFilter(card: MemoryCard, filter: MemoryFilter = {}): boolean {
+  if (!(filter.includeMerged ?? true) && card.mergedInto !== undefined) return false
+  if (filter.domain !== undefined && card.domain !== filter.domain) return false
+  if (filter.kind !== undefined && card.kind !== filter.kind) return false
+  if (filter.status !== undefined && card.status !== filter.status) return false
+  if (filter.tag !== undefined && !card.tags.includes(filter.tag)) return false
+  if (filter.entity !== undefined && !card.entities.includes(filter.entity)) return false
+  if (filter.contains !== undefined && !card.text.includes(filter.contains)) return false
+  if (filter.pinned !== undefined && card.pinned !== filter.pinned) return false
+  if (filter.since !== undefined && card.createdAt < filter.since) return false
+  if (filter.until !== undefined && card.createdAt > filter.until) return false
+  return true
+}
+
+/**
  * 按条件筛选卡片。
  *
  * 返回顺序固定为「`updatedAt` 降序，同刻按 id 升序」，保证同一状态同一查询
@@ -516,20 +544,9 @@ export interface MemoryFilter {
  * @returns 卡片数组。
  */
 export function filterCards(state: MemoryState, filter: MemoryFilter = {}): MemoryCard[] {
-  const includeMerged = filter.includeMerged ?? true
   const result: MemoryCard[] = []
   for (const card of state.cards.values()) {
-    if (!includeMerged && card.mergedInto !== undefined) continue
-    if (filter.domain !== undefined && card.domain !== filter.domain) continue
-    if (filter.kind !== undefined && card.kind !== filter.kind) continue
-    if (filter.status !== undefined && card.status !== filter.status) continue
-    if (filter.tag !== undefined && !card.tags.includes(filter.tag)) continue
-    if (filter.entity !== undefined && !card.entities.includes(filter.entity)) continue
-    if (filter.contains !== undefined && !card.text.includes(filter.contains)) continue
-    if (filter.pinned !== undefined && card.pinned !== filter.pinned) continue
-    if (filter.since !== undefined && card.createdAt < filter.since) continue
-    if (filter.until !== undefined && card.createdAt > filter.until) continue
-    result.push(card)
+    if (matchesFilter(card, filter)) result.push(card)
   }
   result.sort((a, b) => (b.updatedAt - a.updatedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   return result

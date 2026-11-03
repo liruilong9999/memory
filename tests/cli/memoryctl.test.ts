@@ -22,11 +22,12 @@ import {
 } from '../../src/cli/memoryctl.ts'
 import { DEFAULT_CONFIG, mergeConfig } from '../../src/core/config.ts'
 import type { DeepPartial, MemoryConfig } from '../../src/core/config.ts'
-import { buildCardId } from '../../src/core/types.ts'
+import { buildCardId, buildEdgeId } from '../../src/core/types.ts'
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
 import { loadPatchConfig } from '../../src/host/patchConfig.ts'
 import { resolveConfig } from '../../src/host/adapter.ts'
+import { exportJsonl } from '../../src/store/export.ts'
 import { openStore } from '../../src/store/store.ts'
 import { makeTempDir, removeDirContents } from '../store/helpers.ts'
 
@@ -636,6 +637,528 @@ describe('export', () => {
     const summary = JSON.parse(result.stdout) as { out: string; exported: number }
     assert.equal(summary.out, target)
     assert.equal(summary.exported, 2)
+  })
+})
+
+describe('import（FR-A6 的入口侧）', () => {
+  /** 导出到文件，返回路径。 */
+  function exportTo(dir: string, outDir: string, extra: string[] = []): string {
+    const target = join(outDir, 'backup.json')
+    const result = runCli(['export', '--data-dir', dir, '--include-archived', '--out', target, ...extra], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK, `导出失败：${result.stderr}`)
+    return target
+  }
+
+  it('导出的文件能导回一个空库，卡片与边逐字段一致（P1-4 的闭环）', () => {
+    // 这条是 P1-4 的核心：**导出 → 移走数据目录 → 导入 → 抽查一致**。
+    // 只加子命令不够——探针已经证明 `export --out` 的产物喂给 `importJsonl`
+    // 会得到 0 张卡，所以这条用例必须真的走「文件 → 新库」这条路。
+    const source = tempDir()
+    const store = openStore({ dataDir: source })
+    const cards = Array.from({ length: 100 }, (_, index) => makeCard('fact', `第 ${index} 条部署记忆`, {
+      // 每条卡的来源序号不同，id 才不撞（id 由域+来源+类型+文本派生）。
+      source: { sessionId: 'sess-cli', turn: index + 1, step: 1, seq: 1, eventType: 'user/message' },
+    }))
+    for (const card of cards) store.putCard(card)
+    const edge = {
+      id: buildEdgeId(cards[0]?.id ?? '', cards[1]?.id ?? '', 'same-topic'),
+      from: cards[0]?.id ?? '',
+      to: cards[1]?.id ?? '',
+      relation: 'same-topic' as const,
+      weight: 0.75,
+      createdAt: T0,
+    }
+    store.putEdge(edge)
+    store.close()
+
+    const target = exportTo(source, tempDir())
+
+    // 「移走数据目录」用一个全新的空目录代替：这才是真实的换机器场景。
+    const fresh = tempDir()
+    const imported = runCli(['import', target, '--data-dir', fresh], { now: fixedClock })
+    assert.equal(imported.code, EXIT_OK, `导入失败：${imported.stderr}`)
+    assert.match(imported.stdout, /卡片 100 张写入/u)
+
+    const check = openStore({ dataDir: fresh })
+    try {
+      assert.equal(check.count('active'), 100)
+      for (const card of cards) {
+        // 逐字段比对而不是只比数量：只比数量时，「100 张都进来了但字段被
+        // 重放层改写」也会绿，而那正是 ST-1 要防的静默改写。
+        assert.deepEqual(check.getCard(card.id), card)
+      }
+      const edges = check.allEdges()
+      assert.equal(edges.length, 1)
+      assert.equal(edges[0]?.weight, 0.75)
+      assert.equal(edges[0]?.from, edge.from)
+    } finally {
+      check.close()
+    }
+  })
+
+  it('JSONL 格式也能导入（对照组：证明不是只认一种格式）', () => {
+    // 对照组存在的理由：上一条只证明「导出文档」能导入。若实现把格式判断
+    // 写死成文档一种，JSONL 就再也导不进来，而仓库里 `exportJsonl` 是公开
+    // API，旧备份文件很可能就是 JSONL。**两种格式各有一条用例，
+    // 才能证明「自动识别」是真的在识别，而不是碰巧对了一种。**
+    const source = tempDir()
+    const store = openStore({ dataDir: source })
+    const card = makeCard('fact', 'JSONL 往返也要能进')
+    store.putCard(card)
+    // 从**有卡的那个库**取卡再序列化：从空库取会得到一份只有头行的文件，
+    // 于是「导入了 1 张」这条断言永远失败，而失败原因与格式识别无关。
+    const jsonl = exportJsonl(store.listCards({}), [], T0)
+    store.close()
+
+    const target = join(tempDir(), 'backup.jsonl')
+    writeFileSync(target, jsonl, 'utf8')
+
+    const fresh = tempDir()
+    const imported = runCli(['import', target, '--data-dir', fresh], { now: fixedClock })
+    assert.equal(imported.code, EXIT_OK, `导入失败：${imported.stderr}`)
+    assert.match(imported.stdout, /格式 JSONL/u)
+    assert.match(imported.stdout, /卡片 1 张写入/u)
+
+    const check = openStore({ dataDir: fresh })
+    try {
+      assert.deepEqual(check.getCard(card.id), card)
+    } finally {
+      check.close()
+    }
+  })
+
+  it('--in 与位置参数等价；两处不一致时报错而不是静默选一个', () => {
+    const source = tempDir()
+    seedStore(source)
+    // `--include-archived` 下导出 3 张（2 活跃 + 1 归档），所以是 3 张写入。
+    const target = exportTo(source, tempDir())
+
+    const viaFlag = runCli(['import', '--in', target, '--data-dir', tempDir()], { now: fixedClock })
+    assert.equal(viaFlag.code, EXIT_OK, `--in 导入失败：${viaFlag.stderr}`)
+    assert.match(viaFlag.stdout, /卡片 3 张写入/u)
+
+    const conflict = runCli(['import', target, '--in', `${target}.other`, '--data-dir', tempDir()])
+    assert.equal(conflict.code, EXIT_USAGE)
+    assert.match(conflict.stderr, /给了两处且不一致/u)
+  })
+
+  it('同一个文件导两次：第二次按幂等跳过，不报错也不重复建卡', () => {
+    const source = tempDir()
+    seedStore(source)
+    const target = exportTo(source, tempDir())
+    const fresh = tempDir()
+
+    assert.equal(runCli(['import', target, '--data-dir', fresh], { now: fixedClock }).code, EXIT_OK)
+    const again = runCli(['import', target, '--data-dir', fresh], { now: fixedClock })
+    assert.equal(again.code, EXIT_OK)
+    assert.match(again.stdout, /卡片 0 张写入 \/ 3 张已存在/u)
+
+    const check = openStore({ dataDir: fresh })
+    try {
+      // 数量断言是「不重复建卡」的证据；上面那行文案只是它的说法。
+      assert.equal(check.count('active'), 2)
+      assert.equal(check.count('archived'), 1)
+    } finally {
+      check.close()
+    }
+  })
+
+  it('文件不存在时是用法错误（退出码 2），不是「库坏了」', () => {
+    const result = runCli(['import', join(tempDir(), '没有这个文件.json'), '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_USAGE)
+    assert.match(result.stderr, /读不到导入文件/u)
+  })
+
+  it('空文件明确报错，不报「导入成功 0 条」', () => {
+    const target = join(tempDir(), 'empty.json')
+    writeFileSync(target, '   \n', 'utf8')
+    const result = runCli(['import', target, '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_USAGE)
+    assert.match(result.stderr, /文件是空的/u)
+  })
+
+  it('一行都认不出来的文件必须报错，不能报成功（静默数据丢失防线）', () => {
+    // 这条守的是一个非常容易走到的坑：`parseExportFile` 对任何不以 `{` 开头的
+    // 文本都走 JSONL 容错分支，坏行只计数不报错 ⇒ 一份 CSV 会得到
+    // `cards: []`、`skipped: 37`，若 CLI 照直说「已导入 0 张」并退出 0，
+    // 用户会以为备份恢复了。**「什么都没导进去」和「导入成功」必须能区分。**
+    const target = join(tempDir(), 'not-a-backup.csv')
+    writeFileSync(target, 'id,text\n1,部署\n2,迁移\n', 'utf8')
+    const result = runCli(['import', target, '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_USAGE, '认不出的文件不能报成功')
+    assert.match(result.stderr, /一条都认不出来/u)
+  })
+
+  it('边指向不存在的卡时预检失败，且库里一张卡都没写（不留半截状态）', () => {
+    const target = join(tempDir(), 'dangling.json')
+    writeFileSync(target, JSON.stringify({
+      formatVersion: 1,
+      exportedAt: T0,
+      cards: [makeCard('fact', '唯一一张卡')],
+      edges: [{
+        id: 'e1', from: 'ghost-a', to: 'ghost-b', relation: 'same-topic', weight: 0.5, createdAt: T0,
+      }],
+    }), 'utf8')
+
+    const fresh = tempDir()
+    const result = runCli(['import', target, '--data-dir', fresh])
+    assert.equal(result.code, EXIT_UNHEALTHY, '文件不自洽是数据问题，不是用法问题')
+    assert.match(result.stderr, /未通过预检/u)
+    assert.match(result.stderr, /ghost-a/u)
+
+    // 关键断言：预检在写入**之前**。先写卡再报错会留下「一半导入」的状态，
+    // 而用户看到的只有一行错误，会以为什么都没发生。
+    const check = openStore({ dataDir: fresh })
+    try {
+      assert.equal(check.count('active'), 0, '预检失败时不得写入任何卡片')
+    } finally {
+      check.close()
+    }
+  })
+
+  it('版本比本程序新的导出文件拒绝导入', () => {
+    const target = join(tempDir(), 'future.json')
+    writeFileSync(target, JSON.stringify({
+      formatVersion: 999, exportedAt: T0, cards: [], edges: [],
+    }), 'utf8')
+    const result = runCli(['import', target, '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_USAGE)
+    assert.match(result.stderr, /高于本程序支持/u)
+  })
+
+  it('只含边的文件能导入到已有卡的库（端点存在性必须连库一起看）', () => {
+    // 这条守的是 `validateImport` 的 `knownCardIds` 参数。没有它时，
+    // 「端点是否存在」只能查文件内——于是**只含边的文件永远导不进去**，
+    // 因为文件里一张卡都没有，每个端点都被判成悬空。
+    //
+    // 反向验证里把这个参数去掉（`known = inFile`）后，原先那条
+    // 「悬空边报错」的用例照样绿——它测的是「文件内也不存在」，
+    // 两种情况都会报错，区分不出来。必须有一条「文件内没有、库里有」的用例。
+    const fresh = tempDir()
+    const seed = openStore({ dataDir: fresh })
+    const a = makeCard('fact', '端点 A')
+    const b = makeCard('concept', '端点 B')
+    seed.putCard(a)
+    seed.putCard(b)
+    seed.close()
+
+    const target = join(tempDir(), 'edges-only.json')
+    writeFileSync(target, JSON.stringify({
+      formatVersion: 1,
+      exportedAt: T0,
+      cards: [],
+      edges: [{
+        id: buildEdgeId(a.id, b.id, 'same-topic'),
+        from: a.id,
+        to: b.id,
+        relation: 'same-topic',
+        weight: 0.6,
+        createdAt: T0,
+      }],
+    }), 'utf8')
+
+    const result = runCli(['import', target, '--data-dir', fresh])
+    assert.equal(result.code, EXIT_OK, `只含边的文件应能导入：${result.stderr}`)
+    assert.match(result.stdout, /图谱边 1 条写入/u)
+
+    const check = openStore({ dataDir: fresh })
+    try {
+      assert.equal(check.allEdges().length, 1)
+    } finally {
+      check.close()
+    }
+  })
+
+  it('文件内出现重复卡片 id 时预检失败（后写会覆盖先写，属于静默数据丢失）', () => {
+    // 重复 id 不是「多导入一次」，而是**一张卡吃掉另一张**：`putCard` 用 id
+    // 定位，第二张把第一张覆盖掉，而 CLI 会报「2 张写入」——
+    // 用户以为两条都在，实际库里只有一条，且没有任何提示。
+    // 预检必须在写入前拦住它，因为写入后无从区分「本来就只有一条」。
+    const target = join(tempDir(), 'dup.json')
+    const a = makeCard('fact', '重复 id 的第一张')
+    const b = makeCard('fact', '重复 id 的第二张', { id: a.id })
+    writeFileSync(target, JSON.stringify({
+      formatVersion: 1, exportedAt: T0, cards: [a, b], edges: [],
+    }), 'utf8')
+
+    const fresh = tempDir()
+    const result = runCli(['import', target, '--data-dir', fresh])
+    assert.equal(result.code, EXIT_UNHEALTHY)
+    assert.match(result.stderr, /未通过预检/u)
+    assert.match(result.stderr, /重复的卡片 id/u)
+
+    const check = openStore({ dataDir: fresh })
+    try {
+      assert.equal(check.count('active'), 0, '预检失败时不得写入任何卡片')
+    } finally {
+      check.close()
+    }
+  })
+
+  it('--json 输出机器可读计数，且把「坏行」与「幂等跳过」分开报', () => {
+    const source = tempDir()
+    seedStore(source)
+    const target = exportTo(source, tempDir())
+    const fresh = tempDir()
+    runCli(['import', target, '--data-dir', fresh], { now: fixedClock })
+    const result = runCli(['import', target, '--data-dir', fresh, '--json'], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    const payload = JSON.parse(result.stdout) as {
+      format: string
+      cards: { read: number; written: number; skipped: number }
+      edges: { read: number; written: number; skipped: number }
+      malformed: number
+    }
+    assert.equal(payload.format, 'document')
+    assert.equal(payload.cards.read, 3)
+    assert.equal(payload.cards.written, 0)
+    assert.equal(payload.cards.skipped, 3)
+    // 两个数字必须分开：合成一个会让「文件被手改坏了」看起来像
+    // 「数据已经在库里了」，而这两件事的处置方式完全相反。
+    assert.equal(payload.malformed, 0)
+  })
+})
+
+describe('query 的过滤 flag（P1-5）', () => {
+  const DAY = 86_400_000
+  const OLD = T0 - 30 * DAY
+  /**
+   * 落在「上海 2023-11-01 00:00」与「UTC 2023-11-01 00:00」之间的时刻。
+   *
+   * 这两个时刻差 8 小时（1698768000000 vs 1698796800000），中间这段是
+   * **唯一能区分「按 --tz 解释」和「按 UTC 硬算」的窗口**。没有卡落在这里时，
+   * 两种实现给出相同的卡片集合，用例会绿在错误的原因上——
+   * 反向验证里 `--since` 那条一开始就是这么假绿的。
+   */
+  const BETWEEN_ZONES = 1698780000000
+
+  /**
+   * 种一个五张卡的库：三个域、三种类型、三组标签、三个创建时刻。
+   *
+   * 五张卡的正文都含查询词「部署」，所以**过滤是唯一变量**——
+   * 否则「筛出 2 张」可能只是「只有 2 张相关」，用例就绿在错误的原因上。
+   */
+  function seedFilterStore(dir: string): void {
+    const store = openStore({ dataDir: dir })
+    store.putCard(makeCard('fact', '生产环境部署必须先跑数据库迁移', {
+      domain: 'work', tags: ['部署'], createdAt: T0, updatedAt: T0,
+    }))
+    store.putCard(makeCard('concept', '部署流程的学习笔记', {
+      domain: 'study', tags: ['算法'], createdAt: T0, updatedAt: T0,
+    }))
+    store.putCard(makeCard('feeling', '部署出问题时我会很焦虑', {
+      domain: 'life', tags: ['部署'], createdAt: T0, updatedAt: T0,
+    }))
+    store.putCard(makeCard('fact', '旧的部署脚本已废弃', {
+      domain: 'work', tags: ['部署'], createdAt: OLD, updatedAt: OLD,
+    }))
+    // 时区边界卡：只用于让 `--since` 有判别力，别的作用没有。
+    store.putCard(makeCard('concept', '部署边界时刻的笔记', {
+      domain: 'study', tags: ['边界'], createdAt: BETWEEN_ZONES, updatedAt: BETWEEN_ZONES,
+    }))
+    store.close()
+  }
+
+  /** 直调 `engine.query` 拿基准结果，供「CLI === 引擎」比对。 */
+  function engineIds(dir: string, filter: Parameters<MemoryEngine['query']>[0]): string[] {
+    const store = openStore({ dataDir: dir })
+    try {
+      const engine = new MemoryEngine({ store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock })
+      return engine.query(filter).map((card) => card.id)
+    } finally {
+      store.close()
+    }
+  }
+
+  /**
+   * 每个 flag 都必须与「直调 `engine.query` 同参数」的结果**逐条相同**。
+   *
+   * 这是 P1-5 的完成判据原话。只断言「看起来筛对了」不够：那样一个把
+   * `--domain` 实现成「在焦点包里再筛一遍」的版本也能绿，而它和引擎的
+   * `MemoryFilter` 语义（筛候选池）是两件事——差别会在「筛出来的卡没进
+   * 焦点包」时暴露，而那时用例早就绿了。
+   */
+  const cases: Array<{ name: string; args: string[]; filter: Parameters<MemoryEngine['query']>[0] }> = [
+    { name: '--domain', args: ['--domain', 'work'], filter: { domain: 'work', status: 'active' } },
+    { name: '--kind', args: ['--kind', 'feeling'], filter: { kind: 'feeling', status: 'active' } },
+    { name: '--tag', args: ['--tag', '算法'], filter: { tag: '算法', status: 'active' } },
+    {
+      name: '--since',
+      args: ['--since', '2023-11-01', '--tz', TZ],
+      filter: { since: 1698768000000, status: 'active' },
+    },
+  ]
+
+  for (const item of cases) {
+    it(`${item.name} 的结果与直调 engine.query 同参数逐条一致`, () => {
+      const dir = tempDir()
+      seedFilterStore(dir)
+      const result = runCli(['query', '部署', '--data-dir', dir, '--json', ...item.args], { now: fixedClock })
+      assert.equal(result.code, EXIT_OK, `查询失败：${result.stderr}`)
+      const payload = JSON.parse(result.stdout) as { matched: Array<{ id: string }> }
+      assert.ok(Array.isArray(payload.matched), '带过滤条件时 --json 必须给出 matched 全集')
+      const cliIds = payload.matched.map((card) => card.id)
+      // 前提断言：过滤后不能是全集，否则「与引擎一致」可能只是两边都没筛。
+      assert.ok(cliIds.length > 0 && cliIds.length < 5, `前提：${item.name} 必须真的筛掉了一些卡，实际 ${cliIds.length} 张`)
+      assert.deepEqual(cliIds, engineIds(dir, item.filter))
+    })
+  }
+
+  it('过滤作用在候选池上：候选数收缩，且焦点包里没有池外的卡', () => {
+    // 这条是反向验证逼出来的，它守的东西和上面四条**不是同一层**。
+    //
+    // 上面四条比对的是 `matched`，而 `matched` 来自 `engine.query`、候选池来自
+    // `engine.peek`——两条独立路径。把 `peek` 的 filter 参数整个丢掉（变异 M11），
+    // `matched` 依然完全正确，四条用例**一条都不红**。于是「过滤生效」只在
+    // 计数上成立，用户真正看到的焦点包里还是别的域的卡。
+    //
+    // 断言选在 `candidates`（候选池大小）而不是「包里恰好有哪些卡」，
+    // 因为装包还要过打分阈值与 token 预算：fixture 稍变就会让包里只剩 1 张，
+    // 那时「包里都是 work 卡」对「过滤没接线」同样成立——判据会被巧合决定。
+    // 候选池大小没有阈值参与，它直接就是「筛完剩几张」。
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const peekOf = (args: string[]): { candidates: number; domains: string[] } => {
+      const result = runCli(['query', '部署', '--data-dir', dir, '--json', ...args], { now: fixedClock })
+      assert.equal(result.code, EXIT_OK, `查询失败：${result.stderr}`)
+      const payload = JSON.parse(result.stdout) as {
+        candidates: number
+        cards: Array<{ domain: string }>
+      }
+      return { candidates: payload.candidates, domains: payload.cards.map((card) => card.domain) }
+    }
+
+    const all = peekOf([])
+    const work = peekOf(['--domain', 'work'])
+    // 前提：不带过滤时池里必须混有非 work 域的卡，否则「筛掉它」无从观测。
+    assert.equal(all.candidates, 5, '前提：不带过滤时候选池应是全部 5 张活跃卡')
+    assert.equal(work.candidates, 2, '带 --domain work 时候选池应只剩 2 张 work 卡')
+    assert.ok(work.candidates < all.candidates, '过滤必须让候选池收缩，否则它没作用在候选池上')
+    // 池外的卡不得进焦点包。这一半单独断言，因为「池小了」与「包里也干净」
+    // 是两件事：只在装包后过滤会得到同样小的池，却仍可能装进池外的卡。
+    for (const domain of work.domains) {
+      assert.equal(domain, 'work', `焦点包里出现了非 work 域的卡（${domain}），说明过滤没作用到候选池`)
+    }
+  })
+
+  it('--domain 之外的三个 flag 各自筛掉的是不同的卡（不是同一个条件的四种写法）', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const idsOf = (args: string[]): string[] => {
+      const result = runCli(['query', '部署', '--data-dir', dir, '--json', ...args], { now: fixedClock })
+      const payload = JSON.parse(result.stdout) as { matched: Array<{ id: string }> }
+      return payload.matched.map((card) => card.id)
+    }
+    const work = idsOf(['--domain', 'work'])
+    const feeling = idsOf(['--kind', 'feeling'])
+    const algo = idsOf(['--tag', '算法'])
+    assert.notDeepEqual(work, feeling)
+    assert.notDeepEqual(work, algo)
+    assert.notDeepEqual(feeling, algo)
+  })
+
+  it('--since 按 --tz 的时区解释日期（同一个日期串在两个时区结果不同）', () => {
+    // 这是 P1-5 里最容易写错的一处，也是反向验证抓到「假绿」的地方。
+    // `2023-11-01` 在东八区是 1698768000000（UTC 2023-10-31T16:00Z），
+    // 在 UTC 是 1698796800000，差 8 小时；而 fixture 里那张「边界卡」的
+    // 创建时刻 1698780000000 恰好落在这 8 小时中间。
+    //
+    // 于是同一个 `--since 2023-11-01`：东八区 4 张、UTC 3 张。
+    // **两边都非空**很关键——若其中一边是 0，用「空包」也能通过，
+    // 而空包可能只是别的原因（比如查询词没命中），判别力会弱一截。
+    //
+    // 我最初用的是 `--since 2023-11-15`，它给出 3 vs 0：方向对，
+    // 但「UTC 下 0 张」这个结果对「时区算错」和「干脆不过滤」都成立不了，
+    // 却能对「阈值算得太早」成立。换成 11-01 之后，两个数都指向具体实现。
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const count = (tz: string): number => {
+      const result = runCli(
+        ['query', '部署', '--data-dir', dir, '--json', '--since', '2023-11-01', '--tz', tz],
+        { now: fixedClock },
+      )
+      assert.equal(result.code, EXIT_OK, `查询失败：${result.stderr}`)
+      return (JSON.parse(result.stdout) as { matched: unknown[] }).matched.length
+    }
+    const shanghai = count('Asia/Shanghai')
+    const utc = count('UTC')
+    assert.equal(shanghai, 4, '东八区的 11-01 00:00 早于边界卡，边界卡应当保留')
+    assert.equal(utc, 3, 'UTC 的 11-01 00:00 晚于边界卡，边界卡应当被筛掉')
+    assert.notEqual(shanghai, utc, '日期必须按时区解释，否则 --tz 对 --since 毫无作用')
+  })
+
+  it('--since 支持带时刻的写法与毫秒时间戳', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const at = (value: string): number => {
+      const result = runCli(['query', '部署', '--data-dir', dir, '--json', '--since', value, '--tz', TZ], { now: fixedClock })
+      assert.equal(result.code, EXIT_OK, `--since ${value} 失败：${result.stderr}`)
+      return (JSON.parse(result.stdout) as { matched: unknown[] }).matched.length
+    }
+    // 2023-11-15T06:13:20+08:00 恰好是 T0，`since` 是「含」所以同刻写入的三张都在。
+    assert.equal(at('2023-11-15T06:13:20'), 3)
+    // 带秒的写法必须和带分的一致（秒可写可不写，不该改变结果）。
+    assert.equal(at('2023-11-15T06:13:20'), at('2023-11-15T06:13'))
+    // 纯数字按毫秒时间戳直取。
+    assert.equal(at(String(T0)), 3)
+    assert.equal(at(String(T0 + 1000)), 0)
+  })
+
+  it('--since 写错时报用法错误并说清怎么改，而不是静默当成不过滤', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    for (const bad of ['上周', '2024-02-31', '2024-13-01', '2024-03-01T25:00']) {
+      const result = runCli(['query', '部署', '--data-dir', dir, '--since', bad, '--tz', TZ], { now: fixedClock })
+      assert.equal(result.code, EXIT_USAGE, `--since ${bad} 应当报用法错误`)
+      assert.match(result.stderr, /--since/u)
+    }
+  })
+
+  it('过滤后一张都没有时，人读输出要指出可能拼错了域或类型', () => {
+    // 空结果和「库里确实没有」长得一模一样。拼错 `--domain wrok` 会安静地
+    // 返回空，运维于是去查记忆库，而问题在命令行上。这里要求输出自己暴露它。
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const result = runCli(['query', '部署', '--data-dir', dir, '--domain', 'wrok'], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.match(result.stdout, /满足条件的活跃卡 0 张/u)
+    assert.match(result.stdout, /不在内置域里/u)
+    assert.match(result.stdout, /work \/ study \/ life/u)
+  })
+
+  it('人读输出里写明实际生效的过滤条件（运维要能确认 flag 真的被读到了）', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const result = runCli(['query', '部署', '--data-dir', dir, '--domain', 'work', '--tz', TZ], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.match(result.stdout, /过滤：domain=work/u)
+    assert.match(result.stdout, /满足条件的活跃卡 2 张/u)
+  })
+
+  it('不加过滤 flag 时输出里不出现「过滤」行（不制造无关噪声）', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const result = runCli(['query', '部署', '--data-dir', dir, '--tz', TZ], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.doesNotMatch(result.stdout, /过滤：/u)
+    // 配对断言：--json 下也不该凭空多出 matched 字段，
+    // 否则「有 matched 就是过滤生效了」这个判据在调用方那边失效。
+    const json = runCli(['query', '部署', '--data-dir', dir, '--json', '--tz', TZ], { now: fixedClock })
+    assert.equal((JSON.parse(json.stdout) as Record<string, unknown>)['matched'], undefined)
+  })
+
+  it('过滤是只读的：带 flag 查询同样不改库（配对：不带 flag 也不改）', () => {
+    const dir = tempDir()
+    seedFilterStore(dir)
+    const size = (): number => {
+      const files = readdirSync(dir).filter((name) => name.endsWith('.jsonl'))
+      assert.equal(files.length, 1, '本测试假设库里只有一个日志段文件')
+      return statSync(join(dir, files[0] ?? '')).size
+    }
+    const before = size()
+    assert.ok(before > 0, '前提：库里必须已经有日志字节，否则「没变」可能只是库根本没写成功过')
+    runCli(['query', '部署', '--data-dir', dir, '--domain', 'work', '--tz', TZ], { now: fixedClock })
+    assert.equal(size(), before, '带过滤的查询也不得写库')
   })
 })
 

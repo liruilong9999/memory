@@ -15,7 +15,7 @@ export type { AppendOutcome, JournalMode, JournalOptions } from './journal.ts'
 
 export {
   EMPTY_STATE, applyRecord, applyRecordPure, cloneState, countCards, createEmptyState,
-  edgesOf, filterCards, getCard, pruneEdges, rebuildState,
+  edgesOf, filterCards, getCard, matchesFilter, pruneEdges, rebuildState,
 } from './state.ts'
 export type { MemoryFilter, MemoryState } from './state.ts'
 
@@ -26,9 +26,12 @@ export {
 export type { IndexHit, InvertedIndex } from './inverted.ts'
 
 export {
-  EXPORT_FORMAT_VERSION, exportJsonl, exportRecordsJsonl, importJsonl, validateImport,
+  EXPORT_FORMAT_VERSION, exportJsonl, exportRecordsJsonl, importExportDocument, importJsonl,
+  parseExportFile, validateImport,
 } from './export.ts'
-export type { ExportHeader, ExportLine, ExportLineKind, ImportResult } from './export.ts'
+export type {
+  ExportFileFormat, ExportHeader, ExportLine, ExportLineKind, ImportResult, ParsedExportFile,
+} from './export.ts'
 
 export { MemoryStore, cardIdFor, deriveIdempotencyKey, openStore } from './store.ts'
 export type { StoreOptions, WriteResult } from './store.ts'

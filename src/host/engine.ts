@@ -27,6 +27,8 @@ import { normalizeText } from '../core/text.ts'
 import { join } from 'node:path'
 import { runConsolidation } from '../consolidate/nightly.ts'
 import { readLastConsolidationAt, writeLastConsolidationAt } from '../store/meta.ts'
+import { matchesFilter } from '../store/state.ts'
+import type { MemoryFilter } from '../store/state.ts'
 import type { MemoryStore } from '../store/store.ts'
 import {
   buildTimeState, localDate as formatLocalDate, pickDue, renderTimeContext,
@@ -256,10 +258,13 @@ export class MemoryEngine {
    * @param queryText - 查询文本。
    * @param goalText - 当前目标文本，可选。
    * @param at - 查询时刻；省略时取当前时钟。
+   * @param filter - 候选池过滤条件（CLI 的 `--domain` / `--kind` / `--tag` / `--since`）。
    * @returns 召回结果。
    */
-  peek(queryText: string, goalText = '', at = this.clock()): RecallResult {
-    return this.buildRecall(at, makeQuery(queryText, this.config, at, goalText))
+  peek(
+    queryText: string, goalText = '', at = this.clock(), filter: MemoryFilter = {},
+  ): RecallResult {
+    return this.buildRecall(at, makeQuery(queryText, this.config, at, goalText), filter)
   }
 
   /**
@@ -342,23 +347,34 @@ export class MemoryEngine {
    * @param queryText - 查询文本（仅用于回填焦点包）。
    * @param at - 查询时刻。
    * @param query - 已构造的查询上下文。
+   * @param filter - 候选池过滤条件；省略表示不过滤。
    * @returns 召回结果。
    */
-  private buildRecall(at: number, query: RecallQuery): RecallResult {
+  private buildRecall(
+    at: number, query: RecallQuery, filter: MemoryFilter = {},
+  ): RecallResult {
     // 候选池：倒排命中 + 已到期事项 + 钉住的承诺，保证「该想起的不会因为检索没命中而漏掉」。
+    //
+    // 三路都过同一个 `matchesFilter`：过滤条件是**用户显式要的**，必须作用在
+    // 候选池上，否则 `--domain work` 会把生活域的钉住卡也塞进焦点包，
+    // 而用户看到的解释行里没有任何提示（分数构成不体现「被过滤」）。
+    //
+    // 注意不能改成「装包之后再筛」：装包会按预算裁卡，先装后筛等于让被过滤的卡
+    // 先占掉预算、再把它们扔掉——结果既不是「只保留 work」，也不是「全部卡」，
+    // 而是「work 里恰好挤进预算的那几张」，取决于被过滤卡的数量，无法解释。
     const hitIds = new Set(this.store.search(query.tokens).map((hit) => hit.id))
     const cards: MemoryCard[] = []
     for (const id of hitIds) {
       const card = this.store.getCard(id)
-      if (card !== undefined && card.status === 'active') cards.push(card)
+      if (card !== undefined && card.status === 'active' && matchesFilter(card, filter)) cards.push(card)
     }
     const due = pickDue(this.store.listCards({ status: 'active' }), at)
     for (const card of due) {
-      if (!hitIds.has(card.id)) cards.push(card)
+      if (!hitIds.has(card.id) && matchesFilter(card, filter)) cards.push(card)
     }
     // 再补上钉住的卡：承诺与核心事实不能因为检索没命中就消失（FR-C3 的精神）。
     for (const card of this.store.listCards({ status: 'active', pinned: true })) {
-      if (!cards.some((c) => c.id === card.id)) cards.push(card)
+      if (!cards.some((c) => c.id === card.id) && matchesFilter(card, filter)) cards.push(card)
     }
 
     // 传入全部边：扩散激活（FR-G1）需要看到整个图谱才能沿边传播。

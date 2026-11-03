@@ -32,6 +32,7 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let dataDir: string | undefined
   let timeZone: string | undefined
   let out: string | undefined
+  let input: string | undefined
   let json = false
   let verbose = false
   let includeArchived = false
@@ -39,6 +40,10 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
   let days = 7
   let reason = ''
   let clear = false
+  let domain: string | undefined
+  let kind: string | undefined
+  let tag: string | undefined
+  let since: string | undefined
   let helpRequested = false
   let onlyPositionals = false
   let index = 0
@@ -119,13 +124,27 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       days = parsed
       continue
     }
-    if (name === '--data-dir' || name === '--tz' || name === '--out' || name === '--reason') {
+    if (name === '--data-dir' || name === '--tz' || name === '--out' || name === '--reason'
+      || name === '--in') {
       const value = takeValue(name, inline)
       if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
       if (name === '--data-dir') dataDir = value
       else if (name === '--tz') timeZone = value
       else if (name === '--reason') reason = value
+      else if (name === '--in') input = value
       else out = value
+      continue
+    }
+    // `query` 的四个过滤 flag（FR-F2）。取值原样保留，语义由数据面
+    // `MemoryFilter` 定义——这里**不做**第二套判据，否则同一个「域」
+    // 会有两处解释，而两处解释迟早会漂移（缺陷二十五的形状）。
+    if (name === '--domain' || name === '--kind' || name === '--tag' || name === '--since') {
+      const value = takeValue(name, inline)
+      if (value === undefined) return { ok: false, message: `选项 ${name} 缺少取值` }
+      if (name === '--domain') domain = value
+      else if (name === '--kind') kind = value
+      else if (name === '--tag') tag = value
+      else since = value
       continue
     }
     return { ok: false, message: `未知选项「${name}」` }
@@ -136,7 +155,8 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     return {
       ok: true,
       options: {
-        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days, clear,
+        command: 'help', positionals: [], dataDir, timeZone, json, verbose, out, input, includeArchived,
+        reason, limit, days, clear, domain, kind, tag, since,
       },
     }
   }
@@ -148,7 +168,8 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
     options: {
       command: first,
       positionals: positionals.slice(1),
-      dataDir, timeZone, json, verbose, out, includeArchived, reason, limit, days, clear,
+      dataDir, timeZone, json, verbose, out, input, includeArchived, reason, limit, days, clear,
+      domain, kind, tag, since,
     },
   }
 }

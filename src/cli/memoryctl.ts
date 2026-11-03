@@ -51,6 +51,7 @@ import type { MemoryStore } from '../store/store.ts'
 import { isValidTimeZone, parseArgs, resolveTimeZone } from './args.ts'
 import { runConfig } from './commands/config.ts'
 import { runExport } from './commands/export.ts'
+import { runImport } from './commands/import.ts'
 import { runRebuild, runConsolidate, runRestore, runRevise } from './commands/mutate.ts'
 import { runHealth, runLogs, runReport } from './commands/observe.ts'
 import { runQuery } from './commands/query.ts'
@@ -176,10 +177,13 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
     })
     switch (options.command) {
       case 'query':
-        result = runQuery(options, engine)
+        result = runQuery(options, engine, timeZone)
         break
       case 'export':
         result = runExport(options, store, engine, clock())
+        break
+      case 'import':
+        result = runImport(options, store)
         break
       case 'rebuild':
         result = runRebuild(options, engine)

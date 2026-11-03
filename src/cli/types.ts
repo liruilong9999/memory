@@ -38,7 +38,8 @@ export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
 export const COMMANDS = [
-  'query', 'export', 'rebuild', 'health', 'consolidate', 'restore', 'revise', 'logs', 'report', 'config', 'help',
+  'query', 'export', 'import', 'rebuild', 'health', 'consolidate', 'restore', 'revise',
+  'logs', 'report', 'config', 'help',
 ] as const
 
 /** 子命令名。 */
@@ -65,8 +66,36 @@ export interface CliOptions {
   readonly verbose: boolean
   /** `export` 的输出文件；省略时写 stdout。 */
   readonly out: string | undefined
+  /**
+   * `import` 的输入文件（`--in`）。
+   *
+   * 与位置参数二选一，位置参数优先。两条路都留着是因为
+   * `import backup.json` 是自然写法，而脚本里拼路径时 `--in` 更省心。
+   */
+  readonly input: string | undefined
   /** `export` 是否连归档卡一起导出。 */
   readonly includeArchived: boolean
+
+  /**
+   * `query` 的记忆域过滤（`work` / `study` / `life`）。
+   *
+   * 原样保留用户输入而不在这里校验取值：合法值由配置决定
+   * （`extraction.domains` 可被 patch 扩展），CLI 侧硬编码白名单
+   * 会在用户加了自定义域之后拒绝一个**实际有效**的值。
+   */
+  readonly domain: string | undefined
+  /** `query` 的卡片类型过滤。 */
+  readonly kind: string | undefined
+  /** `query` 的标签过滤（必须包含该标签）。 */
+  readonly tag: string | undefined
+  /**
+   * `query` 的起始时刻过滤，**保留用户原始写法**。
+   *
+   * 不在这里转成毫秒：`--since 2024-01-01` 的「那一天」由时区定义，
+   * 而时区要到 `resolveTimeZone` 之后才知道，且 `--tz` 可能写在
+   * `--since` 后面。在这里先按某个时区猜一次，等于给静默错误发通行证。
+   */
+  readonly since: string | undefined
 
   /** `revise` 的修正原因（FR-A5：要能回答「为什么改」）。 */
   readonly reason: string
