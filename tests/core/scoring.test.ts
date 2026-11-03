@@ -412,12 +412,132 @@ test('applyThresholds 阈值刻度不随「是否提供目标」漂移（分母�
   assert.ok(withGoal.score.total >= noGoal.score.total)
 })
 
-test('applyThresholds 不超过 maxCards', () => {
+test('applyThresholds 硬上限精确截到 maxCards 条（不是「不超过」）', () => {
+  // 这条原来是 `assert.ok(... <= config.recall.maxCards)`，**是无牙断言**：
+  // 实测就是 7 = maxCards，余量为 0，但写成 `<=` 之后，把 `maxCards` 改成
+  // 100、或让硬上限那道闸失效（只剩两道内容闸），它照样绿。
+  // 20 张内容完全相同的卡全部命中查询，所以三道闸里只有硬上限在起作用
+  // ——这正是隔离硬上限的语料。
   const now = 1_700_000_000_000
   const query = makeQuery('Qt5 项目', config, now)
   const cards = Array.from({ length: 20 }, (_, i) => makeCard({ id: `c${i}`, createdAt: now }))
   const scored = scoreCards(cards, query, config)
-  assert.ok(applyThresholds(scored, config).length <= config.recall.maxCards)
+  // 前提：候选确实多于上限，否则「截到 7」可能只是恰好只有 7 张
+  assert.ok(
+    scored.length > config.recall.maxCards,
+    `前提：候选 ${scored.length} 条必须多于上限 ${config.recall.maxCards}，否则截断无从发生`,
+  )
+  const picked = applyThresholds(scored, config)
+  assert.equal(
+    picked.length, config.recall.maxCards,
+    `硬上限必须**精确**截到 ${config.recall.maxCards} 条，实际 ${picked.length}。`
+    + '若这条红了，可能是硬上限失效（截多了）或内容闸误伤（截少了）',
+  )
+})
+
+test('三道闸各挡各的：绝对闸按 relevance、相对闸按 total、硬上限按条数', () => {
+  // FR-B2 原文是「绝对阈值 + 相对 top 值阈值；硬上限 7 条」，三者取**最严**。
+  // 但「取最严」这句话很容易写成一个闸，而三道闸其实问三个不同的问题：
+  //
+  //   绝对闸 → relevance（有没有关系）     —— 无关卡 relevance 精确为 0
+  //   相对闸 → total（比本轮最好的差多少） —— 过时卡 total 掉下去
+  //   硬上限 → 条数
+  //
+  // 缺陷二十六修完之后绝对闸换了尺子，而**相对闸仍留在 total 上**（有意的，
+  // 见 applyThresholds 的注释：统一尺子会误杀真相关卡）。所以必须有一条用例
+  // 同时证明「三道闸各自能挡」，否则任一闸恒真都不会被发现。
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目 构建', config, now)
+
+  // 三张卡，各自只该被一道闸挡住：
+  //   hit          —— 三道闸全过
+  //   unrelated    —— relevance 为 0，只该被绝对闸挡（它的 total 其实不低）
+  //   stale        —— relevance 高，但一年前的卡 total 掉到相对闸以下
+  const cards = [
+    makeCard({ id: 'hit', text: 'Qt5 项目 构建 用 cmake', normalized: 'qt5 项目 构建 用 cmake' }),
+    makeCard({
+      id: 'unrelated',
+      text: '深海鮟鱇鱼 的 发光 器官',
+      normalized: '深海鮟鱇鱼 的 发光 器官',
+      salience: 1,
+      confidence: 1,
+    }),
+    makeCard({
+      id: 'stale',
+      text: 'Qt5 项目 构建 相关',
+      normalized: 'qt5 项目 构建 相关',
+      salience: 0.01,
+      confidence: 0.05,
+      createdAt: now - 400 * 86_400_000,
+      updatedAt: now - 400 * 86_400_000,
+    }),
+  ]
+  const scored = scoreCards(cards, query, config)
+  const top = scored[0]
+  assert.ok(top !== undefined, '前提：必须至少有一张卡被打分')
+  const relativeFloor = top.score.total * config.recall.relativeThreshold
+
+  const byId = new Map(scored.map((item) => [item.card.id, item]))
+  const unrelated = byId.get('unrelated')
+  const stale = byId.get('stale')
+  assert.ok(unrelated !== undefined && stale !== undefined, '前提：三张卡都必须进入候选')
+
+  // 前提断言：证明这两张卡确实是「被各自的闸」挡住，而不是因为别的原因没进包
+  assert.equal(
+    unrelated.score.relevance, 0,
+    '前提：无关卡的 relevance 必须精确为 0（零词项交集），否则它可能是被相对闸挡的',
+  )
+  assert.ok(
+    unrelated.score.total >= relativeFloor,
+    `前提：无关卡的 total ${unrelated.score.total.toFixed(4)} 必须 >= 相对闸 ${relativeFloor.toFixed(4)}，`
+    + '这样才能证明挡住它的是绝对闸而不是相对闸',
+  )
+  assert.ok(
+    stale.score.relevance >= config.recall.absoluteThreshold,
+    `前提：过时卡的 relevance ${stale.score.relevance.toFixed(4)} 必须 >= 绝对闸 ${config.recall.absoluteThreshold}，`
+    + '这样才能证明挡住它的是相对闸而不是绝对闸',
+  )
+  assert.ok(
+    stale.score.total < relativeFloor,
+    `前提：过时卡的 total ${stale.score.total.toFixed(4)} 必须 < 相对闸 ${relativeFloor.toFixed(4)}`,
+  )
+
+  const picked = applyThresholds(scored, config)
+  assert.deepEqual(
+    picked.map((item) => item.card.id),
+    ['hit'],
+    '只有三道闸全过的卡能进包：无关卡被绝对闸挡、过时卡被相对闸挡',
+  )
+})
+
+test('硬上限与内容闸同时生效时，取更严的那个（内容闸先挡掉一部分）', () => {
+  // 上一条证明三道闸各挡各的，这一条证明它们**组合**时不会互相抵消。
+  // 语料：2 张强相关卡 + 18 张弱相关卡，弱相关卡的 relevance 过绝对闸
+  // 但 total 低于相对闸 => 内容闸先挡掉 18 张，硬上限只剩 2 张可选。
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目 构建', config, now)
+  const strong = [
+    makeCard({ id: 'strong-a', text: 'Qt5 项目 构建 用 cmake', normalized: 'qt5 项目 构建 用 cmake' }),
+    makeCard({ id: 'strong-b', text: 'Qt5 项目 构建 用 qmake', normalized: 'qt5 项目 构建 用 qmake' }),
+  ]
+  const weak = Array.from({ length: 18 }, (_, i) => makeCard({
+    id: `weak-${i}`,
+    text: 'Qt5 项目 构建 相关',
+    normalized: 'qt5 项目 构建 相关',
+    salience: 0.01,
+    confidence: 0.05,
+    createdAt: now - 400 * 86_400_000,
+    updatedAt: now - 400 * 86_400_000,
+  }))
+  const scored = scoreCards([...strong, ...weak], query, config)
+  assert.ok(scored.length > config.recall.maxCards, '前提：候选必须多于硬上限')
+  const picked = applyThresholds(scored, config)
+  assert.equal(
+    picked.length, 2,
+    `内容闸先挡掉 18 张弱相关卡后只剩 2 张，实际进了 ${picked.length} 张。`
+    + '若等于 maxCards(7)，说明相对闸没在挡，硬上限把弱卡放进来了',
+  )
+  assert.deepEqual(picked.map((item) => item.card.id).sort(), ['strong-a', 'strong-b'])
 })
 
 test('buildFocusPack 空候选产出空包且带说明', () => {
