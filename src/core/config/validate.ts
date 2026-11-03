@@ -57,6 +57,13 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (!Number.isInteger(config.graph.topicNeighbors) || config.graph.topicNeighbors < 0) {
     errors.push('graph.topicNeighbors 必须是 ≥ 0 的整数')
   }
+  // `same-entity` 的度数上限（P2-9）。与 `topicNeighbors` 同一口径：
+  // 0 是合法的（表示不建 entity 边），负数与非整数不是——
+  // 负数会让度数检查 `degree >= k` 恒真（一条边都产不出来，看起来像「关掉了」
+  // 但其实是一个错值），非整数会让上界不是一个可解释的度数。
+  if (!Number.isInteger(config.graph.entityNeighbors) || config.graph.entityNeighbors < 0) {
+    errors.push('graph.entityNeighbors 必须是 ≥ 0 的整数')
+  }
 
   if (config.extraction.domains.length === 0) errors.push('extraction.domains 不能为空')
   if (config.extraction.maxCardsPerTurn < 0) errors.push('extraction.maxCardsPerTurn 不能为负')

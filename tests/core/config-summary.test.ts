@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=14',
+  'configVersion=15',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -171,6 +171,10 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'forgetting.neverArchiveKinds[1]=promise',
   'forgetting.neverArchiveKinds[2]=concept',
   'forgetting.neverArchiveKinds[3]=experience',
+  // 注意：这个数组必须是**排序后**的（`leaves` 走了 `.sort()`）。
+  // `graph.entityNeighbors` 按字典序排在 `graph.topicFloor` **之前**
+  // （'e' < 't'），插在 topicNeighbors 之后会直接红。
+  'graph.entityNeighbors=8',
   'graph.topicFloor=0.08',
   'graph.topicNeighbors=3',
   'recall.absoluteThreshold=0.06',
@@ -251,7 +255,15 @@ describe('摘要配置的默认值与版本', () => {
     //       0.05 配 `decayFactor=0.98` 的均衡点是 `n × 2.45`，`n=1` 就撞上限，
     //       边权分不出使用频率。改默认值必须递增版本——旧快照里写着 0.05 的人
     //       回滚回来会得到一个「全部等强」的图谱。
-    assert.equal(MEMORY_CONFIG_VERSION, 14, '可塑性参数分辨率修正后版本应为 14')
+    //  15 → **新增** graph.entityNeighbors（P2-9）：same-entity 边此前无度数上限，
+    //       生产 5000 卡实测 122500 条 entity 边 / 130000 条总边 / 3621 ms，
+    //       违反 P8「耗时可控」。默认 8 让现有小规模语料的**边集合**不变
+    //       （实体度数普遍远低于 8，上限只在密集实体簇上生效）；
+    //       **但边数组顺序会变**——实体边改成全局候选排序后贪心挑选。
+    //       别把「集合不变」写成「逐位不变」，那是探针一测就破的假话。
+    //       不递增版本的后果：旧快照里没有这个字段，回滚回来会得到一个
+    //       「entity 边无上限」的图谱，P7 参数可版本化被静默破坏。
+    assert.equal(MEMORY_CONFIG_VERSION, 15, '新增 graph.entityNeighbors 后版本应为 15')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
@@ -423,5 +435,35 @@ describe('mergeConfig 对新增字段的深合并', () => {
     const before = DEFAULT_CONFIG.consolidation.summaryEnabled
     merged.consolidation.summaryEnabled = !before
     assert.equal(DEFAULT_CONFIG.consolidation.summaryEnabled, before, '默认配置必须未被污染')
+  })
+})
+
+describe('图谱 entityNeighbors 的配置层守门（P2-9）', () => {
+  it('负数被拒绝（会让度数检查恒真，看起来像「关掉了」）', () => {
+    expectOneError({ graph: { entityNeighbors: -1 } }, 'graph.entityNeighbors')
+  })
+
+  it('非整数被拒绝（上界不是一个可解释的度数）', () => {
+    expectOneError({ graph: { entityNeighbors: 2.5 } }, 'graph.entityNeighbors')
+  })
+
+  it('0 是合法值（表示不建 entity 边，与 topicNeighbors = 0 同语义）', () => {
+    const result = validateConfig(mergeConfig(DEFAULT_CONFIG, { graph: { entityNeighbors: 0 } }))
+    assert.equal(result.ok, true, `0 应当合法，实际错误：${result.errors.join(' | ')}`)
+  })
+
+  it('默认值 8 通过校验，且与 topicNeighbors 是两项独立的上限', () => {
+    const result = validateConfig(mergeConfig(DEFAULT_CONFIG))
+    assert.equal(result.ok, true)
+    assert.equal(DEFAULT_CONFIG.graph.entityNeighbors, 8)
+    assert.equal(DEFAULT_CONFIG.graph.topicNeighbors, 3)
+    // 诚实边界：单卡总度数上界是两项之和，不是任何单一数字。
+    // 这条断言把「上界 = 11」写成可执行的判据，防止后来者把
+    // 「实测最大度数 8」误当成配置上界。
+    assert.equal(
+      DEFAULT_CONFIG.graph.entityNeighbors + DEFAULT_CONFIG.graph.topicNeighbors,
+      11,
+      '单卡总度数上界应是 entityNeighbors + topicNeighbors = 11',
+    )
   })
 })

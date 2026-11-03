@@ -11,7 +11,7 @@ import type { MemoryConfig } from './types.ts'
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 14,
+  configVersion: 15,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -143,6 +143,24 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     // 取 3 而不是 5：K=5 让孤立卡降到 11 张，但边数翻到 745、
     // 精确率反而从 57.5% 降到 55.7%——多出来的边主要是噪声。
     topicNeighbors: 3,
+    // entityNeighbors = 8（P2-9）。加它之前 `same-entity` 没有任何度数上限，
+    // 全量两两连边：实测 5000 张卡 → 122500 条 entity 边 / 130000 条总边 / 3621 ms，
+    // 违反 P8「耗时可控」。
+    //
+    // 取 8 而不是 3：`same-entity` 是「跨层次关联」的主通道（实体天然跨域、
+    // 跨类型），比话题边更重要；而且 8 足以让现有小规模语料的**边集合不变**——
+    // 上限只在密集实体簇上才生效。取 3 会立刻改变已有语料的图谱形状。
+    //
+    // 注意「集合不变」不等于「逐位不变」：本字段引入的同时，实体边改成
+    // 「全局候选排序后贪心挑选」，产出顺序变成按 `(权重, from, to)` 排序。
+    // 探针实测 36 组稀疏语料**顺序全部改变、集合全部相同**。顺序不影响语义
+    // （边是集合语义、id 由 `buildEdgeId` 派生），但「逐位不变」是句假话。
+    // 详见 `types.ts` 的 `entityNeighbors` 注释。
+    //
+    // 单卡总度数上界 = entityNeighbors + topicNeighbors（默认 11），
+    // 不是任何单一数字。`topicNeighbors` 注释里的「实测最大度数 8」是
+    // 300 卡语料的**观测值**，与配置上界不是同一件事。
+    entityNeighbors: 8,
   },
   spread: {
     // 默认 `'shadow'`：**计算但不生效**。
@@ -184,4 +202,4 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 14
+export const MEMORY_CONFIG_VERSION = 15

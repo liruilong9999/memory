@@ -96,45 +96,123 @@ export function buildEdges(
   const keysById = new Map<string, Set<string>>()
   for (const card of pool) keysById.set(card.id, entityKeysOf(card))
 
-  // 一、实体锚点索引：实体键 → 持有该实体的卡 id 列表。
-  const byEntity = new Map<string, string[]>()
-  for (const card of pool) {
-    const keys = keysById.get(card.id)
-    if (keys === undefined) continue
-    for (const key of keys) {
-      const holders = byEntity.get(key)
-      if (holders === undefined) byEntity.set(key, [card.id])
-      else holders.push(card.id)
-    }
-  }
-
-  // 二、按「卡对」聚合共享实体。
-  const pairs = new Map<string, { from: string; to: string; shared: number }>()
-  for (const holders of byEntity.values()) {
-    if (holders.length < 2) continue
-    for (let i = 0; i < holders.length; i += 1) {
-      const from = holders[i]
-      if (from === undefined) continue
-      for (let j = i + 1; j < holders.length; j += 1) {
-        const to = holders[j]
-        if (to === undefined || to === from) continue
-        const pairKey = from < to ? `${from}\u0003${to}` : `${to}\u0003${from}`
-        const existing = pairs.get(pairKey)
-        if (existing === undefined) pairs.set(pairKey, { from, to, shared: 1 })
-        else existing.shared += 1
+  // 一、实体边：双向度数上限 + 贪心取边（P2-9）。
+  //
+  // 加这个上限之前，`same-entity` 是**全量两两连边**：共享同一实体的卡互相连满，
+  // 边数 O(n²)。实测生产 5000 张卡 → 122500 条 entity 边、130000 条总边、
+  // 3621 ms，违反 P8「耗时可控」。
+  //
+  // 现在边数上界是 **`n × entityNeighbors / 2`**（双向计数：每条边同时占用
+  // 两端的额度，所以是 n×K 的一半，不是 n×K）。这个 /2 不能漏写——
+  // 写成 `n × entityNeighbors` 会让审计者按 40000 去核对实测 19990，
+  // 误判成「实现只做到一半」。
+  //
+  // **诚实边界一：上限约束的是「边数」，不是「候选计算量」。** 候选对仍然要
+  // 按实体桶两两枚举，所以计算量仍是 O(Σ|桶|²)，耗时仍随 n² 增长。
+  // 同规模对照实测（单个高频实体桶，全部卡共享同一实体，话题边关断）：
+  //
+  //   n= 500：边 124750 → 1990，耗时 216 ms →  58 ms（3.7x）
+  //   n=1000：边 499500 → 3996，耗时 873 ms → 145 ms（6.0x）
+  //   n=2000：边 1999000 → 7993，耗时 4749 ms → 842 ms（5.6x）
+  //
+  // 所以上限**确实**把耗时降下来了（同规模 4~6 倍），但**没有**把它变成线性：
+  // K=8 下 n 从 1000 到 5000，耗时 231 → 9842 ms，仍是平方级。
+  // 换句话说：P2-9 修的是「图谱被撑爆」，耗时只是顺带改善，**不是根治**。
+  // 要真正降耗时，必须限制桶大小或改成分桶采样，那是另一件事，本轮没做。
+  // （写这段时踩过一次：第一版对比用的是「n=2000 无上限 5200 ms」对
+  //  「n=5000 有上限 9627 ms」，跨了规模，得出「加了上限反而更慢」的假结论。
+  //  同一张表里两个数字必须同规模，否则它证明的是规模差异，不是上限效果。）
+  //
+  // **诚实边界二：产出顺序变了。** 改成「全局候选排序后贪心」之后，边数组
+  // 的顺序变成按 `(权重, from, to)` 排序；旧实现是按实体桶顺序产出。
+  // 探针实测 36 组稀疏语料**顺序全部改变、集合全部相同**（默认 K=8 时
+  // 度数 ≤ 8 的卡一条边都不会被砍）。边是集合语义、id 由 `buildEdgeId`
+  // 派生、唯一消费者 `nightly.ts` 只按 id 过滤，所以顺序不影响结果——
+  // 但「默认值不改变任何东西」是句假话，别这么写。
+  //
+  // `entityNeighbors > 0` 是**性能短路**，与下面 `topicNeighbors` 的 `k > 0`
+  // 同一口径：0 表示不建 entity 边，此时度数检查 `0 >= 0` 恒真、一条边也产不出来，
+  // 保留判断是为了跳过 O(n²) 的候选计算。语义上「0 = 关断」而不是「0 = 未定义」。
+  //
+  // 短路必须**包住整个候选计算**（实体索引 + 卡对聚合 + 挑选），而不只是
+  // 包住挑选那一步：真正的 O(n²) 在「按实体桶做两两聚合」那一层——一个
+  // 5000 卡的实体桶要枚举 C(5000,2) = **12497500** 个卡对。只短路挑选那一步
+  // 的话，配成 0 仍然会跑满 O(n²)，「关断能省时间」就是一句假话。
+  // （这里原写「122500 个卡对」，是把**全库边数**误抄成了**单桶卡对数**，
+  //  两个数量级差 100 倍；实测 n=5000 全量边数 122500 是另一个量。）
+  const entityK = config.graph.entityNeighbors
+  if (entityK > 0) {
+    // 二、实体锚点索引：实体键 → 持有该实体的卡 id 列表。
+    const byEntity = new Map<string, string[]>()
+    for (const card of pool) {
+      const keys = keysById.get(card.id)
+      if (keys === undefined) continue
+      for (const key of keys) {
+        const holders = byEntity.get(key)
+        if (holders === undefined) byEntity.set(key, [card.id])
+        else holders.push(card.id)
       }
     }
-  }
-  for (const pair of pairs.values()) {
-    // 重合度 = 共享实体数 / 双方实体并集大小，而 |A ∪ B| = |A| + |B| − |A ∩ B|。
-    const sizeFrom = keysById.get(pair.from)?.size ?? 0
-    const sizeTo = keysById.get(pair.to)?.size ?? 0
-    const unionSize = sizeFrom + sizeTo - pair.shared
-    const weight = unionSize <= 0 ? 0 : pair.shared / unionSize
-    push(makeEdge(pair.from, pair.to, 'same-entity', weight, now))
+
+    // 三、按「卡对」聚合共享实体。
+    const pairs = new Map<string, { from: string; to: string; shared: number }>()
+    for (const holders of byEntity.values()) {
+      if (holders.length < 2) continue
+      for (let i = 0; i < holders.length; i += 1) {
+        const from = holders[i]
+        if (from === undefined) continue
+        for (let j = i + 1; j < holders.length; j += 1) {
+          const to = holders[j]
+          if (to === undefined || to === from) continue
+          const pairKey = from < to ? `${from}\u0003${to}` : `${to}\u0003${from}`
+          const existing = pairs.get(pairKey)
+          if (existing === undefined) pairs.set(pairKey, { from, to, shared: 1 })
+          else existing.shared += 1
+        }
+      }
+    }
+
+    // 先算出全部候选对，再统一挑选——理由与话题边相同：下面要按「双方度数
+    // 都还有余量」的顺序贪心取边，而不是按单向分数。
+    const candidates: { from: string; to: string; weight: number }[] = []
+    for (const pair of pairs.values()) {
+      // 重合度 = 共享实体数 / 双方实体并集大小，而 |A ∪ B| = |A| + |B| − |A ∩ B|。
+      const sizeFrom = keysById.get(pair.from)?.size ?? 0
+      const sizeTo = keysById.get(pair.to)?.size ?? 0
+      const unionSize = sizeFrom + sizeTo - pair.shared
+      const weight = unionSize <= 0 ? 0 : pair.shared / unionSize
+      candidates.push({ from: pair.from, to: pair.to, weight })
+    }
+    // 排序键必须完全确定：权重降序，同权重按 (from, to) 升序。
+    // 只按分数排会让同权对的取舍依赖数组顺序，破坏 ST-1 确定性——
+    // 而 entity 边**比话题边更容易同权**：共享单个实体的卡对权重恒为
+    // `1 / (|A| + |B| − 1)`，一簇大小相同的卡会产出一大批完全相同的权重。
+    // 所以这个次级排序键在这里不是「保险」，是主要判据。
+    candidates.sort((x, y) => {
+      if (x.weight !== y.weight) return y.weight - x.weight
+      if (x.from !== y.from) return x.from < y.from ? -1 : 1
+      return x.to < y.to ? -1 : x.to > y.to ? 1 : 0
+    })
+    // 贪心取边，**两个端点各自都受 `entityNeighbors` 约束**。
+    //
+    // 为什么必须双向计数（与 `topicNeighbors` 同因）：配置名承诺的是「每张卡
+    // 最多连几条」，而用户看到的度数是**入度 + 出度**。只限制单向时，一张卡
+    // 可以自己选 K 个邻居、又被 K 个别人选中，度数到 2K，配置名就成了谎话。
+    //
+    // 诚实边界：两条边是正交语义轴，同一对卡可能既有 entity 边又有 topic 边，
+    // 所以单卡**总**度数上界是 `entityNeighbors + topicNeighbors`，不是 8。
+    const degree = new Map<string, number>()
+    for (const candidate of candidates) {
+      const fromDeg = degree.get(candidate.from) ?? 0
+      const toDeg = degree.get(candidate.to) ?? 0
+      if (fromDeg >= entityK || toDeg >= entityK) continue
+      degree.set(candidate.from, fromDeg + 1)
+      degree.set(candidate.to, toDeg + 1)
+      push(makeEdge(candidate.from, candidate.to, 'same-entity', candidate.weight, now))
+    }
   }
 
-  // 三、话题边：k 近邻 + 绝对下限。
+  // 四、话题边：k 近邻 + 绝对下限。
   //
   // 原先是「相似度落在 [relatedSimilarity, duplicateSimilarity) 之间就连边」，
   // 即纯绝对阈值。两个问题：
