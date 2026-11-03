@@ -17,7 +17,8 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  bucketByTheme, distillFeelings, feelingToCard, hasFeelingSignal,
+  bucketByTheme, DISTILL_EVENT_TYPE, DISTILL_SESSION_ID, distillFeelings,
+  feelingToCard, hasFeelingSignal, isDistilledCard,
 } from '../../src/core/distill.ts'
 import { distillEdges } from '../../src/core/graph.ts'
 import { runConsolidation } from '../../src/consolidate/nightly.ts'
@@ -72,10 +73,29 @@ describe('hasFeelingSignal：什么算「有感受」', () => {
     assert.equal(hasFeelingSignal(merged, config), false)
   })
 
-  it('感受卡本身不参与再蒸馏（防止自激循环）', () => {
+  it('派生的感受卡不参与再蒸馏（防止自激循环）', () => {
+    // 这条测试**改过断言**，原断言是 `{ kind: 'feeling' }` → false。
+    // 那个断言把缺陷写成了契约：判据用的是 `kind` 标签，而 `kind` 是
+    // 分类器给的、会被改动的东西；注释承诺的却是「感受卡本身」。
+    // 修好情绪通道后真实情绪句几乎都被判成 `feeling`（缺陷二十八），
+    // 于是**原话卡**被这条规则一并排除，蒸馏候选集又空了（缺陷三十）。
+    //
+    // 正确判据是「是不是蒸馏产物」，在数据层可见：`source.sessionId === 'distill'`。
     const config = makeConfig()
-    const feeling = emotionalCard('f', T0, 0.9, { kind: 'feeling' })
-    assert.equal(hasFeelingSignal(feeling, config), false)
+    const derived = makeCard({
+      id: 'f', kind: 'feeling', emotional: 0.9,
+      createdAt: T0, updatedAt: T0,
+      source: { sessionId: DISTILL_SESSION_ID, turn: 0, step: 0, seq: 1, eventType: DISTILL_EVENT_TYPE },
+    })
+    assert.equal(hasFeelingSignal(derived, config), false)
+
+    // 配对反向对照：**原话**的 feeling 卡必须仍然参与蒸馏。
+    // 只测「派生卡被排除」是半个测试——把所有 feeling 都排除也能让它绿。
+    const original = emotionalCard('o', T0, 0.9, { kind: 'feeling' })
+    assert.equal(
+      hasFeelingSignal(original, config), true,
+      '原话的 feeling 卡必须参与蒸馏，否则修好情绪通道后蒸馏又变成空转',
+    )
   })
 })
 
@@ -342,5 +362,122 @@ describe('诚实性：这是规则版，不是语义理解', () => {
       text: '考试没过', entities: ['考试'],
     })
     assert.equal(distillFeelings([one, two], config).length, 0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 缺陷二十九 / 三十：蒸馏在真实语料上恒为空
+//
+// 这两个缺陷和缺陷二十八**互相独立**，而且方向相反地掩盖了对方：
+//   缺陷二十八：情绪句写不进来  ⇒ 蒸馏没有原料
+//   缺陷二十九：主题词取错了粒度 ⇒ 桶数恒为 0
+//   缺陷三十：判据用 kind 标签 ⇒ 修好二十八之后原料又被排除
+//
+// 三者叠加的观测结果完全一样：`distilled = 0`。
+// 所以「修好一处就以为蒸馏会动」是错的——**三个零长得一模一样**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('themeTerms：主题词必须是词项，不是整句（缺陷二十九）', () => {
+  it('无实体的卡按分词取主题，不按空格切整句', () => {
+    // normalizeText 把标点全换成空格，于是 `normalized.split(' ')` 切出来的
+    // 是整段长句。两张不同的情绪卡之间几乎不可能共享整段长句，
+    // 桶数因此恒为 0，蒸馏恒为空——而它只是一个安静的 0。
+    const config = makeConfig()
+    const a = makeCard({
+      id: 'a', kind: 'feeling', emotional: 0.8, createdAt: T0, updatedAt: T0,
+      text: '这个报错又出现了，压力很大',
+      normalized: '这个报错又出现了 压力很大',
+      entities: [],
+    })
+    const b = makeCard({
+      id: 'b', kind: 'feeling', emotional: 0.7, createdAt: T0 + 1000, updatedAt: T0 + 1000,
+      text: '还是那个报错，真的很烦',
+      normalized: '还是那个报错 真的很烦',
+      entities: [],
+    })
+    const buckets = bucketByTheme([a, b], config)
+    assert.ok(buckets.length > 0, '两张共享「报错」的卡必须能聚成桶')
+    // 前提：主题词必须是**词项**而不是整句。整句长 10 字以上，
+    // 词项是二元组级别——用长度区分，防止退化成按空格切。
+    const longest = Math.max(...buckets.map((bucket) => bucket.theme.length))
+    assert.ok(
+      longest <= 4,
+      `主题词必须是词项（长度 <= 4），实际最长 ${longest}：`
+      + `${JSON.stringify(buckets.map((b) => b.theme))}`,
+    )
+  })
+
+  it('主题词不得含标点（缺陷二十九的直接判据）', () => {
+    // 曾经产出 `"，这"`、`"了，"` 这种主题，感受卡写成
+    // 「『，这』这件事反复牵动我的情绪」。主题词是判据，假主题会让
+    // 两张本来无关的卡聚成桶。
+    const config = makeConfig()
+    const cards = [
+      makeCard({
+        id: 'a', kind: 'feeling', emotional: 0.8, createdAt: T0, updatedAt: T0,
+        text: '太难了，快崩溃了', normalized: '太难了 快崩溃了', entities: [],
+      }),
+      makeCard({
+        id: 'b', kind: 'feeling', emotional: 0.9, createdAt: T0 + 1000, updatedAt: T0 + 1000,
+        text: '太难了，真的受不了', normalized: '太难了 真的受不了', entities: [],
+      }),
+    ]
+    const buckets = bucketByTheme(cards, config)
+    assert.ok(buckets.length > 0, '前提：必须能聚出桶')
+    for (const bucket of buckets) {
+      assert.doesNotMatch(
+        bucket.theme, /[\p{P}\p{S}]/u,
+        `主题词不得含标点符号，实际 ${JSON.stringify(bucket.theme)}`,
+      )
+    }
+  })
+})
+
+describe('蒸馏在真实语料上必须真的产出感受（缺陷二十八/二十九/三十串联）', () => {
+  /** 造一批「情绪反复出现」的真实语料——不含任何人工实体。 */
+  function feelingCorpus(): MemoryCard[] {
+    const texts = [
+      ['这个报错又出现了，压力很大', '这个报错又出现了 压力很大'],
+      ['还是那个报错，真的很烦', '还是那个报错 真的很烦'],
+      ['报错又来了，我快崩溃了', '报错又来了 我快崩溃了'],
+    ]
+    return texts.map(([text, normalized], index) => makeCard({
+      id: `card-${index}`, kind: 'feeling', emotional: 0.8,
+      createdAt: T0 + index * 1000, updatedAt: T0 + index * 1000,
+      text: text!, normalized: normalized!, entities: [],
+    }))
+  }
+
+  it('反复出现的情绪必须蒸馏出感受卡（不是恒为空）', () => {
+    const config = makeConfig()
+    const drafts = distillFeelings(feelingCorpus(), config)
+    assert.ok(
+      drafts.length > 0,
+      '3 张同主题、情绪全达标的卡必须蒸馏出至少一条感受（起源 L11）',
+    )
+    // 前提：来源必须是那批卡，否则「产出了感受」可能来自别处。
+    assert.ok(
+      drafts[0]!.sourceIds.length >= config.consolidation.distillMinRecurrence,
+      `感受必须由至少 ${config.consolidation.distillMinRecurrence} 张来源卡支撑`,
+    )
+  })
+
+  it('原话 feeling 卡参与蒸馏，派生 feeling 卡不参与（配对判据）', () => {
+    // 这是缺陷三十的核心：判据必须是「是不是派生卡」，不是 `kind` 标签。
+    const config = makeConfig()
+    const originals = feelingCorpus()
+    const derived = makeCard({
+      id: 'derived', kind: 'feeling', emotional: 0.9,
+      createdAt: T0, updatedAt: T0,
+      text: '感受的总结', normalized: '感受的总结',
+      source: {
+        sessionId: DISTILL_SESSION_ID, turn: 0, step: 0, seq: 1,
+        eventType: DISTILL_EVENT_TYPE,
+      },
+    })
+    assert.equal(hasFeelingSignal(originals[0]!, config), true, '原话 feeling 卡必须参与蒸馏')
+    assert.equal(hasFeelingSignal(derived, config), false, '派生 feeling 卡必须被排除（防自激循环）')
+    assert.equal(isDistilledCard(derived), true)
+    assert.equal(isDistilledCard(originals[0]!), false)
   })
 })

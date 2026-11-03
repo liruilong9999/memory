@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=12',
+  'configVersion=13',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -92,6 +92,49 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'extraction.dueKeywords[7]=deadline',
   'extraction.dueKeywords[8]=闹钟',
   'extraction.dueKeywords[9]=叫我',
+  'extraction.emotionalGateThreshold=0.28',
+  'extraction.emotionalMediumKeywords[0]=很',
+  'extraction.emotionalMediumKeywords[10]=烦',
+  'extraction.emotionalMediumKeywords[11]=累',
+  'extraction.emotionalMediumKeywords[12]=失望',
+  'extraction.emotionalMediumKeywords[13]=慌',
+  'extraction.emotionalMediumKeywords[14]=焦虑',
+  'extraction.emotionalMediumKeywords[15]=委屈',
+  'extraction.emotionalMediumKeywords[16]=孤独',
+  'extraction.emotionalMediumKeywords[17]=温暖',
+  'extraction.emotionalMediumKeywords[18]=疲惫',
+  'extraction.emotionalMediumKeywords[19]=无奈',
+  'extraction.emotionalMediumKeywords[1]=挺',
+  'extraction.emotionalMediumKeywords[20]=庆幸',
+  'extraction.emotionalMediumKeywords[21]=松了一口气',
+  'extraction.emotionalMediumKeywords[22]=满意',
+  'extraction.emotionalMediumKeywords[23]=不安',
+  'extraction.emotionalMediumKeywords[24]=兴奋',
+  'extraction.emotionalMediumKeywords[2]=比较',
+  'extraction.emotionalMediumKeywords[3]=有点',
+  'extraction.emotionalMediumKeywords[4]=感觉',
+  'extraction.emotionalMediumKeywords[5]=觉得',
+  'extraction.emotionalMediumKeywords[6]=担心',
+  'extraction.emotionalMediumKeywords[7]=害怕',
+  'extraction.emotionalMediumKeywords[8]=开心',
+  'extraction.emotionalMediumKeywords[9]=难受',
+  'extraction.emotionalStrongKeywords[0]=非常',
+  'extraction.emotionalStrongKeywords[10]=绝了',
+  'extraction.emotionalStrongKeywords[11]=绝望',
+  'extraction.emotionalStrongKeywords[12]=惊喜',
+  'extraction.emotionalStrongKeywords[13]=震惊',
+  'extraction.emotionalStrongKeywords[14]=激动',
+  'extraction.emotionalStrongKeywords[15]=感激',
+  'extraction.emotionalStrongKeywords[16]=感动',
+  'extraction.emotionalStrongKeywords[1]=特别',
+  'extraction.emotionalStrongKeywords[2]=超级',
+  'extraction.emotionalStrongKeywords[3]=极其',
+  'extraction.emotionalStrongKeywords[4]=太',
+  'extraction.emotionalStrongKeywords[5]=巨',
+  'extraction.emotionalStrongKeywords[6]=崩溃',
+  'extraction.emotionalStrongKeywords[7]=爆炸',
+  'extraction.emotionalStrongKeywords[8]=气死',
+  'extraction.emotionalStrongKeywords[9]=爽',
   'extraction.includeAssistant=true',
   'extraction.maxCardsPerTurn=4',
   'extraction.minAssistantChars=40',
@@ -202,7 +245,7 @@ describe('摘要配置的默认值与版本', () => {
     //       （两把尺子的刻度不同，不能沿用旧值）。同时删除 `capConflictPenalty`。
     //       语义变更比新增字段更需要递增版本：旧快照里写着 `absoluteThreshold: 0.18`
     //       的人以为那是「总分阈值」，回滚回来会得到一个清空焦点包的值。
-    assert.equal(MEMORY_CONFIG_VERSION, 12, '绝对阈值改语义后版本应为 12')
+    assert.equal(MEMORY_CONFIG_VERSION, 13, '情绪通道加入抽取后版本应为 13')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

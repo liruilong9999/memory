@@ -97,9 +97,49 @@ export function gateTurn(
     : []
 
   const signals = [...new Set([...userSignals, ...userDue, ...assistantSignals, ...assistantDue])]
+  // 情绪通道（缺陷二十八，起源 L3 / L11）：整轮平均情绪够浓就放行。
+  // 这是第四条通道，补的正是前三条的结构性盲区——情绪表达通常短、不含决策词、
+  // 也不需要双方都长，于是它在原来的四选一里**一条都不命中**。
+  // 实测未加这条时情绪句通过率 1/10，且高情绪组通过率反而低于低情绪组。
+  const emotional = turnEmotional(input, config)
+  const emotionalPass = emotional >= config.extraction.emotionalGateThreshold
   // 四选一：用户侧有信号、用户侧有到期词、助手侧有信号、或双方都足够长（信息量够）。
-  const pass = signals.length > 0 || (userLong && assistantLong)
+  // 情绪通道是第五条。
+  const pass = signals.length > 0 || (userLong && assistantLong) || emotionalPass
   return { pass, signals }
+}
+
+/**
+ * 算出一整轮的平均情绪强度（起源 L3 激素、L11 只会留下感受）。
+ *
+ * ## 为什么是「按句平均」而不是「全文取最大」
+ *
+ * 门控拿到的是整轮原文，还没切句。若取最大，一个感叹号就能劫持整轮
+ * （「这样行吗？」的 `？` 贡献 0.12，而 `？` 未必是情绪）；若直接对全文跑
+ * 正则，长助手回复会把用户的情绪稀释到不可见。
+ *
+ * 按句平均的语义最接近直觉：「这一轮整体上有没有情绪」。它与
+ * `consolidation.distillMinEmotional`（蒸馏侧同样看平均值）口径一致，
+ * 两处用同一个数才不会有「能进来但永远蒸馏不出」的缝隙。
+ *
+ * 助手侧只统计用户情绪句时会把「我很难受」+ 一大段技术回复稀释成接近 0，
+ * 所以两侧分别算，取较大者——情绪是谁说的不重要，有没有才重要。
+ *
+ * @param input - 一轮对话。
+ * @param config - 配置。
+ * @returns 0..1 的平均情绪强度。
+ */
+export function turnEmotional(input: TurnInput, config: MemoryConfig): number {
+  const average = (text: string): number => {
+    const sentences = splitSentences(text).filter((s) => s.trim().length > 0)
+    if (sentences.length === 0) return 0
+    let sum = 0
+    for (const sentence of sentences) sum += computeEmotional(sentence, config)
+    return sum / sentences.length
+  }
+  const userAvg = average(input.userText)
+  const assistantAvg = config.extraction.includeAssistant ? average(input.assistantText) : 0
+  return Math.max(userAvg, assistantAvg)
 }
 
 /**
@@ -135,16 +175,42 @@ export function classifySentence(sentence: string): MemoryKind {
  * @param entities - 该句抽到的实体。
  * @returns 0..1 的显著性。
  */
+/**
+ * 计算显著性：这句话值不值得记。
+ *
+ * ## 两条独立的理由，取较大者而不是加权相加（缺陷二十八）
+ *
+ * 一句话值得记，可能因为**信息量大**（长度、信号词、实体），也可能因为
+ * **情绪强**（起源 L3 激素、L11 只会留下感受）。这两者是**替代关系**，不是
+ * 互补关系：一条「我快崩溃了」信息量极低，但它恰恰是最该留下的那种记忆。
+ *
+ * 若做成加权相加，四项权重之和必须为 1，就只能从原有三项里各砍一刀——
+ * 实测那样会让真正的决策句显著性下降 18%，为了修一个通道而弄坏另一个。
+ * 取 `max` 则**原有分数一分不动**，情绪只负责把「本来进不来的」抬进来。
+ *
+ * 实测（`.tmp/probe-gate-emotional.mjs`）：只加门控通道、不动这里，
+ * 「我有点难受」显著性 = 0.15 × 0.42 = 0.063 < 0.25，**照样被丢**。
+ * 门控放行、显著性再扔掉，两道串联闸必须一起修，只修一处等于没修。
+ *
+ * @param sentence - 单句。
+ * @param signals - 命中的信号词。
+ * @param entities - 抽出的实体。
+ * @param emotional - 该句的情绪强度（{@link computeEmotional} 的结果）。
+ * @returns 0..1 的显著性。
+ */
 export function computeSalience(
   sentence: string, signals: readonly string[], entities: readonly string[],
+  emotional = 0,
 ): number {
   const chars = [...sentence].length
   // 长度项：太短信息量不足，太长通常是复述；20~80 字最优。
   const lengthScore = chars < 8 ? 0.15 : chars < 20 ? 0.5 : chars <= 80 ? 1 : 0.7
   const signalScore = Math.min(1, signals.length / 3)
   const entityScore = Math.min(1, entities.length / 3)
-  const raw = lengthScore * 0.42 + signalScore * 0.36 + entityScore * 0.22
-  return Math.min(1, Math.max(0, raw))
+  const infoRaw = lengthScore * 0.42 + signalScore * 0.36 + entityScore * 0.22
+  // 情绪项与信息项取较大者：两条独立的「值得记」理由。
+  const emoRaw = Math.min(1, Math.max(0, emotional))
+  return Math.min(1, Math.max(0, Math.max(infoRaw, emoRaw)))
 }
 
 /**
@@ -156,13 +222,50 @@ export function computeSalience(
  * @param sentence - 单句。
  * @returns 0..1 的情绪强度。
  */
-export function computeEmotional(sentence: string): number {
-  const strong = (sentence.match(/(非常|特别|超级|极其|太|巨|特别|崩溃|爆炸|气死|爽|绝了)/gu) ?? []).length
-  const medium = (sentence.match(/(很|挺|比较|有点|感觉|觉得|担心|害怕|开心|难受|烦|累)/gu) ?? []).length
+export function computeEmotional(
+  sentence: string, config?: MemoryConfig,
+): number {
+  // 词表来自配置（缺陷二十八）：写死在正则里时，「失望 / 慌 / 焦虑 / 委屈 /
+  // 疲惫」这些常用情绪词一个都不算数，情绪通道被系统性低估，
+  // 而它不报错、不崩溃，只是安静地少记东西。
+  const strong = config === undefined
+    ? (sentence.match(/(非常|特别|超级|极其|太|巨|崩溃|爆炸|气死|爽|绝了)/gu) ?? []).length
+    : countKeywords(sentence, config.extraction.emotionalStrongKeywords)
+  const medium = config === undefined
+    ? (sentence.match(/(很|挺|比较|有点|感觉|觉得|担心|害怕|开心|难受|烦|累)/gu) ?? []).length
+    : countKeywords(sentence, config.extraction.emotionalMediumKeywords)
   // 感叹号与问号也是情绪信号。
   const marks = (sentence.match(/[!！?？]/gu) ?? []).length
   const raw = Math.min(1, strong * 0.4 + medium * 0.18 + marks * 0.12)
   return Math.max(0, raw)
+}
+
+/**
+ * 统计词表在文本里的命中次数（可重复计）。
+ *
+ * 与 `matchSignals` 的区别：那个返回**去重后命中的词**（用于「命中了哪些信号」
+ * 这种要展示给人看的场景），本函数返回**总次数**（用于「情绪有多浓」这种
+ * 强度度量）。「特别特别开心」应当比「特别开心」更浓。
+ *
+ * @param text - 原文。
+ * @param keywords - 词表。
+ * @returns 命中总次数。
+ */
+function countKeywords(text: string, keywords: readonly string[]): number {
+  const normalized = normalizeText(text)
+  let hits = 0
+  for (const keyword of keywords) {
+    const needle = normalizeText(keyword)
+    if (needle.length === 0) continue
+    let from = 0
+    for (;;) {
+      const at = normalized.indexOf(needle, from)
+      if (at < 0) break
+      hits += 1
+      from = at + needle.length
+    }
+  }
+  return hits
 }
 
 /**
@@ -212,20 +315,31 @@ export function extractCards(input: TurnInput, config: MemoryConfig): CardDraft[
     if (text.trim().length === 0) return
     for (const sentence of splitSentences(text)) {
       const chars = [...sentence].length
-      if (chars < config.extraction.minTextChars) continue
+      // 情绪要先算，因为它是「短句也可以有意义」的唯一理由（缺陷二十八）。
+      const emotional = computeEmotional(sentence, config)
+      const emotionalPass = emotional >= config.extraction.emotionalGateThreshold
+      // 长度闸（`minTextChars`）默认挡掉「嗯」「好的」这类无内容短句。
+      // 但情绪句天然很短：「我有点难受」5 字、「有点烦」3 字——它们恰恰是
+      // 起源 L11 最想留下的东西。所以情绪达标时豁免长度闸，而不是降低
+      // `minTextChars`（那会同时放进来一堆真正的寒暄）。
+      if (chars < config.extraction.minTextChars && !emotionalPass) continue
       const entities = extractEntities(sentence)
       const signals = matchSignals(sentence, config.extraction.signalKeywords)
       // 到期词也算有效信号：否则「明天下午三点提醒我交周报」会因为
       // 没有任何普通信号词 + 无实体 + 不足 40 字而被丢弃（FR-D3 从根上失效）。
       const dueSignals = matchSignals(sentence, config.extraction.dueKeywords)
-      // 无信号且无实体的长句通常是寒暄或复述，跳过。
-      if (signals.length === 0 && dueSignals.length === 0 && entities.length === 0 && chars < 40) continue
+      // 情绪是本函数的**第三个放行理由**（缺陷二十八，起源 L3 / L11）。
+      // 这一行曾是整条情绪路径上最难发现的一道闸：门控放行了，
+      // 但这里「无信号 + 无实体 + 不足 40 字」照样把「我快崩溃了」丢掉。
+      // 无信号、无实体、无情绪的长句通常是寒暄或复述，跳过。
+      if (signals.length === 0 && dueSignals.length === 0 && entities.length === 0
+        && !emotionalPass && chars < 40) continue
 
       const kind = classifySentence(sentence)
       // 显著性必须把到期词一起算进去：只传普通信号会让「明天下午三点提醒我交周报」
       // 这类句子的显著性只剩长度项（0.5×0.42=0.21 < 0.25），直接被阈值丢掉。
       const allSignals = [...new Set([...signals, ...dueSignals])]
-      const salience = computeSalience(sentence, allSignals, entities)
+      const salience = computeSalience(sentence, allSignals, entities, emotional)
       // 显著性太低的不写，防止噪声入库。
       if (salience < 0.25) continue
 
@@ -239,7 +353,7 @@ export function extractCards(input: TurnInput, config: MemoryConfig): CardDraft[
         text,
         normalized,
         salience,
-        emotional: computeEmotional(sentence),
+        emotional,
         confidence: computeConfidence(sentence, fromUser),
         tags: allSignals,
         entities,

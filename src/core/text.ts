@@ -391,11 +391,34 @@ export function matchSignals(text: string, keywords: readonly string[]): string[
  * @returns 句子数组，已去除空白句。
  */
 export function splitSentences(raw: string): string[] {
-  const parts = raw.split(/(?<=[。！？!?；;\n])/u)
+  // 连续标点必须**归入前一句**，而不是各自成句（缺陷二十八）。
+  //
+  // 原实现用 `(?<=[。！？!?；;\n])` 零宽后视切分，「超级爽！！！」会被切成
+  // `"…超级爽！"` + `"！"` + `"！"` 三句。那两个孤立的 `"！"` 是纯噪声：
+  // 它们各自拿到 0.12 的情绪分，还会**稀释按句平均的情绪强度**，
+  // 把「这一轮到底有没有情绪」算低——情绪越激烈，平均分反而越低。
+  //
+  // 改用逐字符累积：遇到标点就结算，但只有「去掉标点后还有字」的片段
+  // 才算一句，纯标点片段直接丢弃（不留进 buffer，否则会和下一句粘连）。
+  const hasContent = (text: string): boolean =>
+    text.replace(/[\p{P}\p{S}\s]+/gu, '').length > 0
   const out: string[] = []
-  for (const part of parts) {
-    const trimmed = part.trim()
-    if (trimmed.length > 0) out.push(trimmed)
+  let buffer = ''
+  for (const ch of raw) {
+    buffer += ch
+    if (!/[。！？!?；;\n]/u.test(ch)) continue
+    if (hasContent(buffer)) {
+      out.push(buffer.trim())
+    } else {
+      // 纯标点片段：**附加到前一句**而不是丢弃或独立成句。
+      // 「真的吗？！」里的 `！` 属于前一句的语气，丢了会让情绪强度偏低，
+      // 独立成句则会产生一个 0.12 分的噪声句。两种都错。
+      // 没有前一句时（文本以标点开头）只能丢弃，因为没有可归属的对象。
+      const last = out.length > 0 ? out[out.length - 1] : undefined
+      if (last !== undefined) out[out.length - 1] = `${last}${buffer.trim()}`
+    }
+    buffer = ''
   }
+  if (hasContent(buffer)) out.push(buffer.trim())
   return out
 }

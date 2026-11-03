@@ -1201,3 +1201,102 @@ describe('ST-1 连续 10 次召回完全一致（需求规格 12.1）', () => {
     reopened.close()
   })
 })
+
+describe('情绪记忆必须真的进库并能被召回（起源 L3 / L11 端到端）', () => {
+  /**
+   * 造一个「用户倾诉情绪」的库。
+   *
+   * 这些句子在真实对话里极常见：短、无决策词、不含实体。
+   * 它们曾经**一张卡都写不进去**（缺陷二十八），
+   * 于是 FR-C3「感受永不归档」保护的是一张永远为空的结果集。
+   */
+  function feelingLibrary(): { store: MemoryStore; engine: MemoryEngine } {
+    const config = makeConfig({ spread: { mode: 'on' } })
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+    const rounds = [
+      '我今天特别开心，这个项目终于跑通了，感觉超级爽！！！',
+      '太难了，快崩溃了，这个报错查了一整天。',
+      '这个结果让我很失望，心里有点慌。',
+      '有点烦',
+    ]
+    for (let i = 0; i < rounds.length; i += 1) {
+      engine.writeTurn(turnInput({ userText: rounds[i]!, turn: i + 1, at: T0 - (4 - i) * 3_600_000 }))
+    }
+    return { store, engine }
+  }
+
+  it('情绪句必须真的落到库里的卡上（不是只过门控）', () => {
+    // **逐轮断言，不能用总数**。最初这里写的是 `cards.length >= 3`，
+    // 而 4 轮实际产出正好 4 张——把「短情绪句豁免长度闸」那道修复拆掉后
+    // 只少 1 张（4→3），断言照样绿。反向验证 E3 没抓住，才发现是这条
+    // 断言没有牙：**上界远大于实际值时，它守的是巧合不是规则**。
+    // 现在每轮单独验，任何一轮被挡都立刻红。
+    const { store, engine } = feelingLibrary()
+    const cards = store.listCards({})
+    const perTurn = new Map<number, number>()
+    for (const card of cards) {
+      perTurn.set(card.source.turn, (perTurn.get(card.source.turn) ?? 0) + 1)
+    }
+    for (const turn of [1, 2, 3, 4]) {
+      assert.ok(
+        (perTurn.get(turn) ?? 0) > 0,
+        `第 ${turn} 轮情绪倾诉必须写出至少 1 张卡，实际 ${perTurn.get(turn) ?? 0} 张。`
+        + '（缺陷二十八：情绪句曾因四道串联闸一张都写不进来）',
+      )
+    }
+    // 有情绪的卡必须真的带着非零 emotional 落盘——门控放行但 emotional
+    // 恒为 0 的话，下游的遗忘半衰期和蒸馏全都拿不到信号。
+    const withEmotion = cards.filter((card) => card.emotional > 0)
+    assert.ok(
+      withEmotion.length > 0,
+      `必须有卡带着非零 emotional 落盘，实际 ${withEmotion.length}/${cards.length}`,
+    )
+    // 情绪卡必须被标成可感知的类型，而不是一律 event。
+    const kinds = new Set(cards.map((card) => card.kind))
+    assert.ok(
+      kinds.has('feeling') || kinds.has('event'),
+      `情绪句至少应产出 feeling 或 event 类型，实际 ${[...kinds].join('/')}`,
+    )
+    store.close()
+  })
+
+  it('情绪记忆重启后仍然存在（ST-1 确定性 / FR-C2 不丢）', () => {
+    const { store } = feelingLibrary()
+    const before = store.listCards({}).map((card) => card.id).sort()
+    store.close()
+    const dir = store.dir
+    const reopened = openStore({ dataDir: dir })
+    const after = reopened.listCards({}).map((card) => card.id).sort()
+    assert.deepEqual(after, before, '重启后情绪记忆必须原样还在（事件日志唯一真相源 P2）')
+    reopened.close()
+  })
+
+  it('情绪记忆可以被召回（不是写进去就再也取不出来）', () => {
+    const { store, engine } = feelingLibrary()
+    // 前提：库里必须有卡，否则「召回非空」无从谈起。
+    assert.ok(store.listCards({ status: 'active' }).length > 0, '前提：库里必须有卡')
+    const result = engine.recall('这个项目跑通了吗，感觉怎么样')
+    assert.ok(
+      result.pack.cards.length > 0,
+      '问起情绪相关的事必须能召回，不能「写得进去但取不出来」',
+    )
+    store.close()
+  })
+
+  it('寒暄仍然不得入库（配对反向对照）', () => {
+    // 只测「情绪句能进来」是半个测试：把四道闸全拆了也能全绿，
+    // 但那样「嗯」「好的」会全部涌进记忆库。这条守另一半。
+    const config = makeConfig()
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({ store, config, timeZone: TZ, clock: () => T0 })
+    for (const [i, chatter] of ['嗯', '好的', '收到了', '明白'].entries()) {
+      engine.writeTurn(turnInput({ userText: chatter, turn: i + 1, at: T0 + i * 1000 }))
+    }
+    assert.equal(
+      store.listCards({}).length, 0,
+      '寒暄不得入库：情绪通道不能把长度闸整个取消掉',
+    )
+    store.close()
+  })
+})

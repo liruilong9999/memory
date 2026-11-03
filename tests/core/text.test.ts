@@ -180,8 +180,24 @@ test('splitSentences 按中文句号切分', () => {
   assert.equal(sentences.length, 3)
 })
 
-test('splitSentences 过滤空白句', () => {
-  assert.deepEqual(splitSentences('  。  '), ['。'])
+test('splitSentences 过滤纯标点片段（缺陷二十八）', () => {
+  // 原断言是 `['。']`——把「纯标点也算一句」写成了契约。
+  // 而正是这个行为让「超级爽！！！」被切成三个片段，其中两个是孤立的
+  // `"！"`：它们各自拿到 0.12 的情绪分，还**稀释按句平均的情绪强度**，
+  // 于是情绪越激烈、平均分反而越低。旧测试保护的是缺陷本身。
+  assert.deepEqual(splitSentences('  。  '), [])
+})
+
+test('splitSentences 连续标点归入前一句，不产生噪声句（缺陷二十八）', () => {
+  // 这是缺陷二十八的直接判据：情绪句末尾的 `！！！` 必须留在原句里。
+  assert.deepEqual(
+    splitSentences('我今天特别开心，这个项目终于跑通了，感觉超级爽！！！'),
+    ['我今天特别开心，这个项目终于跑通了，感觉超级爽！！！'],
+  )
+  // 问号叹号混用同理：`！` 属于前一句的语气，丢了会让情绪强度偏低。
+  assert.deepEqual(splitSentences('真的吗？！我不敢相信。'), ['真的吗？！', '我不敢相信。'])
+  // 配对反向对照：正常切分不得被弄坏。
+  assert.deepEqual(splitSentences('第一句。第二句！第三句？'), ['第一句。', '第二句！', '第三句？'])
 })
 
 describe('extractEntities 中文语料下的锚点（图谱连边的输入）', () => {

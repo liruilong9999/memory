@@ -41,7 +41,7 @@
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from './types.ts'
 import { buildCardId } from './types.ts'
 import type { MemoryConfig } from './config.ts'
-import { normalizeText, truncate } from './text.ts'
+import { normalizeText, tokenize, truncate } from './text.ts'
 
 /**
  * 一条蒸馏出来的感受，尚未落成卡片。
@@ -91,19 +91,69 @@ interface ThemeBucket {
 export function hasFeelingSignal(card: MemoryCard, config: MemoryConfig): boolean {
   if (card.status !== 'active') return false
   if (card.mergedInto !== undefined) return false
-  // 感受卡本身不参与再蒸馏，否则会形成「感受生感受」的自激循环，
+  // 派生感受卡本身不参与再蒸馏，否则会形成「感受生感受」的自激循环，
   // 几轮之后主题词就只剩感受卡自己的措辞，与真实经历脱钩。
-  if (card.kind === 'feeling') return false
+  //
+  // ## 判据必须是「是不是派生的」，不是「是不是 feeling」（缺陷三十）
+  //
+  // 这里原本写的是 `if (card.kind === 'feeling') return false`，而注释说的是
+  // 「感受卡本身不参与再蒸馏」。两句话在旧数据上恰好等价——因为当时
+  // **原话几乎不会被判成 `feeling`**（情绪通道被四道闸挡住，详见缺陷二十八）。
+  //
+  // 修好情绪通道之后，`classifySentence` 把真实情绪句判成 `feeling`，
+  // 于是这些**原话卡**被这条规则一起排除，`distillFeelings` 的候选集又空了：
+  //
+  // ```text
+  // 5 张卡情绪全部 >= distillMinEmotional(0.28)
+  //   → 4 张 kind === 'feeling' 被排除，剩 1 张
+  //   → 1 < distillMinRecurrence(2) → 直接 return []
+  // ```
+  //
+  // 正确的判据是「它是不是蒸馏产物」，这在数据层可见：派生的感受卡
+  // `source.sessionId` 固定为 `'distill'`（见 {@link distillSource}）。
+  // 用数据层的事实判断，而不是用 `kind` 这个会被分类器改动的标签。
+  if (isDistilledCard(card)) return false
   return card.emotional >= config.consolidation.distillMinEmotional
+}
+
+/**
+ * 判断一张卡是不是蒸馏产物。
+ *
+ * 派生感受卡的来源指针由 {@link distillSource} 生成，`sessionId` 固定为
+ * `'distill'`，`eventType` 为 `'consolidate/feeling'`。两个字段任一命中即可，
+ * 这样即使将来只改其中一个也不会漏判。
+ *
+ * @param card - 记忆卡。
+ * @returns 是否为派生卡。
+ */
+export function isDistilledCard(card: MemoryCard): boolean {
+  return card.source.sessionId === DISTILL_SESSION_ID
+    || card.source.eventType === DISTILL_EVENT_TYPE
 }
 
 /**
  * 取一张卡的主题词项集合。
  *
  * 优先用 `entities`（专名、代码标识符等，最能代表「哪件事」）；
- * 没有实体时退回 `normalized` 的词项，但**去掉过短的词项**——
- * 单字二元组（如「今天」的「今天」）共现率太高，几乎每张卡都有，
- * 拿它当主题等于没有主题。
+ * 没有实体时退回**分词**结果，并去掉过短的词项。
+ *
+ * ## 为什么不能用 `card.normalized.split(' ')`（缺陷二十九）
+ *
+ * `normalizeText` 会把**所有标点与符号替换成空格**。于是
+ * 「我今天特别开心，这个项目终于跑通了，感觉超级爽」变成
+ * `"我今天特别开心 这个项目终于跑通了 感觉超级爽"`——按空格切出来的
+ * 是三个**整段长句**，不是词项。
+ *
+ * 后果是结构性的：两张不同的情绪卡之间几乎不可能共享一个整段长句，
+ * 于是 `bucketByTheme` 的桶数**恒为 0**，`distillFeelings` 恒返回空数组。
+ * 它不报错、不崩溃，`distilled` 只是一个安静的 0。
+ *
+ * 实测（5 张情绪全部达标的真实语料）：桶数 = 0，蒸馏产出 = 0。
+ * 这和缺陷二十八是**两个独立的缺陷**：修好情绪通道让卡能写进来，
+ * 蒸馏仍然一条都产不出——「能进来」和「能沉淀」是两件事。
+ *
+ * `tokenize` 对中文产二元组、对英文产整词，并过滤停用词，
+ * 正是「主题词项」需要的粒度。
  *
  * @param card - 记忆卡。
  * @param minChars - 词项最小字符数。
@@ -116,7 +166,14 @@ function themeTerms(card: MemoryCard, minChars: number): Set<string> {
     if (key.length >= minChars) terms.add(key)
   }
   if (terms.size > 0) return terms
-  for (const token of card.normalized.split(' ')) {
+  // 退回分词：`tokenize` 才是词项的正确来源，不是按空格切整句。
+  //
+  // **必须传 `card.normalized` 而不是 `card.text`**：`tokenize` 的入参约定是
+  // 「已归一化的文本」（它按空格切段，并假定段内没有标点）。传原文会让标点
+  // 留在段里，二元组跨标点边界生成——实测产出 `"，这"`、`"了，"`
+  // 这种主题，于是感受卡写成「『，这』这件事反复牵动我的情绪」。
+  // 那不只是难看：主题词是**判据**，一个假主题会让两张本来无关的卡聚成桶。
+  for (const token of tokenize(card.normalized)) {
     if (token.length >= minChars) terms.add(token)
   }
   return terms
@@ -214,6 +271,19 @@ function renderFeeling(bucket: ThemeBucket, config: MemoryConfig): string {
 }
 
 /**
+ * 派生感受卡的伪会话 id。
+ *
+ * 用它而不是 `'distill'` 字面量，是因为它同时被两处使用：
+ * ① {@link distillSource} 写入来源指针；② {@link isDistilledCard} 读出来判断
+ * 「这张卡是不是蒸馏产物」。**两处各写一份字面量就是两个真相源**，
+ * 改一处忘一处会让判据静默失效（本仓库已有同源教训：注释说修好了、实现没修）。
+ */
+export const DISTILL_SESSION_ID = 'distill'
+
+/** 派生感受卡的事件类型，理由同 {@link DISTILL_SESSION_ID}。 */
+export const DISTILL_EVENT_TYPE = 'consolidate/feeling'
+
+/**
  * 从事件卡里蒸馏出感受草稿。
  *
  * 流程：
@@ -271,12 +341,12 @@ export function distillSource(draft: FeelingDraft, sources: readonly MemoryCard[
   return {
     // 固定的伪会话 id：让「这条记忆不是来自某一轮对话」在数据层面可见，
     // 而不是伪装成某轮对话里的原话。
-    sessionId: 'distill',
+    sessionId: DISTILL_SESSION_ID,
     turn: 0,
     step: 0,
     seq: first?.source.seq ?? 0,
     // 事件类型标明它是派生数据，排查时可据此区分「原话」与「提炼」。
-    eventType: 'consolidate/feeling',
+    eventType: DISTILL_EVENT_TYPE,
   }
 }
 

@@ -176,6 +176,59 @@ export interface ExtractionPolicy {
   dueKeywords: string[]
   /** 是否把助手回复也纳入抽取。 */
   includeAssistant: boolean
+  /**
+   * 门控的情绪通道阈值：单轮平均情绪达到它就放行写入（起源 L3 / L11）。
+   *
+   * ## 为什么门控必须有一条情绪通道（缺陷二十八）
+   *
+   * `gateTurn` 原有四个通道：用户信号词、用户到期词、助手信号词、双方都够长。
+   * **没有一个是情绪。** 而情绪表达在真实对话里通常**很短、也不含决策词**
+   * （「今天真的很开心」「太难了，快崩溃了」「有点烦」），于是它们四个通道
+   * 全部不命中，被门控直接拒绝——**情绪最强的句子恰好最容易被丢掉**。
+   *
+   * 实测（`.tmp/probe-gate-emotional.mjs`，10 句真实感情绪表达）：
+   *
+   * ```text
+   * 情绪句通过率 = 1/10
+   * 唯一通过的那条命中的是「明天」（到期词），与情绪无关
+   * 高情绪组（emo>=0.28）通过率 = 17% (1/6)
+   * 低情绪组（emo<0.28）通过率 = 43% (3/7)   ← 反相关
+   * 情绪拉满（emo=1.00）的「我今天特别开心…超级爽！！！」→ 0 张卡
+   * ```
+   *
+   * 这同时违反三条已验收的约束：
+   * - 起源 L3（无编号·激素）「激素是关键！！！大脑皮层只是记忆，激素控制情绪！！！」
+   * - 起源 L11（无编号·细节会忘）「大多数细节都会忘记，只会留下感受」
+   * - FR-C3（`docs/1-需求规格.md:149`）「感受」列入永不归档类别
+   *
+   * 前两条要求感受**必须能进来**，第三条要求它**进来后不许走**——
+   * 而当时它连门都进不了，FR-C3 保护的是一张永远为空的结果集。
+   *
+   * ## 为什么用「平均情绪」而不是「单句最大情绪」
+   *
+   * 门控的输入是整轮文本，还没有切句。用最大值会被一个感叹号劫持
+   * （「这样行吗？」的 `？` 就贡献 0.12）；用平均值衡量的是「这一轮整体
+   * 的情绪浓度」，与 `distillMinEmotional`（蒸馏侧同样看平均值）口径一致。
+   *
+   * 设为 `1` 以上可关闭该通道（校验允许 `[0, 1]`，默认值必须可达）。
+   */
+  emotionalGateThreshold: number
+  /**
+   * 强情绪词表（起源 L3·激素）。
+   *
+   * 与 `signalKeywords` 同理：词表是**配置**不是代码，因为「哪些词算情绪」
+   * 取决于用户语言习惯，写死在正则里既改不了也测不清。
+   */
+  emotionalStrongKeywords: string[]
+  /**
+   * 中情绪词表（起源 L3·激素）。
+   *
+   * 原有实现只有 18 个词，覆盖不足：常用情绪词「失望 / 慌 / 焦虑 / 委屈 /
+   * 激动 / 感激 / 孤独 / 温暖 / 疲惫」全部不在表内。实测
+   * 「这个结果让我很失望」只靠一个「很」拿到 0.18，被当成几乎无情绪。
+   * 词表漏词和判据方向错是同一类问题——**它不报错，只是安静地少记东西**。
+   */
+  emotionalMediumKeywords: string[]
 }
 
 /** 存储参数。 */
@@ -642,7 +695,7 @@ export interface SpreadPolicy {
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 12,
+  configVersion: 13,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -703,6 +756,22 @@ export const DEFAULT_CONFIG: MemoryConfig = {
       '闹钟', '叫我', '通知我', '明天', '后天', '下周', '每天', '每周',
     ],
     includeAssistant: true,
+    // 情绪通道阈值：整轮平均情绪达到 0.28 就放行写入（起源 L3 / L11）。
+    // 与 `consolidation.distillMinEmotional` 取同一个数不是巧合——它们回答的是
+    // 同一个问题「这一轮够不够算有感受」，两处用不同数会让「能进来」和
+    // 「能被蒸馏」之间出现一个谁都不负责的缝隙。
+    emotionalGateThreshold: 0.28,
+    // 强情绪词：单独出现就足够说明情绪很强（语气副词 + 极端状态）。
+    emotionalStrongKeywords: [
+      '非常', '特别', '超级', '极其', '太', '巨', '崩溃', '爆炸', '气死',
+      '爽', '绝了', '绝望', '惊喜', '震惊', '激动', '感激', '感动',
+    ],
+    // 中情绪词：需要叠加或配合标点才算强情绪。
+    emotionalMediumKeywords: [
+      '很', '挺', '比较', '有点', '感觉', '觉得', '担心', '害怕', '开心',
+      '难受', '烦', '累', '失望', '慌', '焦虑', '委屈', '孤独', '温暖',
+      '疲惫', '无奈', '庆幸', '松了一口气', '满意', '不安', '兴奋',
+    ],
   },
   storage: {
     dataDir: '.dsh-memory',
@@ -799,7 +868,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 12
+export const MEMORY_CONFIG_VERSION = 13
 
 /** 配置校验结果。 */
 export interface ConfigValidation {
@@ -859,6 +928,18 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
 
   if (config.extraction.domains.length === 0) errors.push('extraction.domains 不能为空')
   if (config.extraction.maxCardsPerTurn < 0) errors.push('extraction.maxCardsPerTurn 不能为负')
+  // 情绪通道阈值（缺陷二十八）：必须是 `[0, 1]` 内的有限数。
+  // 允许 1 表示「只有情绪拉满才放行」，等价于关闭该通道；但**不允许** > 1，
+  // 那会让通道恒假，而它看起来只是「调高了一点」——恒假的判据和调参长得一样。
+  inUnit('extraction.emotionalGateThreshold', config.extraction.emotionalGateThreshold)
+  // 两张情绪词表都不能为空：空表会让 `computeEmotional` 恒返回 0（只剩标点项），
+  // 于是整条情绪路径静默失效，而配置校验一句话都不会说。
+  if (config.extraction.emotionalStrongKeywords.length === 0) {
+    errors.push('extraction.emotionalStrongKeywords 不能为空（否则情绪强度恒为标点项）')
+  }
+  if (config.extraction.emotionalMediumKeywords.length === 0) {
+    errors.push('extraction.emotionalMediumKeywords 不能为空（否则情绪强度被系统性低估）')
+  }
 
   if (!Number.isInteger(config.storage.journalSegmentBytes) || config.storage.journalSegmentBytes < 4096) {
     errors.push('storage.journalSegmentBytes 必须是不小于 4096 的整数')
