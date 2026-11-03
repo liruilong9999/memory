@@ -481,3 +481,59 @@ describe('蒸馏在真实语料上必须真的产出感受（缺陷二十八/二
     assert.equal(isDistilledCard(originals[0]!), false)
   })
 })
+
+describe('程度副词不得成为主题词（缺陷三十一）', () => {
+  it('「有点」这类程度副词碎片不聚桶、不进感受文本', () => {
+    // 二元组分词没有词典，会产出「有点」这类程度副词碎片。它们几乎每句都能有，
+    // 区分度为零；更要紧的是会被当成主题词，产出
+    // 「『有点』这件事反复牵动我的情绪，前后经历了 2 次」。
+    //
+    // **主题词是判据**：两张卡因为都带「有点」聚成桶，于是「有点烦」和
+    // 「有点慌」被当成同一件事反复经历，感受卡的内容是假的。
+    const config = makeConfig()
+    const cards = [
+      makeCard({
+        id: 'a', kind: 'feeling', emotional: 0.8, createdAt: T0, updatedAt: T0,
+        text: '有点烦', normalized: '有点烦', entities: [],
+      }),
+      makeCard({
+        id: 'b', kind: 'feeling', emotional: 0.7, createdAt: T0 + 1000, updatedAt: T0 + 1000,
+        text: '有点慌', normalized: '有点慌', entities: [],
+      }),
+    ]
+    const buckets = bucketByTheme(cards, config)
+    for (const bucket of buckets) {
+      assert.notEqual(
+        bucket.theme, '有点',
+        '「有点」是程度副词碎片，不得成为主题词',
+      )
+    }
+    // 更强的判据：产出的感受文本里不得出现「「有点」这件事」这种胡说。
+    for (const draft of distillFeelings(cards, config)) {
+      assert.doesNotMatch(
+        draft.text, /「有点」/u,
+        `感受文本不得以程度副词为主题，实际：${draft.text}`,
+      )
+    }
+  })
+
+  it('配对对照：真实主题词仍然能被聚出来（不是把分桶关掉了）', () => {
+    // 只测「副词不聚桶」是半个测试——把分桶整个关掉也能让它绿。
+    const config = makeConfig()
+    const cards = [
+      makeCard({
+        id: 'a', kind: 'feeling', emotional: 0.8, createdAt: T0, updatedAt: T0,
+        text: '这个报错又出现了，压力很大', normalized: '这个报错又出现了 压力很大', entities: [],
+      }),
+      makeCard({
+        id: 'b', kind: 'feeling', emotional: 0.7, createdAt: T0 + 1000, updatedAt: T0 + 1000,
+        text: '还是那个报错，真的很烦', normalized: '还是那个报错 真的很烦', entities: [],
+      }),
+    ]
+    const buckets = bucketByTheme(cards, config)
+    assert.ok(
+      buckets.some((bucket) => bucket.theme === '报错'),
+      `真实主题词「报错」必须能聚桶，实际：${JSON.stringify(buckets.map((b) => b.theme))}`,
+    )
+  })
+})
