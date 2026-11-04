@@ -225,6 +225,46 @@ describe('merge 合并', () => {
     assert.equal(edge?.relation, 'supersedes')
   })
 
+  it('合并由 `core/graph.ts` 的构造函数建边（数据面不自己拼边）', () => {
+    // 这条守的是**接线本身**，不是去重。
+    //
+    // 数据面原先手抄了一份建边代码，与 `mergeSupersedesEdges` 逐字段等价。
+    // 接线之后行为**零变化**（这一点已用探针确认：把 `state.ts` 改回手抄版，
+    // 全部用例仍然全绿）——所以「接线」是一个纯重构，不能用状态差异来守。
+    // 能守住的只有「边确实建出来了」：把这段循环整个删掉，这条立刻红。
+    //
+    // 而「重复 id 只产生一条边」这个**去重承诺**在数据面上不可观测
+    // （`state.edges` 以 `buildEdgeId` 为键，重复项后写覆盖前写、值又相同），
+    // 它只在构造函数的返回值数组上可观测，因此那条断言放在
+    // `tests/core/graph.test.ts`，不在这一层重复一遍假断言。
+    const state = createEmptyState()
+    applyRecord(state, putRecord(1, makeCard({ id: 'a' })))
+    applyRecord(state, putRecord(2, makeCard({ id: 'b' })))
+    applyRecord(state, makeRecord(3, {
+      op: 'merge', ids: ['a', 'b'], into: makeCard({ id: 'into' }), at: 3,
+    }))
+    const supersedes = [...state.edges.values()].filter((e) => e.relation === 'supersedes')
+    assert.equal(supersedes.length, 2, '两张被并入的卡各建一条边')
+    assert.deepEqual(
+      supersedes.map((e) => `${e.from}→${e.to}`).sort(),
+      ['a→into', 'b→into'],
+      '方向固定为「被并入 → 合并结果」',
+    )
+  })
+
+  it('supersedes 边的权重固定为 1（合并是确定关系，不存在「有多像」）', () => {
+    const state = createEmptyState()
+    applyRecord(state, putRecord(1, makeCard({ id: 'a' })))
+    applyRecord(state, makeRecord(2, {
+      op: 'merge', ids: ['a'], into: makeCard({ id: 'into' }), at: 2,
+    }))
+    const edge = state.edges.get(buildEdgeId('a', 'into', 'supersedes'))
+    assert.equal(edge?.weight, 1)
+    // 建立时刻取**记录**的 `at`（不是 `seq`）：`makeRecord` 把 `at` 定为
+    // `1_700_000_000_000 + seq`，第 2 条记录即 `+2`。
+    assert.equal(edge?.createdAt, 1_700_000_000_002, '建立时刻取合并记录的时刻')
+  })
+
   it('合并时重复合并同一批卡不应产生重复的 mergeOf', () => {
     const state = createEmptyState()
     const a = makeCard({ id: 'a' })

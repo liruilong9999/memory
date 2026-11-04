@@ -17,8 +17,8 @@
 import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_CONFIG } from '../../src/core/config.ts'
-import { apply, contextOrder, consolidationPollMs, name } from '../../src/index.ts'
+import { DEFAULT_CONFIG, MEMORY_CONFIG_VERSION, validateConfig } from '../../src/core/config.ts'
+import { apply, contextOrder, consolidationPollMs, defaultConfig, name } from '../../src/index.ts'
 import { readGoalText } from '../../src/host/adapter.ts'
 import type { HostContext } from '../../src/host/adapter.ts'
 import { openStore } from '../../src/store/store.ts'
@@ -264,6 +264,15 @@ describe('插件元信息', () => {
 
   it('夜整理巡检周期是 1 小时', () => {
     assert.equal(consolidationPollMs(), HOUR_MS)
+  })
+
+  it('defaultConfig 别名指向真实的默认配置，且那份配置能通过校验', () => {
+    // 这个导出在包内零引用，但它属于**包的公开面**（`exports["."]`），
+    // 外部写 patch 的人会用它读默认值。所以它不是死代码，而是「对外契约」——
+    // 而对外契约必须有一条测试盯着，否则别名指错、默认值被改坏都没人知道。
+    assert.equal(defaultConfig, DEFAULT_CONFIG, '别名必须就是那一份默认配置对象')
+    assert.equal(defaultConfig.configVersion, MEMORY_CONFIG_VERSION)
+    assert.deepEqual(validateConfig(defaultConfig).errors, [])
   })
 })
 

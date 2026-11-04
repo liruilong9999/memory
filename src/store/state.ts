@@ -11,7 +11,9 @@
  * @module dsh-memory/store/state
  */
 
-import { buildEdgeId, MEMORY_DOMAINS, MEMORY_KINDS } from '../core/types.ts'
+import { MEMORY_DOMAINS, MEMORY_KINDS } from '../core/types.ts'
+// 数据面可以依赖 core/（分层允许），所以 `merge` 分支直接复用契约级的边构造函数。
+import { mergeSupersedesEdges } from '../core/graph.ts'
 import type {
   MemoryCard, MemoryDomain, MemoryEdge, MemoryKind, MemoryRevision, JournalRecord,
 } from '../core/types.ts'
@@ -371,15 +373,16 @@ export function applyRecord(state: MemoryState, record: JournalRecord): MemorySt
           ...(mergeOf.length > 0 ? { mergeOf } : {}),
         }
         state.cards.set(merged.id, merged)
-        for (const id of mergedFrom) {
-          const edge: MemoryEdge = {
-            id: buildEdgeId(id, merged.id, 'supersedes'),
-            from: id,
-            to: merged.id,
-            relation: 'supersedes',
-            weight: 1,
-            createdAt: at,
-          }
+        // 用 `core/graph.ts` 的构造函数而不是在这里手拼边。
+        //
+        // 这里原先抄了一份：`buildEdgeId(id, merged.id, 'supersedes')` + 五个字段
+        // 逐一赋值。而 `graph.ts` 的文件头恰好写着它之所以放在 `core/` 而不是
+        // `consolidate/`，就是为了让数据面不必「反向 import（违反分层）」或
+        // 「自己再抄一份（两份真相）」——注释预见了这个错法，实现还是抄了。
+        // 抄件与原件当时的差别只有一处：原件会对 `absorbedIds` 去重。
+        // 也就是说「同一次合并里出现重复 id」时两份行为不同，而 `op.ids` 来自
+        // 日志、没人保证它不重复。接线后这个分叉消失。
+        for (const edge of mergeSupersedesEdges(mergedFrom, merged.id, at)) {
           state.edges.set(edge.id, edge)
         }
       }

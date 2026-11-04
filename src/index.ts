@@ -306,7 +306,20 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   logger.info(`记忆系统就绪：活跃 ${store.count('active')} 张，数据目录 ${config.storage.dataDir}`)
 }
 
-/** 插件默认配置，供宿主 patch 引用。 */
+/**
+ * 插件默认配置，供宿主 patch 引用。
+ *
+ * **本仓库内部零引用**（`grep -rn defaultConfig src/ tests/` 只有这一行），
+ * 但它与另外三个死导出不同，**保留**：`index.ts` 是这个包的公开入口
+ * （`package.json` 的 `main` / `exports["."]`），而 `DEFAULT_CONFIG` 在
+ * `src/core/config/` 里——外部消费者（写 patch 的人、别的插件）不该为了读
+ * 默认值去 import 内部路径。**「本仓库零引用」不等于「无用」**，
+ * 判据是「包外有没有人会用到它」。
+ *
+ * 为了让它不是无牙的装饰，`tests/host/plugin.test.ts` 里有一条用例断言
+ * 「这个别名仍然指向真实的默认配置，且那份配置能通过校验」——别名指错、
+ * 默认值被改坏都会红。
+ */
 export const defaultConfig = DEFAULT_CONFIG
 
 /**

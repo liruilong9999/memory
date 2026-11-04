@@ -75,16 +75,6 @@ export function stepDownWeight(weight: number): number {
 }
 
 /**
- * 权重升一格。
- *
- * @param weight - 当前权重。
- * @returns 比输入严格大一格的权重；已在上限时返回 1。
- */
-export function stepUpWeight(weight: number): number {
-  return quantizeWeight(Math.min(1, weight + EDGE_WEIGHT_STEP))
-}
-
-/**
  * 造一条边。
  *
  * 权重会被夹到 0..1 并保留两位小数（见 `quantizeWeight`）。

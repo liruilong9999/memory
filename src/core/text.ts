@@ -167,20 +167,6 @@ export function tokenSet(text: string): Set<string> {
 }
 
 /**
- * 词频表，用于 BM25 式的语义相关度。
- *
- * @param text - 原文。
- * @returns 词项到出现次数的映射。
- */
-export function termFrequency(text: string): Map<string, number> {
-  const tf = new Map<string, number>()
-  for (const token of tokenize(normalizeText(text))) {
-    tf.set(token, (tf.get(token) ?? 0) + 1)
-  }
-  return tf
-}
-
-/**
  * Jaccard 相似度：交集除以并集。
  *
  * 用于去重判定（FR-C1）。选 Jaccard 而不是余弦：结果天然落在 0..1，
