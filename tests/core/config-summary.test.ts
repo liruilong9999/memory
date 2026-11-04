@@ -47,12 +47,11 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=15',
+  'configVersion=16',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
   'consolidation.distillEnabled=true',
-  'consolidation.distillExampleChars=30',
   'consolidation.distillMaxChars=120',
   'consolidation.distillMaxPerRun=3',
   'consolidation.distillMinEmotional=0.28',
@@ -65,7 +64,6 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'consolidation.monthlySummaryMaxChars=110',
   'consolidation.summaryBriefChars=40',
   'consolidation.summaryEnabled=true',
-  'consolidation.summaryMaxEntities=6',
   'consolidation.summaryMaxTags=6',
   'consolidation.summaryMinChildren=2',
   'consolidation.summaryMinSourceChars=120',
@@ -263,7 +261,14 @@ describe('摘要配置的默认值与版本', () => {
     //       别把「集合不变」写成「逐位不变」，那是探针一测就破的假话。
     //       不递增版本的后果：旧快照里没有这个字段，回滚回来会得到一个
     //       「entity 边无上限」的图谱，P7 参数可版本化被静默破坏。
-    assert.equal(MEMORY_CONFIG_VERSION, 15, '新增 graph.entityNeighbors 后版本应为 15')
+    //  16 → **删除**两个零读取的死配置：`consolidation.summaryMaxEntities` 与
+    //       `consolidation.distillExampleChars`。两者都是「删了功能、留下旋钮」的
+    //       残骸：前者注释写「摘要卡最多保留的关键实体数」，但 `topTerms` 只吃
+    //       `summaryMaxTags`（tags 与 entities 合并计数），改它 0 或 999 产物
+    //       逐字节相同；后者的功能在 `renderFeeling` 里被主动删掉了（注释写明
+    //       「不引用来源原文」，因为引用会替模板表态情绪极性）。
+    //       删字段同样要递增版本，理由同 10：旧配置文件与旧快照里可能写着它们。
+    assert.equal(MEMORY_CONFIG_VERSION, 16, '删除两个死配置后版本应为 16')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

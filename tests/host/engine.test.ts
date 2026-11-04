@@ -1089,6 +1089,61 @@ describe('影子观察值的可观测出口（FR-G1 / FR-F1）', () => {
 })
 
 /**
+ * `debugExplain` 必须真的控制「召回解释是否落盘」（FR-F1 / 缺陷十七）。
+ *
+ * 这个开关此前**零读取**：注释写「调试开关：记录每次召回的解释」，
+ * 而 `recall()` 的 `detail.picked` 只记了 `{id, total}`。这类缺陷的形态
+ * 本仓库已经见过（缺陷十七：声明了、注释承诺了、校验写了、生产代码零读取），
+ * 判据是「改它的值，产物变不变」——**不是 `grep` 到读取点就算接线**。
+ *
+ * 所以这里做的是对照实验：同一个库、同一个查询，只改这一个字段，
+ * 断言 `detail.picked[*].explain` 的出现与消失。**两边都必须断言**：
+ * 只测「关掉时没有」的话，一个从不写 explain 的实现照样绿。
+ */
+describe('debugExplain 真的控制解释行是否落盘（FR-F1）', () => {
+  /** 造一个有卡的库，按给定开关跑一次召回，返回那条 recall 日志。 */
+  function recallEntryWith(debugExplain: boolean): MemoryLogEntry {
+    const logs: MemoryLogEntry[] = []
+    const config = makeConfig({ debugExplain })
+    const store = openStore({ dataDir: tempDir(), config })
+    const engine = new MemoryEngine({
+      store, config, timeZone: TZ, clock: () => T0,
+      onLog: (entry) => logs.push(entry),
+    })
+    engine.writeTurn(turnInput({
+      userText: '决定「CordisPlugin」的版本用「ThreePointTwo」', at: T0,
+    }))
+    engine.recall('CordisPlugin 版本')
+    const entry = logs.filter((e) => e.kind === 'recall').at(-1)
+    assert.ok(entry !== undefined, '前提：recall 必须写日志')
+    return entry
+  }
+
+  it('打开时每张入选卡都带 explain 行', () => {
+    const entry = recallEntryWith(true)
+    const picked = entry.detail.picked as Array<Record<string, unknown>>
+    // 前提：必须有入选卡，否则「没有 explain」可以是因为「没有卡」。
+    assert.ok(picked.length > 0, '前提：这个库必须能召回至少一张卡')
+    for (const item of picked) {
+      assert.ok(Array.isArray(item.explain), '打开时必须带 explain 数组')
+      assert.ok((item.explain as string[]).length > 0, 'explain 不能是空数组')
+    }
+  })
+
+  it('关闭时一条 explain 都不落盘（但卡片本身仍然记）', () => {
+    const entry = recallEntryWith(false)
+    const picked = entry.detail.picked as Array<Record<string, unknown>>
+    assert.ok(picked.length > 0, '前提：这个库必须能召回至少一张卡')
+    for (const item of picked) {
+      assert.equal('explain' in item, false, '关闭时 picked 里不得出现 explain 键')
+      // 同时断言卡片还在：若实现把整个 picked 删了，这条会红，
+      // 从而区分「关掉解释」与「关掉整条日志」。
+      assert.ok(typeof item.id === 'string', '关闭解释不等于关闭 picked 记录')
+    }
+  })
+})
+
+/**
  * ST-1 验收口径：「连续 10 次召回结果完全一致」。
  *
  * 原有那条「同样查询两次结果一致」只做 2 次，而需求写的是 10 次。差的不只是

@@ -120,8 +120,10 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (config.consolidation.summaryMinChildren < 2) {
     errors.push('consolidation.summaryMinChildren 必须 ≥ 2（只有一个下级时是复制不是压缩）')
   }
-  if (config.consolidation.summaryMaxEntities < 0) {
-    errors.push('consolidation.summaryMaxEntities 不能为负')
+  // `summaryMaxTags` 可以为 0：那表示摘要不列关键词（只留计数与领域）。
+  // 不允许负数——「保留 −1 个」没有意义，而它会让 `slice(0, -1)` 静默截掉最后一个。
+  if (config.consolidation.summaryMaxTags < 0) {
+    errors.push('consolidation.summaryMaxTags 不能为负')
   }
   if (config.consolidation.distillMinRecurrence < 1) {
     errors.push('consolidation.distillMinRecurrence 必须 ≥ 1')
@@ -131,7 +133,6 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   }
   if (config.consolidation.distillMaxPerRun < 0) errors.push('consolidation.distillMaxPerRun 不能为负')
   if (config.consolidation.distillMaxChars < 1) errors.push('consolidation.distillMaxChars 必须 ≥ 1')
-  if (config.consolidation.distillExampleChars < 1) errors.push('consolidation.distillExampleChars 必须 ≥ 1')
   if (!/^\d{2}:\d{2}$/u.test(config.consolidation.dailyAt)) {
     errors.push('consolidation.dailyAt 必须是 HH:mm 形式')
   }

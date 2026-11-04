@@ -329,9 +329,13 @@ export interface ConsolidationPolicy {
    * 是复制。层级的意义来自「多个下级被合成一个」，只有一个下级时它不成立。
    */
   summaryMinChildren: number
-  /** 摘要卡最多保留的关键实体数。 */
-  summaryMaxEntities: number
-  /** 摘要卡最多保留的关键标签数。 */
+  /**
+   * 摘要卡最多保留的关键词项数（标签与实体共用这一个上限）。
+   *
+   * 早先还有独立的 `summaryMaxEntities`，但 `topTerms` 把 tags 与 entities
+   * 合在一起计数后统一取前 N，两个旋钮实际只生效一个。已删除那个字段，
+   * 保留这一个——**一个上限一个旋钮**，名字要能对上实现。
+   */
   summaryMaxTags: number
   /** 摘要里「最值得记住的一件事」的引用字符数，超长截断。 */
   summaryBriefChars: number
@@ -363,8 +367,6 @@ export interface ConsolidationPolicy {
   distillMaxPerRun: number
   /** 感受卡文本的字符上限。 */
   distillMaxChars: number
-  /** 感受卡里引用一个具体例子的字符数，超长截断。 */
-  distillExampleChars: number
   /** 感受卡指向来源事件卡的 `distills` 边权重（0..1）。 */
   distillEdgeWeight: number
 }
@@ -422,7 +424,7 @@ export interface MemoryConfig {
   graph: GraphPolicy
   /** 图谱扩散与突触可塑性策略（FR-G1）。 */
   spread: SpreadPolicy
-  /** 调试开关：记录每次召回的解释。 */
+  /** 调试开关：把每张卡的 `explain` 行写进诊断日志（`detail.explain`）。 */
   debugExplain: boolean
 }
 

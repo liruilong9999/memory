@@ -11,7 +11,7 @@ import type { MemoryConfig } from './types.ts'
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 15,
+  configVersion: 16,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -114,7 +114,11 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     summaryTargetRatio: 0.5,
     summaryMinSourceChars: 120,
     summaryMinChildren: 2,
-    summaryMaxEntities: 6,
+    // 摘要卡的实体与标签共用一个上限：`topTerms` 把 tags 与 entities 一起计数后
+    // 统一取前 N，所以「最多保留几个实体」和「最多保留几个标签」不是两个旋钮。
+    // 原先这里还有一个 `summaryMaxEntities`，注释写「摘要卡最多保留的关键实体数」，
+    // 但生产代码只把 `summaryMaxTags` 传给 `topTerms`——那个字段改 0 改 999
+    // 产物逐字节相同（探针实测），是删功能后留下的残骸，已删除（configVersion 16）。
     summaryMaxTags: 6,
     summaryBriefChars: 40,
     distillEnabled: true,
@@ -125,7 +129,11 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     distillThemeMinChars: 2,
     distillMaxPerRun: 3,
     distillMaxChars: 120,
-    distillExampleChars: 30,
+    // 这里原先还有一个 `distillExampleChars`（注释「感受卡里引用一个具体例子的
+    // 字符数」）。它是**删功能后的残骸**：`renderFeeling` 现在的注释明确写着
+    // 「不引用来源原文」，理由是早期版本在末尾拼「其中一次：<原文>」，原文里的
+    // 「特别开心」被读者当成系统的情绪判断——模板说不判极性、引用却替它表态。
+    // 功能删了、配置项留着，改它不会改变任何产物，已删除（configVersion 16）。
     distillEdgeWeight: 0.6,
   },
   reminder: {
@@ -198,8 +206,14 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     maxPrunePerRun: 200,
     explainSourceChars: 24,
   },
+  // 调试开关：召回时把每张卡的 `explain` 行写进诊断日志的 `detail.explain`。
+  //
+  // 这个字段曾经**零读取**（缺陷十七的原样形态：声明了、注释承诺了、合并写了、
+  // 生产代码从不读）。当时的注释写着「调试开关：记录每次召回的解释」，
+  // 而 `recall()` 的 `detail.picked` 只记了 `{id, total}`——解释行一条都没落盘。
+  // 现在真的接了（`src/host/engine.ts` 的 `recall()`）。
   debugExplain: true,
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 15
+export const MEMORY_CONFIG_VERSION = 16

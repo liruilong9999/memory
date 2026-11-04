@@ -226,6 +226,17 @@ export class MemoryEngine {
         actualRank: item.shadowSpread!.actualRank,
         hypotheticalRank: item.shadowSpread!.hypotheticalRank,
       }))
+    // `debugExplain` 打开时把每张卡的 `explain` 行一并落盘（FR-F1 / 缺陷十七）。
+    //
+    // 这个字段此前**零读取**：注释写「调试开关：记录每次召回的解释」，而这里
+    // 只记了 `{id, total}`，解释行一条都没留下。两种修法（接线 / 删字段）里
+    // 选了接线，理由是 `explain` 本身已经存在且 `renderFocusPackExplain` 在用，
+    // 少一个真相源；而删掉它会让「为什么这张卡被选中」在跨进程复盘时永久丢失
+    // ——`renderFocusPackExplain` 只活在当次进程的终端里。
+    //
+    // 默认 `true` 会让每条 recall 记录多出几行文本，但日志有 `logMaxEntries`
+    // 环形截断兜底，且它记的是**已经算好的**字符串，没有额外计算。
+    const explainOn = this.config.debugExplain
     this.diagnostics.record({
       kind: 'recall',
       at,
@@ -234,7 +245,11 @@ export class MemoryEngine {
       detail: {
         query: queryText,
         candidates: result.candidates,
-        picked: result.pack.cards.map((c) => ({ id: c.card.id, total: c.score.total })),
+        picked: result.pack.cards.map((c) => ({
+          id: c.card.id,
+          total: c.score.total,
+          ...(explainOn ? { explain: c.explain } : {}),
+        })),
         tokens: result.pack.tokens,
         empty: result.pack.empty,
         // FR-F3 的「冲突数」从这里聚合。**必须真的写进日志**：
