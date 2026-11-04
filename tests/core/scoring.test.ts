@@ -54,9 +54,44 @@ test('recencyScore 半衰期为 0 返回 0', () => {
   assert.equal(recencyScore(100, 0), 0)
 })
 
-test('importanceScore 落在 0..1', () => {
-  const score = importanceScore(makeCard({ salience: 1, emotional: 1, accessCount: 100 }))
-  assert.ok(score >= 0 && score <= 1)
+test('importanceScore 三个分项的权重精确是 0.55 / 0.25 / 0.20', () => {
+  // 这条原来是 `assert.ok(score >= 0 && score <= 1)`——**无牙断言**。
+  // `importanceScore` 出口有 `clamp01`，任何实现都满足值域；把三个权重全改错
+  // （比如 0.55 写成 0.45）它照样绿。名字说的是「落在 0..1」，测的也只是
+  // 这个恒真事实，而真正该守的是「三个分项真的按声明的权重被用上」。
+  //
+  // 判据换成**逐项增量**：让一个分项从 0 到 1、其余保持 0，增量必须精确等于
+  // 它的权重。这样改任何一个系数都会红，且红的位置直接指向被改的那一项。
+  // 实测值：0.55 / 0.25 / 0.20（与 `src/core/scoring/score.ts` 的
+  // `salience * 0.55 + emotional * 0.25 + accessBoost * 0.20` 逐字对应）。
+  const zero = importanceScore(makeCard({ salience: 0, emotional: 0, accessCount: 0 }))
+  assert.equal(zero, 0, '三项全 0 时必须精确为 0（否则增量就不等于权重了）')
+  assert.equal(
+    importanceScore(makeCard({ salience: 1, emotional: 0, accessCount: 0 })), 0.55,
+    '显著性权重',
+  )
+  assert.equal(
+    importanceScore(makeCard({ salience: 0, emotional: 1, accessCount: 0 })), 0.25,
+    '情绪权重（起源 L3·激素是关键）',
+  )
+  assert.equal(
+    importanceScore(makeCard({ salience: 0, emotional: 0, accessCount: 12 })), 0.20,
+    '访问频次权重',
+  )
+})
+
+test('importanceScore 的访问频次在 12 次饱和（对数压缩的上限）', () => {
+  // 分项权重对了还不够：`accessBoost` 用 `min(1, log1p(n)/log1p(12))` 做压缩，
+  // 12 次正好到顶。若有人把分母 12 改成 20，前面那条「accessCount=12 得 0.20」
+  // 就会红（得 0.17 左右），但「饱和」这件事本身还需要单独守：
+  // 它保证「用 50 次」不会碾压「用 12 次」，这是对数压缩的全部意义。
+  const at12 = importanceScore(makeCard({ salience: 0, emotional: 0, accessCount: 12 }))
+  const at50 = importanceScore(makeCard({ salience: 0, emotional: 0, accessCount: 50 }))
+  assert.equal(at50, at12, '12 次与 50 次必须同分，否则「高频卡碾压一切」又回来了')
+  assert.ok(
+    importanceScore(makeCard({ salience: 0, emotional: 0, accessCount: 6 })) < at12,
+    '前提：12 次确实高于 6 次，否则「饱和」可能只是因为整条链路都没在算频次',
+  )
 })
 
 test('importanceScore 高显著性高于低显著性', () => {
@@ -103,10 +138,40 @@ test('effectiveHalfLife 访问多则半衰期长', () => {
   assert.ok(used > fresh)
 })
 
-test('scoreCard 总分落在 0..1', () => {
-  const query = makeQuery('Qt5 项目', config, 1_700_000_000_000)
-  const scored = scoreCard(makeCard(), query, config)
-  assert.ok(scored.score.total >= 0 && scored.score.total <= 1)
+test('scoreCard 的总分真的把各分项权重算进去了', () => {
+  // 这条原来是 `assert.ok(total >= 0 && total <= 1)`——**无牙断言**。
+  // 总分出口有 `clamp01`，值域恒真。要测的是「各分项权重真的被用上」，
+  // 那必须构造**只在一个分项上有差异**的两张卡，看总分差是否等于理论值。
+  //
+  // 理论式：`Δtotal = Δimportance × w.importance / Σw`，其中 Σw 是全部正权重之和
+  // （分母恒含 goal，见 `scoreCard` 里那段「缺失即中性」的注释）。
+  // 实测：Σw = 1.00，importance 从 0.385（salience 0.7 × 0.55）升到 0.55，
+  // Δimportance = 0.165，Δtotal = 0.165 × 0.18 = 0.0297。
+  const now = 1_700_000_000_000
+  const query = makeQuery('Qt5 项目', config, now)
+  const w = config.weights
+  const totalWeight = w.semantic + w.importance + w.recency + w.goal + w.confidence
+  const plain = scoreCard(makeCard({ salience: 0.7 }), query, config)
+  const highSalience = scoreCard(makeCard({ salience: 1 }), query, config)
+  const deltaImportance = highSalience.score.importance - plain.score.importance
+  // 前提：两个分项确实不同，否则下面的等式可能因「两边都 0」而空成立。
+  assert.ok(deltaImportance > 0, `前提：importance 必须真的变了，实际 Δ=${deltaImportance}`)
+  const expected = deltaImportance * w.importance / totalWeight
+  assert.ok(
+    Math.abs((highSalience.score.total - plain.score.total) - expected) < 1e-9,
+    `Δtotal 应为 Δimportance × w.importance / Σw = ${expected}，`
+    + `实际 ${highSalience.score.total - plain.score.total}`,
+  )
+  // 换一个 w.importance，Δ 必须跟着变——否则上面那个等式可能只是巧合。
+  const heavier = { ...config, weights: { ...w, importance: 0.36 } }
+  const plain2 = scoreCard(makeCard({ salience: 0.7 }), query, heavier)
+  const high2 = scoreCard(makeCard({ salience: 1 }), query, heavier)
+  const totalWeight2 = w.semantic + 0.36 + w.recency + w.goal + w.confidence
+  const expected2 = deltaImportance * 0.36 / totalWeight2
+  assert.ok(
+    Math.abs((high2.score.total - plain2.score.total) - expected2) < 1e-9,
+    `w.importance 改为 0.36 后 Δtotal 应为 ${expected2}，实际 ${high2.score.total - plain2.score.total}`,
+  )
 })
 
 test('scoreCard 解释行非空且含总分', () => {
@@ -462,15 +527,66 @@ test('applyThresholds 的死卡丢弃不是「全都丢」：同批放一张相�
 test('applyThresholds 阈值刻度不随「是否提供目标」漂移（分母恒含 goal 权重）', () => {
   // 这条守的是分数刻度的稳定性。若有人把 w.goal 从分母里摘掉（我曾这么干过），
   // 所有卡的归一化分会整体上浮 1/(1-w.goal) 倍，绝对阈值的实际严苛程度被悄悄改掉。
-  // 同一张卡、同一个时刻，有没有目标只应改变 goal 这一项的贡献，不应改变分母基准。
+  //
+  // **第一版这条断言仍然没牙**，值得记下来：我原本只比较「同一张卡、有没有
+  // 传 goalText」两种情况的 `total` 是否逐位相同。把 w.goal 从分母里摘掉后，
+  // 两张卡的总分**一起**上浮 1/0.9，彼此依然相等——反向验证时它一条都没红。
+  // 配对相等只能抓「分母随查询条件变」，抓不到「分母恒定地少了一项」。
+  //
+  // 所以判据必须包含**绝对值**：用 config 里的五个权重自己算一遍理论总分，
+  // 与实际比。分母少一项就会对不上，而且报错信息直接指出差多少。
+  const now = 1_700_000_000_000
+  // 卡里没有「Qt5 项目」任何词项 ⇒ goal 项恒为 0，两种查询下都如此。
+  const card = makeCard({ id: 'no-overlap', text: '今天天气不错', normalized: '今天天气不错', tags: [], entities: [] })
+  const noGoal = scoreCard(card, makeQuery('Qt5', config, now), config)
+  const withGoalMiss = scoreCard(card, makeQuery('Qt5', config, now, 'Qt5 项目'), config)
+  // 前提：两种情况 goal 项都是 0，否则测的就不是分母了。
+  assert.equal(noGoal.score.goal, 0, '前提：无目标时 goal 为 0')
+  assert.equal(withGoalMiss.score.goal, 0, '前提：目标未命中时 goal 也为 0')
+  assert.equal(
+    withGoalMiss.score.total, noGoal.score.total,
+    'goal 项两边都是 0 时总分必须逐位相同——不等就说明分母随查询条件变了',
+  )
+  // 绝对值判据：分母恒为**五个**权重之和，一个都不能漏。
+  const w = config.weights
+  const allWeights = w.semantic + w.importance + w.recency + w.goal + w.confidence
+  const s = noGoal.score
+  const expectedTotal = (
+    s.semantic * w.semantic + s.importance * w.importance + s.recency * w.recency
+    + s.goal * w.goal + s.confidence * w.confidence
+  ) / allWeights - s.conflictPenalty * w.conflict
+  assert.ok(
+    Math.abs(s.total - expectedTotal) < 1e-12,
+    `总分必须按「五项权重之和」归一：期望 ${expectedTotal}，实际 ${s.total}。`
+    + `差 ${s.total - expectedTotal} 说明分母漏了某项（漏 w.goal 会上浮 11%）`,
+  )
+})
+
+test('目标命中必须让总分**严格**上升，且增量精确等于 goal 项', () => {
+  // 这条原来是 `assert.ok(withGoal.score.total >= noGoal.score.total)`——
+  // **`>=` 等于没断言**（AGENTS.md 五·「断言 `>=` 等于没断言」）：等式成立也算过，
+  // 而当时 `goalScore` 从总分里整个摘掉它依然绿。
+  // 要求「变好」必须写 `>`，并且要写出**变好多少**。
+  //
+  // 实测：这张卡的目标词项全覆盖（goal = 1），Δtotal = 1 × 0.10 / 1.00 = 0.10。
   const now = 1_700_000_000_000
   const card = makeCard({ id: 'same-card' })
   const noGoal = scoreCard(card, makeQuery('Qt5', config, now), config)
   const withGoal = scoreCard(card, makeQuery('Qt5', config, now, 'Qt5 项目'), config)
-  // 无目标时 goal 项为 0，有目标且命中时 goal 项 > 0，故总分只会更高或相等。
+  // 前提：无目标时 goal 项确实是 0，有目标时确实命中。
   assert.equal(noGoal.score.goal, 0)
-  assert.ok(withGoal.score.goal > 0)
-  assert.ok(withGoal.score.total >= noGoal.score.total)
+  assert.ok(withGoal.score.goal > 0, '前提：目标必须真的命中，否则「上升」无从谈起')
+  assert.ok(
+    withGoal.score.total > noGoal.score.total,
+    `有目标必须**严格**高于无目标，实际 ${withGoal.score.total} vs ${noGoal.score.total}`,
+  )
+  const w = config.weights
+  const totalWeight = w.semantic + w.importance + w.recency + w.goal + w.confidence
+  const expected = withGoal.score.goal * w.goal / totalWeight
+  assert.ok(
+    Math.abs((withGoal.score.total - noGoal.score.total) - expected) < 1e-9,
+    `Δtotal 应为 goal × w.goal / Σw = ${expected}，实际 ${withGoal.score.total - noGoal.score.total}`,
+  )
 })
 
 test('applyThresholds 硬上限精确截到 maxCards 条（不是「不超过」）', () => {

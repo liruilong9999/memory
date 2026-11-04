@@ -448,11 +448,34 @@ describe('query（FR-F2）', () => {
     }
     assert.equal(payload.query, '部署')
     assert.ok(payload.cards.length > 0)
-    assert.ok(payload.candidates >= payload.cards.length)
+    // 这条原来是 `assert.ok(payload.candidates >= payload.cards.length)`——
+    // **恒真断言**：`candidates` 是候选池大小、`cards` 是装进焦点包的子集，
+    // 构造上就不可能反超。它想守的其实是「候选数与装包数各是什么」，
+    // 那必须写**精确值**。
+    //
+    // 语料是 `seedStore`：两张活跃卡（都含「部署」）+ 一张归档卡。
+    // 实测 candidates = 2、cards = 2——归档卡既不进候选也不进包，
+    // 而两张活跃卡都够格。把「归档卡也算进候选」的回归会立刻让这条红。
+    assert.equal(payload.candidates, 2, '候选池：两张活跃卡都命中「部署」，归档卡不算')
+    assert.equal(payload.cards.length, 2, '两张活跃卡都进了焦点包（预算足够）')
     // 预算必须来自配置，而不是写死在 CLI 里（硬性约定 6）。
     assert.equal(payload.budgetTokens, DEFAULT_CONFIG.recall.tokenBudget)
     assert.equal(typeof payload.cards[0]?.score.total, 'number')
     assert.ok((payload.cards[0]?.explain.length ?? 0) > 0)
+  })
+
+  it('--json 在零命中时 candidates 与 cards 都是 0（与上一条配对）', () => {
+    // 上一条断言「2 / 2」，只有这一条能区分「真的在按内容筛选」与
+    // 「不管查什么都返回全部活跃卡」——后者在上一条里同样给 2 / 2。
+    // 实测 `query=天气`：candidates = 0、cards = 0、tokens = 0。
+    const dir = tempDir()
+    seedStore(dir)
+    const result = runCli(['query', '天气', '--data-dir', dir, '--json'], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    const payload = JSON.parse(result.stdout) as { candidates: number; cards: unknown[]; tokens: number }
+    assert.equal(payload.candidates, 0, '库里没有任何卡含「天气」，候选池必须为空')
+    assert.equal(payload.cards.length, 0)
+    assert.equal(payload.tokens, 0, '空包不该占 token')
   })
 
   it('--verbose 下 query 不产生召回日志，因为只读查询不写事件（FR-F1 语义）', () => {

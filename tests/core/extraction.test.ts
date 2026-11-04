@@ -63,9 +63,52 @@ test('classifySentence 兜底为事件', () => {
   assert.equal(classifySentence('昨天服务器重启了一次'), 'event')
 })
 
-test('computeSalience 落在 0..1', () => {
-  const value = computeSalience('我们决定这个项目用 Qt5 开发', ['决定'], ['Qt5'])
-  assert.ok(value >= 0 && value <= 1)
+test('computeSalience 三个信息分项各自真的被算进去', () => {
+  // 这条原来是 `assert.ok(value >= 0 && value <= 1)`——**无牙断言**。
+  // `computeSalience` 出口夹紧，值域恒真；输入里明明有「决定」+「Qt5」，
+  // 但断言不关心它们有没有被算进去。要守的是「长度 / 信号 / 实体三项
+  // 真的各按 0.42 / 0.36 / 0.22 参与合成」。
+  //
+  // 实测（60 字以内 ⇒ lengthScore = 1）：
+  //   无信号无实体 0.42、只信号 0.54、只实体 0.4933…、两者 0.6133…
+  // 注意每个分项都先除以 3 封顶：1 个信号得 1/3，所以增量是 0.36/3 = 0.12，
+  // 不是 0.36。第一版断言写 0.78 是**我把公式读错了**，实测立刻打回来。
+  const long = '我们决定这个项目用 Qt5 而不是 Qt6 来开发'
+  const base = computeSalience(long, [], [])
+  assert.ok(Math.abs(base - 0.42) < 1e-9, `长度项 1 × 0.42，实际 ${base}`)
+  const withSignal = computeSalience(long, ['决定'], [])
+  assert.ok(
+    Math.abs(withSignal - (0.42 + 0.36 / 3)) < 1e-9,
+    `1 个信号 = 0.36 × (1/3)，实际 ${withSignal}`,
+  )
+  const withEntity = computeSalience(long, [], ['Qt5'])
+  assert.ok(
+    Math.abs(withEntity - (0.42 + 0.22 / 3)) < 1e-9,
+    `1 个实体 = 0.22 × (1/3)，实际 ${withEntity}`,
+  )
+  const both = computeSalience(long, ['决定'], ['Qt5'])
+  assert.ok(
+    Math.abs(both - (0.42 + 0.36 / 3 + 0.22 / 3)) < 1e-9,
+    `两项相加，实际 ${both}`,
+  )
+  // 信号/实体各封顶 3 个（`Math.min(1, n/3)`）：给 5 个不能比给 3 个更高。
+  const threeSignals = computeSalience(long, ['a', 'b', 'c'], [])
+  const fiveSignals = computeSalience(long, ['a', 'b', 'c', 'd', 'e'], [])
+  assert.equal(fiveSignals, threeSignals, '信号项在 3 个处封顶')
+})
+
+test('computeSalience 长度项分四档（<8 / <20 / ≤80 / >80）', () => {
+  // 长度项是唯一与信号、实体无关的分项，单测它才能证明「档位边界」真的存在。
+  // 注意每个档位都是 lengthScore × 0.42，**不是 lengthScore 本身**：
+  // 短句 0.15 × 0.42 = 0.063、8~19 字 0.5 × 0.42 = 0.21、
+  // 20~80 字 1 × 0.42 = 0.42、>80 字 0.7 × 0.42 = 0.294。
+  // （第一版直接拿档位值当期望，实测 0.063 vs 0.15 打回来——判据读错了公式。）
+  assert.ok(Math.abs(computeSalience('好', [], []) - 0.15 * 0.42) < 1e-9, '<8 字：0.15 × 0.42')
+  const tenChars = '这个项目用 Qt5 开发'
+  assert.ok([...tenChars].length >= 8 && [...tenChars].length < 20, '前提：这句在 8~19 字之间')
+  assert.ok(Math.abs(computeSalience(tenChars, [], []) - 0.5 * 0.42) < 1e-9, '8~19 字：0.5 × 0.42')
+  assert.ok(Math.abs(computeSalience('这'.repeat(80), [], []) - 1 * 0.42) < 1e-9, '20~80 字：1 × 0.42')
+  assert.ok(Math.abs(computeSalience('这'.repeat(81), [], []) - 0.7 * 0.42) < 1e-9, '>80 字：0.7 × 0.42')
 })
 
 test('computeSalience 短句显著性低', () => {
@@ -80,9 +123,27 @@ test('computeEmotional 强情绪高于中性', () => {
   assert.ok(strong > neutral)
 })
 
-test('computeEmotional 落在 0..1', () => {
-  const value = computeEmotional('非常非常非常崩溃！！！！')
-  assert.ok(value >= 0 && value <= 1)
+test('computeEmotional 三个信号项各自真的被算进去，且封顶 1', () => {
+  // 这条原来是 `assert.ok(value >= 0 && value <= 1)`——**无牙断言**。
+  // 用「非常非常非常崩溃！！！！」这么强的情绪句，只断言值域等于没用它。
+  // 要守的是「强词 ×0.4 + 中词 ×0.18 + 标点 ×0.12，三者相加后封顶 1」。
+  //
+  // 实测：单个强词 0.4、单个感叹号 0.12、那句最强的 1（本来算出来是 1.76，被封顶）。
+  assert.ok(Math.abs(computeEmotional('非常') - 0.4) < 1e-9, '一个强词 = 0.4')
+  assert.ok(Math.abs(computeEmotional('！') - 0.12) < 1e-9, '一个标点 = 0.12')
+  assert.equal(computeEmotional('这个项目用 Qt5 开发'), 0, '中性句必须精确为 0')
+  // 封顶：三个强词本来算 1.2，必须夹到 1。
+  assert.equal(computeEmotional('非常特别超级'), 1, '三个强词算出来 1.2，必须封顶 1')
+  // 中词与强词不同档：各一个时强词更高。
+  assert.ok(
+    computeEmotional('非常') > computeEmotional('很'),
+    '强词档（0.4）必须高于中词档（0.18）',
+  )
+  // 可重复计：两个强词高于一个（「特别特别开心」应当比「特别开心」更浓）。
+  assert.ok(
+    computeEmotional('非常非常') > computeEmotional('非常'),
+    '同一个词出现两次必须更浓（`countKeywords` 是可重复计的）',
+  )
 })
 
 test('computeConfidence 用户高于助手', () => {

@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 
 import { DEFAULT_CONFIG, MEMORY_CONFIG_VERSION, validateConfig } from '../../src/core/config.ts'
 import { apply, contextOrder, consolidationPollMs, defaultConfig, name } from '../../src/index.ts'
+import { CONTEXT_ORDER } from '../../src/host/plugin/constants.ts'
 import { readGoalText } from '../../src/host/adapter.ts'
 import type { HostContext } from '../../src/host/adapter.ts'
 import { openStore } from '../../src/store/store.ts'
@@ -256,10 +257,26 @@ describe('插件元信息', () => {
     assert.equal(name, 'memory')
   })
 
-  it('动态上下文排序值 ≥ 300（C7：排在动态尾部，不打断前缀缓存）', () => {
-    // 宿主 CONTEXT_ORDERS 最高到 210（WEB_SURFACE），且 200 之后才是不进缓存的
-    // 动态区（system-prompt:182）。记忆每轮都变，必须落在这个区里。
-    assert.ok(contextOrder() >= 300)
+  it('动态上下文排序值落在宿主动态尾部（C7：排在 200 之后，不打断前缀缓存）', () => {
+    // 这条原来是 `assert.ok(contextOrder() >= 300)`——**同义反复**：
+    // `contextOrder()` 返回的就是常量 `CONTEXT_ORDER`（300），`>= 300` 只是把
+    // 那个字面量抄了一遍。改 `CONTEXT_ORDER` 到 299 才会红，而那时红的原因
+    // 也不是「缓存被破坏」。
+    //
+    // 真正该断言的是**语义**：宿主的静态上下文序最高到 210（WEB_SURFACE），
+    // 而 200 之后才是不进缓存系统的动态区（`system-prompt:182`）。
+    // 记忆每轮都变，落在 200 之前会让前缀缓存每轮失效——那才是要守的后果。
+    //
+    // 判据写 `> 210` 而不是 `>= 300`：210 是**宿主的约束**（别的地方改不了），
+    // 300 是**本仓库的选择**（随时可调）。断言前者才有意义。
+    const HOST_MAX_STATIC_ORDER = 210
+    assert.ok(
+      contextOrder() > HOST_MAX_STATIC_ORDER,
+      `必须排在宿主最大静态序 ${HOST_MAX_STATIC_ORDER} 之后，实际 ${contextOrder()}`,
+    )
+    // 并且必须是那个常量本身——防止有人把 contextOrder() 改成写死的另一个数，
+    // 让它与真正注册进宿主的 CONTEXT_ORDER 漂移成两个真相。
+    assert.equal(contextOrder(), CONTEXT_ORDER)
   })
 
   it('夜整理巡检周期是 1 小时', () => {

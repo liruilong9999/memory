@@ -17,6 +17,7 @@ import { DEFAULT_CONFIG, mergeConfig } from '../../src/core/config.ts'
 import type { MemoryConfig } from '../../src/core/config.ts'
 import type { MemoryLogEntry } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
+import { nextDueAt } from '../../src/host/engine/reminders.ts'
 import { openStore } from '../../src/store/store.ts'
 import { indexStats } from '../../src/store/inverted.ts'
 import type { MemoryStore } from '../../src/store/store.ts'
@@ -287,6 +288,16 @@ describe('MemoryEngine 召回（FR-B1..B6 / FR-E1 / FR-E3）', () => {
   })
 
   it('钉住的承诺即使检索没命中也会进入候选（FR-C3 精神）', () => {
+    // 这条原来是 `assert.ok(result.candidates >= 1)`——**无牙断言**。
+    // 库里只有 1 张卡时，任何召回都给 `candidates >= 1`；把钉住那条通道整个
+    // 删掉它也照样绿。真正该断言的是**那张 pinned-card 真的在候选里**。
+    //
+    // 为什么断言在 `candidates` 这一层而不是「进焦点包」：
+    // 实测这张卡 `relevance = 0`（「答应下周交付演示版本」与「今天天气怎么样」
+    // 零词项交集），于是它被绝对闸挡在包外——`pack.cards.length === 0`、
+    // `pack.note` 是「没有相关记忆。」。这是**正确行为**：FR-C3 说的是
+    // 「不能因为检索没命中就漏掉」，不是「必须塞进焦点包」（后者会违反 FR-B2
+    // 「全低分时不硬塞」）。所以断言必须落在候选池这一层，且要指名道姓。
     const { store, engine } = openEngine()
     store.putCard(makeCard({
       id: 'pinned-card',
@@ -297,7 +308,44 @@ describe('MemoryEngine 召回（FR-B1..B6 / FR-E1 / FR-E3）', () => {
       updatedAt: T0,
     }))
     const result = engine.recall('今天天气怎么样')
-    assert.ok(result.candidates >= 1)
+    assert.ok(
+      result.candidates >= 1,
+      `前提：候选池非空，实际 ${result.candidates}`,
+    )
+    // 真正有牙的那一条：候选池里必须有这张钉住的卡。
+    // 但它不在 `pack.cards` 里——召回结果不暴露候选 id 列表，所以用
+    // 「库里只有这一张活跃卡」把 candidates 的含义钉死：非空 ⟺ 就是它。
+    const active = store.listCards({ status: 'active' })
+    assert.equal(active.length, 1, '前提：库里只有这一张活跃卡')
+    assert.equal(active[0]?.id, 'pinned-card')
+    assert.equal(result.candidates, 1, '候选池里必须恰好是这张钉住卡')
+    // 并明确记录「它被内容闸挡住」这件事，防止将来有人把这条测试改成
+    // 「钉住卡必须进包」——那是另一条需求（FR-B2 与 FR-C3 的冲突点）。
+    assert.equal(result.pack.cards.length, 0, '零相关查询下不进包：FR-B2「全低分时不硬塞」')
+  })
+
+  it('不钉住的同类卡在同样查询下不进候选（与上一条配对，隔离出钉住通道）', () => {
+    // 上一条断言「钉住卡 → candidates = 1」。但只有那一条的话，
+    // 「1」也可能来自「整条召回链路根本没在筛内容」——那是一个假绿。
+    // 唯一能区分两者的构造是：**同一张卡、同样的无关查询，只是不钉住**。
+    // 它必须给 `candidates = 0`。
+    //
+    // 这个配对不是想出来的，是反向验证逼出来的：我把「钉住卡补池」那段循环
+    // 整个删掉时，原来那条「检索命中时进入焦点包」的用例**没有变红**——
+    // 因为命中的卡是走倒排索引进来的，根本不经过钉住通道。那条用例看着像配对，
+    // 实际没有隔离出任何东西。
+    const { store, engine } = openEngine()
+    store.putCard(makeCard({
+      id: 'unpinned-same-card',
+      text: '答应下周交付演示版本',
+      kind: 'promise',
+      pinned: false,
+      createdAt: T0,
+      updatedAt: T0,
+    }))
+    const result = engine.recall('今天天气怎么样')
+    assert.equal(result.candidates, 0, '不钉住就没有补池通道，无关查询必须给空候选')
+    assert.equal(result.pack.cards.length, 0)
   })
 
   it('已归档的卡不进入召回候选', () => {
@@ -733,7 +781,15 @@ describe('到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
     store.close()
   })
 
-  it('每天提醒的 dueAt 在未来且可重复命中', () => {
+  it('每天提醒的 dueAt 在未来，且第二天真的会再响一次', () => {
+    // 这条名字原写「在未来**且可重复命中**」，但断言只有
+    // `assert.ok(card.dueAt! > MON)`——**只测了前半句**。
+    // 「可重复」是 FR-D3 的核心（重复提醒曾永久静默，见缺陷十二），
+    // 而它恰恰是前半句证不了的那一半：一个 `dueRepeat` 没落盘、
+    // 或者推进逻辑算错一天的实现，`dueAt > MON` 一样成立。
+    //
+    // 实测（`Asia/Shanghai`）：`dueAt = 1705363200000`（本地 2024-01-16 08:00）、
+    // `dueRepeat = 'daily'`；从它往后推 = `1705449600000`，差值精确 86400000。
     const dir = tempDir()
     const { engine, store } = engineAt(dir, () => MON)
     const summary = engine.writeTurn(turnInput({
@@ -742,6 +798,11 @@ describe('到期提醒（FR-D3 / SC-5 / 起源 L21）', () => {
     const card = summary.cards.find((item) => item.dueAt !== null)
     assert.ok(card !== undefined, '每日提醒必须入库')
     assert.ok(card.dueAt! > MON, '每日提醒的下一次应在未来')
+    // 有牙的那一半：重复方式必须落盘，否则推进时无从知道该怎么推。
+    assert.equal(card.dueRepeat, 'daily', '重复方式必须随 dueAt 一起落盘')
+    // 而且推进函数真的能算出下一次——这才是「可重复命中」。
+    const next = nextDueAt(card, card.dueAt! + 1, TZ, DEFAULT_CONFIG)
+    assert.equal(next, card.dueAt! + 86_400_000, '每日提醒推进应恰好一天')
     store.close()
   })
 })

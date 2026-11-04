@@ -366,10 +366,71 @@ describe('runConsolidation 上限与确定性（P8 / ST-1）', () => {
     assert.equal(result.report.afterActive, 1)
   })
 
-  it('报告包含人可读的变更摘要（FR-C1）', () => {
+  it('报告包含人可读的变更摘要，且数字与报告字段一致（FR-C1）', () => {
+    // 这条原来只查 `notes[0]?.includes('夜整理完成')`——**只查固定前缀**。
+    // `notes` 里到底有没有记录「合并几条、衰减几条、归档几条」全不管，
+    // 而 FR-C1 的验收正是「每次整理有一份**可读**报告」：一句话里只有标题、
+    // 数字全是 0 或者干脆没写，人读了等于没读。
+    //
+    // 判据改成「那句话里的每个数字都必须等于 report 上的对应字段」。
+    // 这样把 `notes.unshift` 里任何一个插值改成字面量 0 都会红。
+    // 实测（单卡、30 天后）：
+    //   "夜整理完成：活跃卡 1 → 1，合并 0 组重复卡，衰减 1 张，归档 0 张低强度卡，新增 0 条图谱边"
     const cards = [makeCard({ id: 'a', text: '部署走 CI', createdAt: T0 })]
     const result = runConsolidation({ cards }, makeConfig(), T0 + 30 * DAY_MS, TZ)
-    assert.ok(result.report.notes[0]?.includes('夜整理完成'))
+    const summary = result.report.notes[0]
+    assert.ok(summary !== undefined, '报告第一条必须是汇总句')
+    const r = result.report
+    // 逐项断言：句子里的数字与字段一致。
+    assert.ok(
+      summary.includes(`活跃卡 ${r.beforeActive} → ${r.afterActive}`),
+      `活跃卡前后数必须来自 report，实际句子：${summary}`,
+    )
+    assert.ok(
+      summary.includes(`合并 ${r.merged} 组重复卡`),
+      `合并组数必须来自 report，实际句子：${summary}`,
+    )
+    assert.ok(
+      summary.includes(`衰减 ${r.decayed} 张`),
+      `衰减张数必须来自 report，实际句子：${summary}`,
+    )
+    assert.ok(
+      summary.includes(`归档 ${r.archived} 张低强度卡`),
+      `归档张数必须来自 report，实际句子：${summary}`,
+    )
+    assert.ok(
+      summary.includes('新增') && summary.includes('条图谱边'),
+      `新增边数必须在句子里，实际句子：${summary}`,
+    )
+    // 前提：这条语料确实产生了衰减，否则「衰减 1 张」可能只是把 0 抄对了。
+    assert.equal(r.decayed, 1, '前提：30 天后这张卡应被衰减一次')
+  })
+
+  it('合并发生时汇总句记的是真实组数，且另有一条说明并入了谁（FR-C1）', () => {
+    // 上一条用的是「没有合并」的语料，`merged = 0`——一个把合并数写死成 0
+    // 的实现也能通过。这条用**真的会合并**的两张卡，把那个数字变成 1。
+    // 实测两张同文本卡的 notes：
+    //   0: "夜整理完成：活跃卡 2 → 1，合并 1 组重复卡，衰减 1 张，归档 0 张低强度卡，新增 0 条图谱边"
+    //   1: "合并重复卡：将 「部署走 CI 流水线」 并入「部署走 CI 流水线」"
+    const cards = [
+      makeCard({ id: 'a', text: '部署走 CI 流水线', createdAt: T0 }),
+      makeCard({ id: 'b', text: '部署走 CI 流水线', createdAt: T0 + DAY_MS }),
+    ]
+    const result = runConsolidation({ cards }, makeConfig(), T0 + DAY_MS, TZ)
+    const r = result.report
+    assert.equal(r.merged, 1, '前提：这两张卡确实被合并了')
+    assert.equal(r.beforeActive, 2)
+    assert.equal(r.afterActive, 1)
+    const summary = r.notes[0]
+    assert.ok(
+      summary !== undefined && summary.includes('合并 1 组重复卡'),
+      `汇总句必须记下真实的合并组数，实际：${summary}`,
+    )
+    // 第二条说明「并入了谁」——只报「合并 1 组」读者不知道合的是哪两张。
+    assert.ok(
+      r.notes.some((note) => note.includes('合并重复卡') && note.includes('部署走 CI 流水线')),
+      `必须有一条说明合并对象的可读记录，实际：${JSON.stringify(r.notes)}`,
+    )
   })
 
   it('整理后的卡片视图包含未变更的卡', () => {
