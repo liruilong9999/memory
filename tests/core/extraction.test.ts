@@ -233,16 +233,115 @@ test('textSimilarity 无关文本为 0', () => {
   assert.equal(textSimilarity('苹果', '汽车'), 0)
 })
 
-test('looksConflicting 共享实体且低相似判定冲突', () => {
-  const conflict = looksConflicting(
-    { entities: ['Qt5'] }, { entities: ['Qt5'] }, 0.1, config.dedup.relatedSimilarity,
+// ─────────────────────────────────────────────────────────────────────────────
+// 缺陷二十五：FR-B5 的冲突判据**方向是反的**（未修，故意的）
+//
+// 下面这几条断言的是**当前错误行为**，不是正确行为。它们存在的唯一理由是：
+// 没有它们，全绿的测试套件会让下一个人以为冲突判定已经修好了。
+//
+// 判据原话（`src/core/extraction.ts:459`）：`shared && similarity < relatedThreshold`
+// ⇒ 它筛出来的是「提到了同一个东西但说了不同的事」＝**无关**，不是**矛盾**。
+//
+// 实测（`.tmp/probe-frb5-pin.ts`，用真实的 `extractEntities` + `normalizeText`）：
+//
+// | 类型 | 句子对 | 相似度 | 现行判据 | 应该 |
+// |---|---|---|---|---|
+// | 漏判 | 「阈值」设成 0.18 ×「阈值」不要设成 0.18 | 0.6667 | false | true |
+// | 漏判 | 「日志」保留三十天 ×「日志」保留七天 | 0.2857 | true | true |
+// | 误判 | 「部署」改成手动发布 ×「部署」的日志保留三十天 | 0.0769 | true | false |
+// | 误判 | 「缓存」改成写回 ×「缓存」的键要带版本号 | 0.1000 | true | false |
+// | 误判 | 「索引」重建一次 ×「索引」不要存在内存里 | 0.1000 | true | false |
+//
+// **为什么调阈值没用**：真冲突里既有高相似度（0.6667）也有低相似度（0.2857），
+// 无关对里也有低相似度（0.0769）。`similarity` 这一个标量在两类上分布重叠，
+// 不存在一个阈值能分开它们——调阈值只会在错的路上更精确。
+//
+// **三个替代判据都试过，全部被探针打回**（`.tmp/probe-frb5-*.ts`）：
+//   F 共享实体 +（否定不对称无条件放行 或 同框架数值不一致）
+//     → 对抗集 FP=6/14：「部署」改成手动发布 ×「部署」的日志保留三十天 被判冲突
+//   G/H 两条分支都要求框架相似度过线
+//     → 可行地板区间只有 **0.0308 宽**（下界 0.2000 由一句非冲突对决定、
+//       上界 0.2308 由现有 engine 测试那一对决定）⇒ 是巧合不是判据
+//   I 剥掉否定与数字后「还是不是同一句话」（地板 ≥ 0.6）
+//     → 误判清零，但把现有 engine 测试那一对打红；而那一对判对本身是
+//       「方向反了」的副产品（它 sim=0.1765 低，反向判据恰好把它判成冲突）
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('缺陷二十五·漏判：真冲突（同一句的肯定与否定）被判成「不冲突」', () => {
+  // 相似度 0.6667 高于阈值 0.45 ⇒ 反向判据认为「说法一样，不冲突」。
+  // 但这两句恰恰是同一件事的正反两面，是最典型的冲突。
+  const similarity = textSimilarity('「阈值」设成 0.18', '「阈值」不要设成 0.18')
+  assert.ok(similarity > config.dedup.relatedSimilarity,
+    `前提：这对的相似度必须高于阈值，否则测不到这条分支。实际 ${similarity}`)
+  assert.equal(
+    looksConflicting({ entities: ['阈值'] }, { entities: ['阈值'] }, similarity, config.dedup.relatedSimilarity),
+    false,
+    '当前行为（错的）：相似度高 ⇒ 反向判据判「不冲突」。修好这条判据时，这个断言要跟着改成 true',
   )
-  assert.equal(conflict, true)
+})
+
+test('缺陷二十五·误判：共享实体但说的是两件事，被判成「冲突」', () => {
+  // 相似度 0.0769 远低于阈值 ⇒ 反向判据认为「说法不同，冲突」。
+  // 但一个是发布方式、一个是日志保留期，两者可以同时成立，根本不矛盾。
+  const similarity = textSimilarity('「部署」改成手动发布', '「部署」的日志保留三十天')
+  assert.ok(similarity < config.dedup.relatedSimilarity,
+    `前提：这对的相似度必须低于阈值，否则测不到这条分支。实际 ${similarity}`)
+  assert.equal(
+    looksConflicting({ entities: ['部署'] }, { entities: ['部署'] }, similarity, config.dedup.relatedSimilarity),
+    true,
+    '当前行为（错的）：相似度低 ⇒ 反向判据判「冲突」。修好这条判据时，这个断言要跟着改成 false',
+  )
+})
+
+test('缺陷二十五·调阈值救不了：真冲突与无关对的相似度区间重叠', () => {
+  // 这条断言的是「不存在可行阈值」这件事本身，而不是某一次判定。
+  const trueConflict = textSimilarity('「阈值」设成 0.18', '「阈值」不要设成 0.18')   // 0.6667
+  const trueConflictLow = textSimilarity('「日志」保留三十天', '「日志」保留七天')     // 0.2857
+  const falsePositive = textSimilarity('「部署」改成手动发布', '「部署」的日志保留三十天') // 0.0769
+  // 要让「误判对」判 false，阈值必须 ≤ 0.0769；
+  // 但那样「真冲突」两对（0.6667 / 0.2857）全部 > 阈值 ⇒ 全被判 false。
+  assert.ok(falsePositive < trueConflictLow && trueConflictLow < trueConflict,
+    `前提：三个相似度必须严格递增，否则「区间重叠」这个论证不成立。实际 ${falsePositive} < ${trueConflictLow} < ${trueConflict}`)
+  // 任何阈值 T：T ≤ 0.0769 时两对真冲突都漏；T > 0.0769 时误判对仍被误判。
+  // 所以 T ∈ (0.0769, 0.2857) 能救「误判对」但漏掉两对真冲突；
+  // T ≤ 0.0769 全漏；T ≥ 0.6667 全不判冲突。
+  for (const threshold of [0.05, 0.0769, 0.1, 0.2, 0.2857, 0.45, 0.6667, 0.8]) {
+    const judgments = [trueConflict, trueConflictLow, falsePositive].map((s) => s < threshold)
+    // 正确结果应是 [true, true, false]；任何阈值都拿不到它。
+    assert.notDeepEqual(judgments, [true, true, false],
+      `阈值 ${threshold} 竟然判对了三对——若真如此，说明判据已被修好，这条用例该删`)
+  }
 })
 
 test('looksConflicting 无共享实体不冲突', () => {
   assert.equal(looksConflicting({ entities: ['A'] }, { entities: ['B'] }, 0.1, 0.45), false)
 })
+
+test('looksConflicting 任一侧实体为空时永不冲突（与相似度无关）', () => {
+  // 这条比「方向反了」更根本：真实中文写法下 `extractEntities` 几乎不给实体，
+  // 于是判据连「方向」这一步都走不到。实测 18 句日常写法里 14 句（77.8%）
+  // 抽不出实体（`.tmp/probe-frb5-pin.ts` 第 ② 节）。
+  //
+  // 判据要**两端都断言**，否则会绿在巧合上：
+  // 只测 sim=0.9 时，`similarity < 0.45` 恰好也是 false，删掉整个实体门它照样绿。
+  for (const similarity of [0.1, 0.9]) {
+    assert.equal(looksConflicting({ entities: [] }, { entities: ['部署'] }, similarity, 0.45), false,
+      `左侧实体为空、相似度 ${similarity} 时应判不冲突`)
+    assert.equal(looksConflicting({ entities: ['部署'] }, { entities: [] }, similarity, 0.45), false,
+      `右侧实体为空、相似度 ${similarity} 时应判不冲突`)
+  }
+  // 对照：同样的两个相似度，实体补齐之后判定就不再恒为 false —— 这才说明
+  // 上面的 false 来自「实体为空」，而不是「这个相似度刚好落在那一边」。
+  const withEntities = (s: number): boolean =>
+    looksConflicting({ entities: ['部署'] }, { entities: ['部署'] }, s, 0.45)
+  assert.ok(withEntities(0.1) || withEntities(0.9),
+    '前提：实体补齐后至少有一个相似度会判冲突，否则上面的 false 说明不了任何事')
+})
+
+// 注意：`looksConflicting` 第一行 `if (a.entities.length === 0 || b.entities.length === 0)
+// return false` 是**冗余**的——下一行算出的 `shared` 对空实体必然为 false。
+// 反向验证证实了这一点：把整行删掉，上面那条用例**一条都不红**（等价变异）。
+// 保留它不影响正确性，但**不要以为它在守一条独立的边界**。
 
 test('unionTags 去重保序', () => {
   assert.deepEqual(unionTags(['a', 'b'], ['B', 'c']), ['a', 'b', 'c'])
