@@ -19,7 +19,8 @@ export {
 } from './scoring/score.ts'
 export { filterByDomain, scoreCards } from './scoring/spread.ts'
 export { EMPTY_PACK_NOTE, applyThresholds, buildFocusPack } from './scoring/pack.ts'
+export type { CardRefLookup } from './scoring/render.ts'
 export {
-  buildExplain, describeConflictPeers, formatCardLine, formatDuration, formatTime, kindLabel,
-  renderEmptyNote, renderFocusPack,
+  CARD_REF_PREFIX_LENGTH, buildExplain, describeConflictPeers, formatCardLine, formatCardRef,
+  formatDuration, formatTime, kindLabel, lookupCard, renderEmptyNote, renderFocusPack,
 } from './scoring/render.ts'

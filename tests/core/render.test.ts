@@ -14,7 +14,9 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { renderFocusPackExplain } from '../../src/core/render.ts'
-import { EMPTY_PACK_NOTE, formatTime, renderEmptyNote, renderFocusPack } from '../../src/core/scoring.ts'
+import {
+  EMPTY_PACK_NOTE, formatTime, lookupCard, renderEmptyNote, renderFocusPack,
+} from '../../src/core/scoring.ts'
 import type { FocusPack, MemoryCard, ScoredCard, TimeState } from '../../src/core/types.ts'
 
 /**
@@ -139,15 +141,31 @@ describe('renderFocusPackExplain（FR-B4 可解释）', () => {
     assert.ok(text.startsWith('焦点包 1 张，候选 12 张'))
   })
 
-  it('每张卡有「■ 文本」+「总分 X」+ 缩进的 explain 各行', () => {
+  it('每张卡有「■ 文本」+「卡片 id」+「总分 X」+ 缩进的 explain 各行', () => {
     const text = renderFocusPackExplain(makePack([makeScored('偏好 PostgreSQL', 0.539)]), 12)
     const lines = text.split('\n')
     assert.equal(lines[0], '焦点包 1 张，候选 12 张')
     assert.equal(lines[1], '')
     assert.equal(lines[2], '■ 偏好 PostgreSQL')
-    assert.equal(lines[3], '  总分 0.539')
-    assert.equal(lines[4], '  recency 0.5 × 0.25 = 0.125')
-    assert.equal(lines[5], '  semantic 0.6 × 0.45 = 0.270')
+    assert.equal(lines[3], '  卡片 id card-13')
+    assert.equal(lines[4], '  总分 0.539')
+    assert.equal(lines[5], '  recency 0.5 × 0.25 = 0.125')
+    assert.equal(lines[6], '  semantic 0.6 × 0.45 = 0.270')
+  })
+
+  it('每张卡都印出可以粘给 restore / revise 的 id（FR-A5 / FR-C2 的前置条件）', () => {
+    // 这条守的不是「有个 id 字样」，而是**输出与输入的闭环**：
+    // 渲染出来的字符串必须能被 formatCardRef 的逆运算（lookupCard）解析回同一张卡。
+    // 只断言 `includes('卡片 id')` 的话，印成 `卡片 id ？？？` 也一样绿。
+    const scored = makeScored('偏好 PostgreSQL', 0.539)
+    const text = renderFocusPackExplain(makePack([scored]), 1)
+    const idLine = text.split('\n').find((line) => line.startsWith('  卡片 id '))
+    assert.ok(idLine !== undefined, `前提：必须有一行卡片 id，实际输出：\n${text}`)
+    const printed = idLine.slice('  卡片 id '.length)
+    assert.equal(printed, scored.card.id, '前提：这张卡的 id 不足 8 位，应原样印出')
+    const resolved = lookupCard([scored.card], printed)
+    assert.equal(resolved.ok, true, `印出来的 id 必须能被解析：${printed}`)
+    if (resolved.ok) assert.equal(resolved.card.id, scored.card.id)
   })
 
   it('总分保留三位小数', () => {
@@ -170,17 +188,19 @@ describe('renderFocusPackExplain（FR-B4 可解释）', () => {
       makePack([makeScored('第一张', 0.5), makeScored('第二张', 0.4)]), 5,
     )
     const lines = text.split('\n')
-    // 首行 + 空行 + 卡1(1+1+2行) + 空行 + 卡2(1+1+2行)
+    // 首行 + 空行 + 卡1(1+1+1+2行) + 空行 + 卡2(1+1+1+2行)
     assert.equal(lines.filter((line) => line === '').length, 2)
     assert.ok(lines.includes('■ 第一张'))
     assert.ok(lines.includes('■ 第二张'))
+    // id 行也跟着空行分组，不会两张卡共用一个 id 行。
+    assert.equal(lines.filter((line) => line.startsWith('  卡片 id ')).length, 2)
   })
 
   it('没有 explain 行时不产生多余空白行', () => {
     // explain 为空说明打分链路异常，但渲染不该因此吐出孤立的空行。
     const scored = makeScored('裸卡', 0.1, { explain: [] })
     const text = renderFocusPackExplain(makePack([scored]), 1)
-    assert.equal(text, '焦点包 1 张，候选 1 张\n\n■ 裸卡\n  总分 0.100')
+    assert.equal(text, '焦点包 1 张，候选 1 张\n\n■ 裸卡\n  卡片 id card-2\n  总分 0.100')
   })
 
   it('同一输入渲染两次结果完全一致（ST-1 确定性）', () => {

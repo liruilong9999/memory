@@ -22,6 +22,7 @@ import {
 } from '../../src/cli/memoryctl.ts'
 import { DEFAULT_CONFIG, mergeConfig } from '../../src/core/config.ts'
 import type { DeepPartial, MemoryConfig } from '../../src/core/config.ts'
+import { formatCardRef, formatTime } from '../../src/core/scoring.ts'
 import { buildCardId, buildEdgeId } from '../../src/core/types.ts'
 import type { MemoryCard, MemoryDomain, MemoryKind, SourcePointer } from '../../src/core/types.ts'
 import { MemoryEngine } from '../../src/host/engine.ts'
@@ -1208,6 +1209,232 @@ describe('rebuild（FR-F4）', () => {
     assert.ok(payload.records > 0)
     assert.equal(payload.active, 2)
     assert.equal(payload.archived, 1)
+  })
+})
+
+describe('history（FR-A5 可查历史）', () => {
+  /**
+   * 往临时库里种一张**有两条修正历史**的卡。
+   *
+   * 修行走的是真实 `engine.revise`，不是手工往 `revisions` 里塞数组：
+   * 后者会让「写历史那条路坏了」时这些用例依然全绿——而「历史查不到」
+   * 恰恰有两种成因（没写进去 / 写进去了没出口），必须用真实写入把第一种排除掉。
+   *
+   * 第二条修正的 `reason` 刻意留空，用来覆盖「未填写原因」那条渲染分支。
+   *
+   * @param dir - 数据目录。
+   * @returns 完整 id 与前 8 位前缀。
+   */
+  function seedRevisedCard(dir: string): { id: string; prefix: string } {
+    const store = openStore({ dataDir: dir })
+    const card = makeCard('fact', '生产环境部署必须先跑数据库迁移')
+    store.putCard(card)
+    const engine = new MemoryEngine({
+      store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock,
+    })
+    assert.equal(
+      engine.revise(card.id, '生产环境部署必须先跑迁移脚本', '流程调整'),
+      true, '前提：第一条修正必须真的写进库',
+    )
+    assert.equal(
+      engine.revise(card.id, '生产环境部署必须先跑数据库迁移脚本', ''),
+      true, '前提：第二条修正必须真的写进库',
+    )
+    const after = engine.inspect(card.id)
+    assert.equal(after?.revisions.length, 2, '前提：两条修正记录都要在')
+    store.close()
+    return { id: card.id, prefix: formatCardRef(card.id) }
+  }
+
+  it('列出每次修正的时间、旧正文与原因', () => {
+    const dir = tempDir()
+    const { id } = seedRevisedCard(dir)
+    const result = runCli(['history', id, '--data-dir', dir, '--tz', TZ], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.equal(result.stderr, '')
+    assert.ok(result.stdout.includes(`卡片 id ${id}`), result.stdout)
+    assert.match(result.stdout, /修正过 2 次/u)
+    assert.ok(result.stdout.includes('旧正文：生产环境部署必须先跑数据库迁移'), result.stdout)
+    assert.ok(result.stdout.includes('旧正文：生产环境部署必须先跑迁移脚本'), result.stdout)
+    assert.ok(result.stdout.includes('原因：流程调整'), result.stdout)
+    // 空 reason 必须显式写「未填写原因」——留白与「渲染漏了一行」在终端里一样。
+    assert.ok(result.stdout.includes('原因：未填写原因'), result.stdout)
+    // 时间必须来自真实修正时刻（固定时钟），不是格式占位符。
+    assert.ok(result.stdout.includes(formatTime(fixedClock(), TZ)), result.stdout)
+  })
+
+  it('--json 输出结构与卡片字段', () => {
+    const dir = tempDir()
+    const { id } = seedRevisedCard(dir)
+    const result = runCli(['history', id, '--data-dir', dir, '--json'], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    const payload = JSON.parse(result.stdout) as {
+      id: string
+      status: string
+      revisions: { at: number; reason: string; previousText: string; actor: string }[]
+    }
+    assert.equal(payload.id, id)
+    assert.equal(payload.status, 'active')
+    assert.equal(payload.revisions.length, 2)
+    assert.equal(payload.revisions[0]?.reason, '流程调整', '最早的一条在前')
+    assert.equal(payload.revisions[0]?.previousText, '生产环境部署必须先跑数据库迁移')
+    assert.equal(payload.revisions[0]?.actor, 'manual')
+    assert.equal(payload.revisions[1]?.reason, '', '空原因在 JSON 里保留原值，不替它编一句')
+    assert.deepEqual(payload.revisions.map((r) => r.at), [fixedClock(), fixedClock()])
+  })
+
+  it('从未修正过的卡明确说「从未修正过」，而不是空输出', () => {
+    const dir = tempDir()
+    seedStore(dir)
+    const store = openStore({ dataDir: dir })
+    const target = store.listCards({}).find((card) => card.text.includes('生产环境部署必须先跑'))
+    store.close()
+    assert.ok(target !== undefined, '前提：seedStore 里必须有那张卡')
+    const result = runCli(['history', target.id, '--data-dir', dir], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.match(result.stdout, /从未修正过/u)
+    assert.ok(result.stdout.trim().length > 0, '不能是空输出')
+  })
+
+  it('缺 id 返回用法错误', () => {
+    const result = runCli(['history', '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_USAGE)
+    assert.match(result.stderr, /history 需要一个卡片 id/u)
+  })
+
+  it('卡片不存在时说明情况并退出 1（沿用 restore / revise 的约定）', () => {
+    const result = runCli(['history', 'ffffffffffffffff', '--data-dir', tempDir()])
+    assert.equal(result.code, EXIT_UNHEALTHY)
+    assert.equal(result.stdout, '')
+    assert.match(result.stderr, /没有这张卡：ffffffffffffffff/u)
+  })
+})
+
+describe('卡片 id 前缀（可查历史 ↔ 可粘回命令的闭环）', () => {
+  /**
+   * 直接写入指定 id 的卡，用来构造「前缀撞车」。
+   *
+   * 真实 id 是 FNV 哈希，靠自然碰撞拼出两条相同前缀既不稳定也不可读；
+   * 而这里要测的正是「两条同前缀时怎么办」，所以把 id 钉死。
+   *
+   * @param dir - 数据目录。
+   * @param id - 完整 16 位十六进制 id。
+   * @param text - 正文。
+   */
+  function putCardWithId(dir: string, id: string, text: string): void {
+    const store = openStore({ dataDir: dir })
+    store.putCard(makeCard('fact', text, { id }))
+    store.close()
+  }
+
+  it('人读输出里印的 id 可以原样粘给 revise（闭环）', () => {
+    // 这是整个缺口的核心：用户看到一张卡想修正，必须能从屏幕上抄下一个字符串、
+    // 粘进 revise 就能用。只断言「输出里有 id 字样」是不够的——
+    // 印成任何拿不回来的东西都会让那条断言变绿。
+    const dir = tempDir()
+    seedStore(dir)
+    const listed = runCli(['query', '部署', '--data-dir', dir, '--tz', TZ], { now: fixedClock })
+    assert.equal(listed.code, EXIT_OK)
+    const printed = listed.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('  卡片 id '))
+      .map((line) => line.slice('  卡片 id '.length))
+    assert.equal(printed.length, 2, '前提：两张活跃卡都要印出 id')
+    for (const ref of printed) {
+      assert.match(ref, /^[0-9a-f]{8}$/u, `印出来的应该是 8 位十六进制前缀，实际：${ref}`)
+    }
+
+    const target = printed[0] ?? ''
+    const revised = runCli(
+      ['revise', target, '部署前必须先跑数据库迁移', '--reason', '补一步', '--data-dir', dir],
+      { now: fixedClock },
+    )
+    assert.equal(revised.code, EXIT_OK, revised.stderr)
+    assert.match(revised.stdout, /已修正/u)
+
+    // 正向证据：修正真的落到了「印出那个前缀所指的那张卡」上，而不是随便一张。
+    const after = runCli(['history', target, '--data-dir', dir, '--tz', TZ], { now: fixedClock })
+    assert.equal(after.code, EXIT_OK)
+    assert.ok(after.stdout.includes('原因：补一步'), after.stdout)
+    assert.match(after.stdout, /修正过 1 次/u)
+  })
+
+  it('人读输出里印的 id 可以原样粘给 restore（闭环，归档卡不印在 query 里）', () => {
+    // 归档卡不出现在 query 的输出里，但 history 能查、restore 要能用同一个前缀。
+    const dir = tempDir()
+    putCardWithId(dir, 'abcdef0123456789', '部署脚本已废弃')
+    const store = openStore({ dataDir: dir })
+    const engine = new MemoryEngine({
+      store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock,
+    })
+    const before = engine.inspect('abcdef0123456789')
+    assert.ok(before !== undefined, '前提：卡必须在')
+    store.append({ op: 'archive', id: 'abcdef0123456789', at: T0 + 1, reason: '测试归档' })
+    assert.equal(engine.inspect('abcdef0123456789')?.status, 'archived', '前提：必须真的归档了')
+    store.close()
+
+    const restored = runCli(['restore', 'abcdef01', '--data-dir', dir], { now: fixedClock })
+    assert.equal(restored.code, EXIT_OK, restored.stderr)
+    assert.ok(restored.stdout.includes('已恢复：abcdef0123456789'), restored.stdout)
+  })
+
+  it('前缀撞多张时明确报错并列出候选，绝不随便挑一张', () => {
+    const dir = tempDir()
+    putCardWithId(dir, 'abcd000000000000', '第一张同前缀卡')
+    putCardWithId(dir, 'abcd000000000001', '第二张同前缀卡')
+
+    const result = runCli(['history', 'abcd', '--data-dir', dir], { now: fixedClock })
+    assert.equal(result.code, EXIT_USAGE, '歧义是用法问题，不是库坏了')
+    assert.equal(result.stdout, '', '不能输出任何一张卡的历史——那等于已经挑了一张')
+    assert.match(result.stderr, /匹配到 2 张，请给更长前缀：abcd/u)
+    // 候选必须列全：只报数量、不列 id 的话，用户没有更长前缀可敲。
+    assert.ok(result.stderr.includes('abcd000000000000'), result.stderr)
+    assert.ok(result.stderr.includes('abcd000000000001'), result.stderr)
+
+    // 反向：更长前缀就不再歧义，能正常查。
+    const narrower = runCli(['history', 'abcd000000000000', '--data-dir', dir], { now: fixedClock })
+    assert.equal(narrower.code, EXIT_OK)
+    assert.ok(narrower.stdout.includes('第一张同前缀卡'), narrower.stdout)
+  })
+
+  it('前缀歧义时 revise / restore 同样拒绝执行（不留半截副作用）', () => {
+    const dir = tempDir()
+    putCardWithId(dir, 'abcd000000000000', '第一张同前缀卡')
+    putCardWithId(dir, 'abcd000000000001', '第二张同前缀卡')
+
+    const revised = runCli(
+      ['revise', 'abcd', '被改坏的正文', '--data-dir', dir], { now: fixedClock },
+    )
+    assert.equal(revised.code, EXIT_USAGE)
+    assert.match(revised.stderr, /匹配到 2 张/u)
+    assert.doesNotMatch(revised.stdout, /已修正/u, '没做成的事不能说「已修正」')
+
+    // 前提+反向：两张卡一个字都没被改过。只断言退出码的话，
+    // 「先改了一张再发现歧义」的实现也能绿。
+    const listed = runCli(['history', 'abcd000000000000', '--data-dir', dir], { now: fixedClock })
+    assert.ok(listed.stdout.includes('第一张同前缀卡'), listed.stdout)
+    assert.match(listed.stdout, /从未修正过/u)
+    const other = runCli(['history', 'abcd000000000001', '--data-dir', dir], { now: fixedClock })
+    assert.match(other.stdout, /从未修正过/u)
+  })
+
+  it('完整 id 走精确匹配，不依赖前缀扫描', () => {
+    // 完整 id 是脚本与旧文档的写法，必须一直有效——它是「更长前缀」的极限情况。
+    const dir = tempDir()
+    const { id } = ((): { id: string } => {
+      const store = openStore({ dataDir: dir })
+      const card = makeCard('fact', '生产环境部署必须先跑数据库迁移')
+      store.putCard(card)
+      const engine = new MemoryEngine({
+        store, config: DEFAULT_CONFIG, timeZone: TZ, clock: fixedClock,
+      })
+      engine.revise(card.id, '生产环境部署必须先跑迁移脚本', '流程调整')
+      store.close()
+      return { id: card.id }
+    })()
+    const result = runCli(['history', id, '--data-dir', dir, '--tz', TZ], { now: fixedClock })
+    assert.equal(result.code, EXIT_OK)
+    assert.ok(result.stdout.includes('原因：流程调整'), result.stdout)
   })
 })
 

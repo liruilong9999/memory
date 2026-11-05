@@ -39,7 +39,7 @@ export const FALLBACK_TIME_ZONE = 'Asia/Shanghai'
 /** 全部子命令，顺序即用法文本里的展示顺序。 */
 export const COMMANDS = [
   'query', 'export', 'import', 'rebuild', 'health', 'consolidate', 'restore', 'revise',
-  'logs', 'report', 'config', 'help',
+  'history', 'logs', 'report', 'config', 'help',
 ] as const
 
 /** 子命令名。 */

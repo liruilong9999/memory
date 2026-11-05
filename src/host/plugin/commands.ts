@@ -7,8 +7,47 @@
  * @module dsh-memory/host/plugin/commands
  */
 
-import { renderFocusPackExplain } from '../../core/render.ts'
+import { renderCardHistory, renderFocusPackExplain } from '../../core/render.ts'
+import { lookupCard } from '../../core/scoring.ts'
+import type { MemoryCard } from '../../core/types.ts'
 import type { MemoryEngine } from '../engine.ts'
+
+/**
+ * 解析会话内命令给的卡片引用（完整 id 或人读输出里印的前缀）。
+ *
+ * 人读输出（`/memory explain` 与 `memoryctl query`）里印的是前 8 位，
+ * 而 `engine.inspect` 只认完整 id。不做这一步，用户从屏幕上抄来的字符串
+ * 必然得到「没有这张卡」——**输出与输入对不上，id 就白印了**。
+ *
+ * 返回字符串表示失败（已经是给人看的话），返回卡片表示成功。
+ * **有歧义绝不挑一张**：悄悄改了另一张卡而一切看起来正常，是查不出来的错。
+ *
+ * @param engine - 记忆引擎（只调用只读入口）。
+ * @param ref - 用户写的引用。
+ * @returns 解析出的卡片，或一句失败说明。
+ */
+function resolveCardInSession(engine: MemoryEngine, ref: string): MemoryCard | string {
+  const exact = engine.inspect(ref)
+  if (exact !== undefined) return exact
+  // 未命中才扫全库做前缀匹配。归档卡也要在候选里——`restore` 的主顾正是它们。
+  const found = lookupCard(engine.query({}), ref)
+  if (found.ok) return found.card
+  return found.message
+}
+
+/**
+ * 会话内渲染历史用的时区。
+ *
+ * 引擎不暴露 `timeZone`（它是私有的），`buildTime` 是唯一合法出口：
+ * 用引擎自己的时钟取一个 `TimeState`，把里面的时区交给渲染层。
+ * 这样 `/memory history` 与 `memoryctl history` 在同一台机器上显示同一时刻。
+ *
+ * @param engine - 记忆引擎。
+ * @returns IANA 时区名。
+ */
+function sessionTimeZone(engine: MemoryEngine): string {
+  return engine.buildTime(engine.now()).timeZone
+}
 
 /**
  * `/memory` 命令实现。
@@ -42,12 +81,14 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     // FR-C2 的生产入口。归档是**自动**发生的（autoArchive 默认开），
     // 在此之前用户没有任何办法撤销一次误归档——数据面有 `restore` 分支、
     // 有测试，但没有生产者。能力在、路径缺，比没实现更危险。
-    const id = trimmed.slice('restore'.length).trim()
-    if (id.length === 0) return '用法：/memory restore <卡片 id>'
-    const card = engine.inspect(id)
-    if (card === undefined) return `没有这张卡：${id}`
-    if (!engine.restore(id)) return `这张卡没有被归档（当前状态：${card.status}），无需恢复`
-    return `已恢复：${id}`
+    const ref = trimmed.slice('restore'.length).trim()
+    if (ref.length === 0) return '用法：/memory restore <卡片 id>'
+    const resolved = resolveCardInSession(engine, ref)
+    if (typeof resolved === 'string') return resolved
+    if (!engine.restore(resolved.id)) {
+      return `这张卡没有被归档（当前状态：${resolved.status}），无需恢复`
+    }
+    return `已恢复：${resolved.id}`
   }
   if (command === 'revise') {
     // FR-A5 的生产入口。此前 `revisions` 数组**恒为空**，
@@ -55,13 +96,24 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const rest = trimmed.slice('revise'.length).trim()
     const space = rest.indexOf(' ')
     if (space < 0) return '用法：/memory revise <卡片 id> <新正文>'
-    const id = rest.slice(0, space)
+    const ref = rest.slice(0, space)
     const text = rest.slice(space + 1).trim()
-    if (id.length === 0 || text.length === 0) return '用法：/memory revise <卡片 id> <新正文>'
-    const card = engine.inspect(id)
-    if (card === undefined) return `没有这张卡：${id}`
-    if (!engine.revise(id, text, '会话内手动修正')) return '正文没有变化，未写入修正记录'
-    return `已修正：${id}`
+    if (ref.length === 0 || text.length === 0) return '用法：/memory revise <卡片 id> <新正文>'
+    const resolved = resolveCardInSession(engine, ref)
+    if (typeof resolved === 'string') return resolved
+    if (!engine.revise(resolved.id, text, '会话内手动修正')) return '正文没有变化，未写入修正记录'
+    return `已修正：${resolved.id}`
+  }
+  if (command === 'history') {
+    // FR-A5 的读取出口。`revisions` 早有生产者（engine.revise / CLI revise /
+    // 本命令的 revise），但此前**没有任何渲染代码读它**——`reason` 写进去了，
+    // 却查不到。需求原文要的是「修正后可查『改过什么、为什么』」，
+    // 而「写」与「可查」是两件事。
+    const ref = trimmed.slice('history'.length).trim()
+    if (ref.length === 0) return '用法：/memory history <卡片 id>'
+    const resolved = resolveCardInSession(engine, ref)
+    if (typeof resolved === 'string') return resolved
+    return renderCardHistory(resolved, sessionTimeZone(engine))
   }
   if (command === 'status') {
     const metrics = engine.metrics()
@@ -85,5 +137,5 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const result = engine.recall(trimmed.slice('explain'.length).trim())
     return renderFocusPackExplain(result.pack, result.candidates)
   }
-  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise`
+  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise / history`
 }

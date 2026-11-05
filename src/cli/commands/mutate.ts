@@ -1,5 +1,6 @@
 import type { MemoryEngine } from '../../host/engine.ts'
 import { jsonText, usageFailure } from '../output.ts'
+import { resolveCardRef } from '../resolveCard.ts'
 import { EXIT_OK, EXIT_UNHEALTHY } from '../types.ts'
 import type { CliOptions, CliResult } from '../types.ts'
 
@@ -23,24 +24,23 @@ import type { CliOptions, CliResult } from '../types.ts'
 export function runRestore(options: CliOptions, engine: MemoryEngine): CliResult {
   const id = options.positionals[0]
   if (id === undefined || id.length === 0) {
-    return usageFailure('restore 需要一个卡片 id，例如：memoryctl restore card_1a2b3c')
+    return usageFailure('restore 需要一个卡片 id，例如：memoryctl restore 1a2b3c4d')
   }
-  const card = engine.inspect(id)
-  if (card === undefined) {
-    return { code: EXIT_UNHEALTHY, stdout: '', stderr: `没有这张卡：${id}\n` }
-  }
-  const written = engine.restore(id)
+  const resolved = resolveCardRef(engine, id)
+  if (!resolved.ok) return resolved.result
+  const card = resolved.card
+  const written = engine.restore(card.id)
   if (!written) {
     // 区分「本来就没归档」与「写库失败」——两者都不是错误，
     // 但告诉用户「它已经是活跃的」比只说「没做」有用得多。
     return {
       code: EXIT_UNHEALTHY,
-      stdout: options.json ? jsonText({ id, restored: false, status: card.status }) : '',
+      stdout: options.json ? jsonText({ id: card.id, restored: false, status: card.status }) : '',
       stderr: `这张卡没有被归档（当前状态：${card.status}），无需恢复\n`,
     }
   }
-  if (options.json) return { code: EXIT_OK, stdout: jsonText({ id, restored: true }), stderr: '' }
-  return { code: EXIT_OK, stdout: `已恢复：${id}\n`, stderr: '' }
+  if (options.json) return { code: EXIT_OK, stdout: jsonText({ id: card.id, restored: true }), stderr: '' }
+  return { code: EXIT_OK, stdout: `已恢复：${card.id}\n`, stderr: '' }
 }
 
 /**
@@ -58,26 +58,27 @@ export function runRestore(options: CliOptions, engine: MemoryEngine): CliResult
 export function runRevise(options: CliOptions, engine: MemoryEngine): CliResult {
   const id = options.positionals[0]
   if (id === undefined || id.length === 0) {
-    return usageFailure('revise 需要一个卡片 id，例如：memoryctl revise card_1a2b3c "新的正文"')
+    return usageFailure('revise 需要一个卡片 id，例如：memoryctl revise 1a2b3c4d "新的正文"')
   }
   const text = options.positionals.slice(1).join(' ').trim()
   if (text.length === 0) {
-    return usageFailure('revise 需要新的正文，例如：memoryctl revise card_1a2b3c "新的正文"')
+    return usageFailure('revise 需要新的正文，例如：memoryctl revise 1a2b3c4d "新的正文"')
   }
-  const card = engine.inspect(id)
-  if (card === undefined) {
-    return { code: EXIT_UNHEALTHY, stdout: '', stderr: `没有这张卡：${id}\n` }
-  }
-  const written = engine.revise(id, text, options.reason)
+  const resolved = resolveCardRef(engine, id)
+  if (!resolved.ok) return resolved.result
+  const card = resolved.card
+  const written = engine.revise(card.id, text, options.reason)
   if (!written) {
     return {
       code: EXIT_UNHEALTHY,
-      stdout: options.json ? jsonText({ id, revised: false }) : '',
+      stdout: options.json ? jsonText({ id: card.id, revised: false }) : '',
       stderr: `正文没有变化，未写入修正记录\n`,
     }
   }
-  if (options.json) return { code: EXIT_OK, stdout: jsonText({ id, revised: true, text }), stderr: '' }
-  return { code: EXIT_OK, stdout: `已修正：${id}\n`, stderr: '' }
+  if (options.json) {
+    return { code: EXIT_OK, stdout: jsonText({ id: card.id, revised: true, text }), stderr: '' }
+  }
+  return { code: EXIT_OK, stdout: `已修正：${card.id}\n`, stderr: '' }
 }
 
 /**

@@ -228,10 +228,92 @@ export function describeConflictPeers(item: ScoredCard, pack: FocusPack): string
   for (const id of ids) {
     const peer = pack.cards.find((other) => other.card.id === id)
     if (peer === undefined) {
-      described.push(`（另一条记忆 ${id.slice(0, 8)}，不在本次焦点包内）`)
+      described.push(`（另一条记忆 ${formatCardRef(id)}，不在本次焦点包内）`)
       continue
     }
     described.push(`「${truncate(peer.card.text, pack.maxCardChars)}」`)
   }
   return described.join('；')
+}
+
+/* ------------------------------------------------------------------ *
+ * 卡片引用（人读输出里怎么写、用户抄回来怎么解析）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 人读输出里卡片 id 的展示长度（取前 N 位）。
+ *
+ * ## 8 这个数从哪来
+ *
+ * 卡片 id 是 `buildCardId` 产出的 **16 位十六进制**（64 位 FNV-1a 取前 64 位
+ * 的完整十六进制文本）。人读输出里没必要占 16 个字符，取前 8 位 = **32 位熵**。
+ * 按生日悖论估算，一个库里 `n` 张卡撞前缀的概率约 `n² / (2 × 2³²)`：
+ * `n = 1000` 约 0.012%，`n = 5000` 约 0.29%。
+ *
+ * 也就是说 **8 位不是「永远够用」，而是「大多数时候够用、且撞了能被发现」**。
+ * 它成立的前提是配对的解析函数 {@link lookupCard}：撞前缀时它报
+ * 「匹配到多张，请给更长前缀」，而不是随便挑一张。**没有这一步，缩短就是错的**
+ * ——用户拿着 `a1b2c3d4` 敲 `restore`，系统悄悄恢复了另一张卡，事后无从发现。
+ *
+ * 改这个数只改一处：渲染（{@link formatCardRef}）与解析（{@link lookupCard}，
+ * 它接受任意长度的前缀）都读它或与它相容，不会各自漂移。
+ */
+export const CARD_REF_PREFIX_LENGTH = 8
+
+/**
+ * 把卡片 id 渲染成人读输出里的引用写法。
+ *
+ * 规则：**长于 {@link CARD_REF_PREFIX_LENGTH} 时截断，否则原样返回**。
+ * 不足 8 位原样返回是为了让测试与手工构造的 id（如 `card-7`）也能被渲染，
+ * 渲染函数不该假定 id 一定是 16 位。
+ *
+ * @param id - 完整卡片 id。
+ * @returns 可粘回 `restore` / `revise` / `history` 的引用写法。
+ */
+export function formatCardRef(id: string): string {
+  return id.length <= CARD_REF_PREFIX_LENGTH ? id : id.slice(0, CARD_REF_PREFIX_LENGTH)
+}
+
+/**
+ * 卡片引用的解析结果。
+ *
+ * `ok: false` 时 `message` 已经是**给人看的一句话**：调用方（CLI / 会话命令）
+ * 直接打印即可，不需要各自再拼一遍文案——两处各写一遍就是两个真相源。
+ */
+export type CardRefLookup =
+  | { ok: true; card: MemoryCard }
+  | { ok: false; reason: 'not-found' | 'ambiguous'; message: string }
+
+/**
+ * 把用户抄回来的卡片引用解析成一张卡。
+ *
+ * ## 判据顺序（顺序本身就是判据）
+ *
+ * 1. **全 id 精确命中优先**：用户给的是完整 16 位时，前缀歧义与他无关。
+ * 2. 否则按**前缀**匹配。大小写不敏感——id 是十六进制，`AB` 与 `ab` 是同一个数；
+ *    人从终端复制时大小写不该成为失败原因。
+ * 3. 命中 0 张 → `not-found`；命中 1 张 → 返回它。
+ * 4. 命中 ≥2 张 → `ambiguous`，**绝不挑一张**。挑一张的后果是「命令成功了、
+ *    改的是另一张卡」，而输出里看不出任何异常——这是缺陷三十四那种
+ *    「每步都成功、结果全错」的形状。
+ *
+ * @param cards - 候选卡片集合（通常是一次 `engine.query({})` 的全库结果）。
+ * @param ref - 用户给的引用；可以是全 id，也可以是前缀。
+ * @returns 解析结果。
+ */
+export function lookupCard(cards: readonly MemoryCard[], ref: string): CardRefLookup {
+  const wanted = ref.trim().toLowerCase()
+  if (wanted.length === 0) return { ok: false, reason: 'not-found', message: `没有这张卡：${ref}` }
+  // 精确命中优先：全 id 不需要参与前缀歧义判定。
+  const exact = cards.find((card) => card.id.toLowerCase() === wanted)
+  if (exact !== undefined) return { ok: true, card: exact }
+  const matches = cards.filter((card) => card.id.toLowerCase().startsWith(wanted))
+  const only = matches[0]
+  if (matches.length === 1 && only !== undefined) return { ok: true, card: only }
+  if (matches.length === 0) return { ok: false, reason: 'not-found', message: `没有这张卡：${ref}` }
+  // 候选按 id 升序，保证同一库同一引用每次报出来的名单完全一致（ST-1）。
+  const sorted = [...matches].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  const lines = [`匹配到 ${sorted.length} 张，请给更长前缀：${ref}`]
+  for (const card of sorted) lines.push(`  ${card.id}「${card.text}」`)
+  return { ok: false, reason: 'ambiguous', message: lines.join('\n') }
 }
