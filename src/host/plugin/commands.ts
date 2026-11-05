@@ -50,6 +50,42 @@ function sessionTimeZone(engine: MemoryEngine): string {
 }
 
 /**
+ * `/memory pin` 与 `/memory unpin` 的共同实现。
+ *
+ * ## 为什么这里自己拼字符串，而不复用 CLI 的 `runPin`
+ *
+ * 会话命令的返回类型是 `string`（要直接塞进对话里给人看），CLI 返回的是
+ * `{ code, stdout, stderr }`（还有退出码要区分）。两者共用**动作**（都调
+ * `engine.pin` / `engine.unpin`），但出口形状不同——强行共用会让会话里
+ * 多出一层退出码概念，或者让 CLI 丢掉「状态没变」与「卡不存在」的分辨。
+ * 与 `restore` / `revise` 在上面的写法保持一致。
+ *
+ * ## 「已经钉住了」为什么不算成功
+ *
+ * 与 CLI 同一套语义（那里有详细理由）：状态没变 ⇒ `false` ⇒ 明说没写记录。
+ * 静默返回「已钉住」会让用户以为这次调用起了作用，而它什么都没做。
+ *
+ * @param engine - 记忆引擎。
+ * @param trimmed - 去掉首尾空白后的整条命令（含子命令名）。
+ * @param target - 目标 `pinned` 值。
+ * @returns 给人看的结果文本。
+ */
+function runPinInSession(engine: MemoryEngine, trimmed: string, target: boolean): string {
+  const word = target ? 'pin' : 'unpin'
+  const ref = trimmed.slice(word.length).trim()
+  if (ref.length === 0) return `用法：/memory ${word} <卡片 id>`
+  const resolved = resolveCardInSession(engine, ref)
+  if (typeof resolved === 'string') return resolved
+  const changed = target ? engine.pin(resolved.id) : engine.unpin(resolved.id)
+  if (!changed) {
+    return target
+      ? `这张卡已经钉住了（卡片 id：${resolved.id}），无需重复操作`
+      : `这张卡本来就没有钉住（卡片 id：${resolved.id}），无需取消`
+  }
+  return `${target ? '已钉住' : '已取消钉住'}：${resolved.id}`
+}
+
+/**
  * `/memory` 命令实现。
  *
  * 只读为主：命令是给人看的，不应该顺带改变记忆状态。
@@ -115,6 +151,17 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     if (typeof resolved === 'string') return resolved
     return renderCardHistory(resolved, sessionTimeZone(engine))
   }
+  if (command === 'pin') {
+    // FR-C3 的人工豁免。`shouldArchive` 里 `if (card.pinned) return false` 早就在，
+    // 但在本命令之前**没有任何入口能把 pinned 置成 true**：字段认了、判定写了、
+    // 测试绿了，用户却够不到。这是 restore 那条「能力在、路径缺」的同一个形态。
+    return runPinInSession(engine, trimmed, true)
+  }
+  if (command === 'unpin') {
+    // 豁免必须能撤销：否则一次误操作就把「忘得掉」（起源 L11「细节会忘」）
+    // 永久关掉了，而用户没有任何办法改回来。
+    return runPinInSession(engine, trimmed, false)
+  }
   if (command === 'status') {
     const metrics = engine.metrics()
     const health = engine.health()
@@ -137,5 +184,5 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const result = engine.recall(trimmed.slice('explain'.length).trim())
     return renderFocusPackExplain(result.pack, result.candidates)
   }
-  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise / history`
+  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise / history / pin / unpin`
 }

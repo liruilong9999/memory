@@ -689,6 +689,84 @@ export class MemoryEngine {
   }
 
   /**
+   * 手动钉住一张卡，让它免于自动归档（FR-C3 的人工豁免入口）。
+   *
+   * ## 为什么必须有这个方法
+   *
+   * `consolidate/archive.ts` 的 `shouldArchive` 里 `if (card.pinned) return false`
+   * 排在最前面，测试也覆盖了——但 `src/` 里没有任何一处能**让 `pinned` 变成
+   * `true`**。数据面认这个字段，用户却没有任何入口去置它：`pinned` 永远停在
+   * 写入时的初值，人工豁免在真实数据上恒不生效。这是 {@link restore} 那条
+   * 「能力在、路径缺」的同一个形态（见缺陷十七、三十三）。
+   *
+   * ## 为什么落的是整张卡，而不是一条 `pin` 操作
+   *
+   * 日志的操作集合（`journal.ts` 的 `KNOWN_OPS`）是**封闭**的：只有 put /
+   * revise / touch / archive / restore / merge / edge / purge，没有 pin。
+   * 而重放层里唯一能改 `pinned` 的只有 `put` 分支（整卡覆盖）。所以这里走
+   * `store.putCard`，与 {@link restore} 走 `append({op:'restore'})` 的差别
+   * 不在风格，而在**数据面只提供了这一条路**。
+   *
+   * @param id - 卡片 id。
+   * @param now - 钉住时刻；省略时取当前时钟。
+   * @returns 是否真的写了一条记录（卡不存在、或本来就是钉住状态时返回 `false`）。
+   */
+  pin(id: string, now = this.clock()): boolean {
+    return this.setPinned(id, true, now)
+  }
+
+  /**
+   * 取消钉住，让这张卡重新受自动归档管辖（FR-C3）。
+   *
+   * 钉住是**人工豁免**，不是永久豁免：豁免必须能撤销，否则「忘得掉」这条
+   * （起源 L11「细节会忘」）会被一次误操作永久关掉——用户只能改库，而库的
+   * 写入路径对他是不可见的。
+   *
+   * @param id - 卡片 id。
+   * @param now - 取消时刻；省略时取当前时钟。
+   * @returns 是否真的写了一条记录（卡不存在、或本来就没钉住时返回 `false`）。
+   */
+  unpin(id: string, now = this.clock()): boolean {
+    return this.setPinned(id, false, now)
+  }
+
+  /**
+   * {@link pin} 与 {@link unpin} 的共同实现：把 `pinned` 写成一个确定的目标值。
+   *
+   * ## `updatedAt` 为什么必须手动往前推 1 毫秒
+   *
+   * `put` 的幂等键（`store.ts` 的 `deriveIdempotencyKey`）由 id / updatedAt /
+   * text / conflictOf / strength / status / accessCount / dueAt / dueRepeat /
+   * cronExpression 拼成——**`pinned` 不在里面**。于是「只翻 pinned」的 put 与
+   * 上一次写这张卡时的键**逐字节相同**，日志层会判成重复提交并**静默丢弃**
+   * （`journal.append` 返回 `appended: false`）：方法返回 `false`、卡还是旧的
+   * pinned 值，而调用方以为自己改过了。这正是 AGENTS.md 第五节点名的
+   * 「幂等键漏字段」缺陷在 put 分支上的第三次变体（前两次是 `edge` 漏 weight、
+   * `put` 漏 strength/status/accessCount）。
+   *
+   * 危险的是「只写 `updatedAt: now`」在通常情况下**恰好**管用：真实时钟几乎
+   * 总比卡上次变动晚。但同一个毫秒里写入再钉住（会话内刚写就钉、CLI 的固定
+   * 时钟测试）就会撞键。靠巧合安全不是靠规则安全，所以这里写成
+   * `max(now, card.updatedAt + 1)`：它由构造保证严格大于卡上一次的
+   * updatedAt，因此键必然与产生当前状态的那条记录不同。
+   *
+   * 副作用可接受：`updatedAt` **不进打分**（打分的新鲜度用的是 `createdAt`，
+   * 见 `core/scoring/score.ts`），只影响 `listCards` 的排序与
+   * `detectLastActivity()`，而「这张卡最近变过」正是它该表达的意思。
+   */
+  private setPinned(id: string, pinned: boolean, now: number): boolean {
+    const card = this.store.getCard(id)
+    // 卡不存在 ⇒ 无事可做，理由与 restore 相同：id 可能来自旧日志或用户手抄。
+    if (card === undefined) return false
+    // 状态没变 ⇒ 不写记录。否则「钉住」按钮每按一次就多一条 put，
+    // 而 FR-A3 要求日志里的每一条都对应一次真实的变更。
+    if (card.pinned === pinned) return false
+    const updatedAt = Math.max(now, card.updatedAt + 1)
+    const outcome = this.store.putCard({ ...card, pinned, updatedAt }, undefined, updatedAt)
+    return outcome.written
+  }
+
+  /**
    * 修正一张卡的正文，保留旧版本（FR-A5 的生产入口）。
    *
    * 与 {@link restore} 同一类缺口：`state.ts` 的 `revise` 分支把

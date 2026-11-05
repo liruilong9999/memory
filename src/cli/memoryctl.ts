@@ -53,7 +53,7 @@ import { runConfig } from './commands/config.ts'
 import { runExport } from './commands/export.ts'
 import { runHistory } from './commands/history.ts'
 import { runImport } from './commands/import.ts'
-import { runRebuild, runConsolidate, runRestore, runRevise } from './commands/mutate.ts'
+import { runRebuild, runConsolidate, runPin, runRestore, runRevise, runUnpin } from './commands/mutate.ts'
 import { runHealth, runLogs, runReport } from './commands/observe.ts'
 import { runQuery } from './commands/query.ts'
 import { helpText } from './help.ts'
@@ -203,6 +203,12 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
         break
       case 'history':
         result = runHistory(options, engine, timeZone)
+        break
+      case 'pin':
+        result = runPin(options, engine)
+        break
+      case 'unpin':
+        result = runUnpin(options, engine)
         break
       case 'logs':
         result = runLogs(options, resolved, store.dir, timeZone)
