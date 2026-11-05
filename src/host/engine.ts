@@ -36,6 +36,10 @@ import {
 import { DiagnosticLog } from './engine/diagnostics.ts'
 import { applyDueSpecs, nextDueAt, renderDueReminderText } from './engine/reminders.ts'
 import { markConflicts } from './engine/conflicts.ts'
+import {
+  compactionKey, readCompactionLedger, summarizeCompactions, upsertCompactionRecord, writeCompactionLedger,
+} from './engine/compactionLedger.ts'
+import type { CompactionRecord, CompactionStats, ShadowedRange } from './engine/compactionLedger.ts'
 
 /** 引擎参数。 */
 export interface EngineOptions {
@@ -116,6 +120,26 @@ export class MemoryEngine {
    * `dueAt` 会推进；只有推进到新时刻才应该再唤醒一次（FR-D3）。
    */
   private readonly remindedDueAt = new Map<string, number>()
+  /**
+   * 压缩台账（P1-6）：宿主每次压缩吞掉了哪些 `seq`，以及那一次回填救回了
+   * 几张卡。
+   *
+   * 跨进程持久化在 `dataDir/compaction/ledger.json`（见
+   * `./engine/compactionLedger.ts`）。**不进事件日志**：压缩是**宿主**的
+   * 动作，不是用户做的，写进日志会同时污染「重放 = 重放用户做过什么」这个
+   * 语义，并挤占 `seq`（判据二，见 `src/store/meta.ts` 模块注释）。
+   *
+   * 丢掉它可承受：最坏后果是**重复 flush 一次**，而 flush 的产物是记忆卡，
+   * 卡片经 `deriveIdempotencyKey` 去重，不会产生重复卡。丢掉的另一半只是
+   * 「最近被吞了哪些区间」这段可观测历史，而那正是会被
+   * `storage.compactionLedgerMaxEntries` 主动截掉的部分。
+   *
+   * 与 `lastConsolidationAt` 一样**刻意不写 `= []` 初始化器**：初值必须来自
+   * 磁盘。保留初始化器会让「某条构造路径忘了读盘」编译期看不出来，而它的
+   * 表现正是**跨进程幂等静默失效**——不报错、不崩溃、只是每次重启后同一个
+   * `compactionId` 都能再记一次。
+   */
+  private compactionRecords: CompactionRecord[]
 
   /**
    * @param options - 引擎参数。
@@ -145,6 +169,10 @@ export class MemoryEngine {
     // 从磁盘恢复：进程重启后不应把「上次整理」忘成 null，否则夜整理每次
     // 重启都重跑一遍（幂等，但白烧全库去重的 CPU）。
     this.lastConsolidationAt = readLastConsolidationAt(this.store.dir)
+    // 压缩台账同理必须从磁盘恢复：这是**跨进程**幂等的全部依据（同一
+    // compactionId 在重启之后再投递一次也不能重复记账）。读盘不抛错，
+    // 文件不存在就是空台账。
+    this.compactionRecords = readCompactionLedger(this.store.dir)
   }
 
   /**
@@ -723,9 +751,17 @@ export class MemoryEngine {
   /**
    * 健康检查（FR-F5）。
    *
-   * @returns 健康状态与统计。
+   * @returns 健康状态与统计（含压缩回填的观测视图）。
    */
-  health(): { healthy: boolean; active: number; archived: number; edges: number; indexOk: boolean } {
+  health(): {
+    healthy: boolean
+    active: number
+    archived: number
+    edges: number
+    indexOk: boolean
+    /** 压缩回填（P1-6）的观测视图，见 {@link compactionStats}。 */
+    compaction: CompactionStats
+  } {
     const state = this.store.snapshot()
     return {
       healthy: this.store.isIndexHealthy(),
@@ -733,7 +769,103 @@ export class MemoryEngine {
       archived: this.store.count('archived'),
       edges: state.edges.size,
       indexOk: this.store.isIndexHealthy(),
+      compaction: this.compactionStats(),
     }
+  }
+
+  /**
+   * 这个 `compactionId` 是不是已经处理过了（P1-6 的**跨进程**幂等判据）。
+   *
+   * 判据读的是**从磁盘恢复的台账**，不是进程内的一次性标记，所以插件重启、
+   * 宿主重投、CLI 与插件交替运行都看到同一个答案。
+   *
+   * 为什么还要单独一个 `has`：命中与未命中要做的事完全不同。
+   * 未命中才 flush（回填是「把快丢的东西捞回来」，重复做一遍没有收益，
+   * 只有 `putCard` 幂等键兜底才不会产生重复卡）；命中也仍要记账
+   * （`deliveries` 加一），否则「宿主重投了同一个 `compactionId`」这个
+   * 事实在数据面上完全不可见。
+   *
+   * @param sessionId - 会话 id。
+   * @param compactionId - 宿主给的压缩标识。
+   * @returns 是否已处理过。
+   */
+  hasCompaction(sessionId: string, compactionId: string): boolean {
+    const key = compactionKey({ sessionId, compactionId })
+    return this.compactionRecords.some((record) => compactionKey(record) === key)
+  }
+
+  /**
+   * 记一次压缩回填（P1-6）。
+   *
+   * 幂等键是 `sessionId + compactionId`：命中则**替换**（`deliveries` 加一，
+   * 范围与 token 数取最新投递的），未命中则追加——两个方向都有明确语义。
+   * 键里刻意**不含** `shadowedRange`，否则同一次压缩带着不同范围重投会被
+   * 当成两次，于是「该丢弃的丢弃」方向失守（`deriveIdempotencyKey` 的
+   * `edge` / `put` 分支都在同一个坑里摔过）。
+   *
+   * 落盘失败**不抛错**，只记一条诊断日志并保留内存里的记录：这里是宿主的
+   * 压缩路径，抛异常会让压缩本身失败，而压缩失败等于用户直接丢掉上下文。
+   * 代价是那次幂等记忆只在本次进程内有效——与「台账丢了最多重复 flush
+   * 一次」同量级，可接受。
+   *
+   * @param entry - 本次压缩的载荷与回填结果。
+   * @returns 记账后的记录（含算好的 `deliveries`）。
+   */
+  recordCompaction(entry: {
+    sessionId: string
+    compactionId: string
+    at: number
+    shadowedRange: ShadowedRange | null
+    shadowedSeqs: readonly number[]
+    shadowedTokenCount: number
+    flushedCards: number
+  }): CompactionRecord {
+    const previous = this.compactionRecords.find(
+      (record) => compactionKey(record) === compactionKey(entry),
+    )
+    const next: CompactionRecord = {
+      sessionId: entry.sessionId,
+      compactionId: entry.compactionId,
+      at: entry.at,
+      // 载荷缺范围时留 `null`——**不用 `{0,0}` 冒充**：那会让读者以为真有
+      // 一个零点区间。真正能回答「吞了哪些 seq」的是 `shadowedSeqs`。
+      shadowedRange: entry.shadowedRange,
+      shadowedSeqs: [...entry.shadowedSeqs],
+      shadowedTokenCount: entry.shadowedTokenCount,
+      // **累加**而不是覆盖：重投同一个 `compactionId` 时通常不再 flush
+      // （已处理过），若覆盖，一次重投就会把「救回了 3 张」抹成 0。
+      flushedCards: (previous?.flushedCards ?? 0) + entry.flushedCards,
+      deliveries: previous === undefined ? 1 : previous.deliveries + 1,
+    }
+    this.compactionRecords = upsertCompactionRecord(
+      this.compactionRecords,
+      next,
+      this.config.storage.compactionLedgerMaxEntries,
+    )
+    try {
+      writeCompactionLedger(this.store.dir, this.compactionRecords)
+    } catch (error) {
+      this.diagnostics.record({
+        kind: 'error',
+        at: entry.at,
+        summary: '压缩台账落盘失败，本次幂等记忆只在进程内有效',
+        detail: { compactionId: entry.compactionId, reason: error instanceof Error ? error.message : String(error) },
+      })
+    }
+    return next
+  }
+
+  /**
+   * 压缩回填的观测视图（P1-6）。
+   *
+   * 单独一个入口而不是塞进 `metrics()`：`metrics()` 是「给人看的周报汇总」，
+   * 与 `lastConsolidatedAt` 单独存在的理由相同——**用途不同的量分开暴露**，
+   * 将来 `metrics()` 加字段时不该让这里的读者跟着改。
+   *
+   * @returns 台账汇总；从未压缩过时是零值形状（`count === 0`）。
+   */
+  compactionStats(): CompactionStats {
+    return summarizeCompactions(this.compactionRecords)
   }
 
   /**

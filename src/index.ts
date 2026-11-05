@@ -26,13 +26,14 @@ import {
   resolveConfig, resolveTimeZone, setRepeating, subscribe,
 } from './host/adapter.ts'
 import { readRollbackState, resolveDataDirLoose } from './host/configRollback.ts'
+import { flushPendingTurn, parseCompactionSummary } from './host/engine/compaction.ts'
 import { MemoryEngine } from './host/engine.ts'
 import { runMemoryCommand } from './host/plugin/commands.ts'
 import {
   CONSOLIDATION_POLL_MS, CONTEXT_NAME, CONTEXT_ORDER,
 } from './host/plugin/constants.ts'
 import { makeFocusPackRenderer } from './host/plugin/render.ts'
-import { accumulateEvent, readTurnText } from './host/plugin/turnBuffer.ts'
+import { accumulateEvent, readTurn, readTurnText } from './host/plugin/turnBuffer.ts'
 import type { TurnBuffers } from './host/plugin/turnBuffer.ts'
 import { isWakeable, makeWakeMessage, pickDomain, sessionIdOf } from './host/plugin/wake.ts'
 import type { WakeableAgent } from './host/plugin/wake.ts'
@@ -61,6 +62,98 @@ interface Wiring {
   logger: Logger
   /** 停止定时器。 */
   disposeTimer: () => void
+}
+
+/**
+ * 处理一次压缩摘要：把该会话**还没落盘**的轮次写进记忆（P1-6 第 ② 步）。
+ *
+ * ## 为什么要有这一步
+ *
+ * 宿主压缩上下文时，被压掉的那段原文只剩一条摘要。若插件不在这一刻把
+ * 尚未落盘的轮次写进库，那些对话就**永久丢失**：后续任何一轮都不会再提到
+ * 它们，`agent/turn-stopping` 也不会为已经结束的轮次补发一次。
+ *
+ * ## 顺序为什么是「先 flush、后记账」
+ *
+ * flush 可能失败（磁盘满、抽取抛错），而记账一旦先写下去，这次压缩就被
+ * 永久标记成「已处理」，**那一轮的原始对话再没有任何补救机会**——下一次
+ * `turn-stopping` 看到的是新的 `turn/start` 重置过的空缓冲。
+ * 先 flush 后记账，最坏结果是「账没记上 → 下次同 id 重投时再 flush 一次」，
+ * 而 flush 产物经 `putCard` 的幂等键去重，不产生重复卡。**两次 flush 比
+ * 一次都没 flush 好得多。**
+ *
+ * ## 幂等
+ *
+ * 判据是 `engine.hasCompaction(sessionId, compactionId)`，读的是**从磁盘
+ * 恢复的台账**，所以插件重启、宿主重投、CLI 与插件交替运行都看到同一个
+ * 答案（内存 `Map` 做不到这一点，那只能跨轮次、不能跨进程）。
+ *
+ * ## 失败一律吞掉
+ *
+ * 这是宿主的压缩路径。记忆插件在这里抛异常会让宿主的压缩失败，而压缩失败
+ * 会让用户**直接失去上下文**——比丢几条记忆严重得多。
+ *
+ * @param turnBuffers - 各会话的累积器（flush 成功后按会话清空）。
+ * @param engine - 记忆引擎。
+ * @param config - 已校验的配置。
+ * @param logger - 日志器。
+ * @param sessionId - 会话 id。
+ * @param event - `session/event` 的第二个参数。
+ */
+function handleCompaction(
+  turnBuffers: TurnBuffers,
+  engine: MemoryEngine,
+  config: MemoryConfig,
+  logger: Logger,
+  sessionId: string,
+  event: unknown,
+): void {
+  const summary = parseCompactionSummary(event)
+  // 不是压缩摘要（绝大多数会话事件都会走到这里）：直接返回。
+  if (summary === null) return
+  const at = engine.now()
+  // 重复投递**整个不动缓冲**。先前一版在这里删了缓冲，理由写的是「残留要清」，
+  // 但那是错的：两次投递之间可能已经攒起了**下一轮**的内容，删掉就是一次
+  // 静默的数据丢失，而 `turn-stopping` 下次读到的将是一个空缓冲。
+  // 重复投递的正确语义是「什么都不做」。
+  if (engine.hasCompaction(sessionId, summary.compactionId)) {
+    engine.recordCompaction({
+      sessionId,
+      compactionId: summary.compactionId,
+      at,
+      shadowedRange: summary.shadowedRange,
+      shadowedSeqs: summary.shadowedSeqs,
+      shadowedTokenCount: summary.shadowedTokenCount,
+      flushedCards: 0,
+    })
+    logger.debug(`压缩回填：${summary.compactionId} 是重复投递，已跳过`)
+    return
+  }
+  const pending = readTurn(turnBuffers, sessionId)
+  const result = flushPendingTurn(pending, {
+    sessionId,
+    domain: pickDomain(config),
+    at,
+    write: (input) => engine.writeTurn(input),
+  })
+  if (result.error !== null) {
+    logger.error(`压缩回填写入失败（缓冲已保留，下一轮 turn-stopping 会重试）：${result.error}`)
+  }
+  // 只有 `clear` 才动缓冲：写失败时留着让 `turn-stopping` 再试一次。
+  if (result.clear) turnBuffers.delete(sessionId)
+  engine.recordCompaction({
+    sessionId,
+    compactionId: summary.compactionId,
+    at,
+    shadowedRange: summary.shadowedRange,
+    shadowedSeqs: summary.shadowedSeqs,
+    shadowedTokenCount: summary.shadowedTokenCount,
+    flushedCards: result.written,
+  })
+  logger.debug(
+    `压缩回填：${summary.compactionId} 吞掉 ${summary.shadowedSeqs.length} 个事件，`
+    + `写入 ${result.written} 张卡`,
+  )
 }
 
 /**
@@ -177,7 +270,22 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     const sessionId = typeof session?.id === 'string' ? session.id : ''
     if (sessionId.length === 0) return
     lastSessionId = sessionId
-    accumulateEvent(turnBuffers, sessionId, args[1])
+    const event = args[1]
+    // 压缩回填（P1-6 / 起源 L27、L11 反过来说的「压掉就没了」）。
+    //
+    // `compaction/summary` 不是 ctx 事件名而是**会话事件类型**（详见
+    // `./host/engine/compaction.ts` 模块注释），所以分派在这里而不是另起
+    // 一条 subscribe——另起的那条永远不会触发，却看起来接上了。
+    //
+    // **整段包在 try/catch 里，且解析失败不抛错**：这是宿主的压缩路径。
+    // 记忆插件在这里抛异常等于让宿主的压缩失败，而压缩失败会让用户直接
+    // 失去上下文——比丢几条记忆严重得多。所以这里吞掉一切，只记日志。
+    try {
+      handleCompaction(turnBuffers, engine, config, logger, sessionId, event)
+    } catch (error) {
+      logger.error(`压缩回填失败（已放行，不影响宿主压缩）：${error instanceof Error ? error.message : String(error)}`)
+    }
+    accumulateEvent(turnBuffers, sessionId, event)
   })
   if (!sessionEvents) logger.warn('无法订阅 session/event，记忆不会被写入')
 

@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=16',
+  'configVersion=17',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -200,6 +200,7 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'spread.pruneThreshold=0.1',
   'spread.reinforceDelta=0.01',
   'spread.seedRatio=0.85',
+  'storage.compactionLedgerMaxEntries=128',
   'storage.configSnapshotMaxEntries=200',
   'storage.dataDir=.dsh-memory',
   'storage.fsyncOnWrite=true',
@@ -268,7 +269,11 @@ describe('摘要配置的默认值与版本', () => {
     //       逐字节相同；后者的功能在 `renderFeeling` 里被主动删掉了（注释写明
     //       「不引用来源原文」，因为引用会替模板表态情绪极性）。
     //       删字段同样要递增版本，理由同 10：旧配置文件与旧快照里可能写着它们。
-    assert.equal(MEMORY_CONFIG_VERSION, 16, '删除两个死配置后版本应为 16')
+    //  17 → 新增 `storage.compactionLedgerMaxEntries`（压缩回填 P1-6 的跨进程
+    //       幂等台账上限）。不递增的后果与 16 相反但同源：旧快照里**没有**这个
+    //       字段，回滚回来会得到一份「台账上限为 undefined」的配置，而校验层
+    //       `!Number.isInteger(undefined)` 会在加载期直接拒绝——库打不开。
+    assert.equal(MEMORY_CONFIG_VERSION, 17, '新增压缩台账上限后版本应为 17')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
@@ -470,5 +475,43 @@ describe('图谱 entityNeighbors 的配置层守门（P2-9）', () => {
       11,
       '单卡总度数上界应是 entityNeighbors + topicNeighbors = 11',
     )
+  })
+})
+
+describe('压缩台账上限的配置层守门（P1-6）', () => {
+  it('默认值 128 通过校验', () => {
+    const result = validateConfig(mergeConfig(DEFAULT_CONFIG))
+    assert.equal(result.ok, true, `默认配置必须合法，实际错误：${result.errors.join(' | ')}`)
+    assert.equal(DEFAULT_CONFIG.storage.compactionLedgerMaxEntries, 128)
+  })
+
+  it('0 被拒绝（它与另两个上限的「0 表示不限制」不是一回事）', () => {
+    // 这是本节唯一一条「看着像有牙其实最关键」的断言：`logMaxEntries` 与
+    // `configSnapshotMaxEntries` 的 0 是「全留」，这里若允许 0 会被实现读成
+    // 「一条都不留」⇒ 同一个 compactionId 每次都认不出来 ⇒ **幂等在数学上
+    // 恒为假**，且不报错、不崩溃，只是每压缩一次就重复 flush 一遍。
+    expectOneError({ storage: { compactionLedgerMaxEntries: 0 } }, 'storage.compactionLedgerMaxEntries')
+  })
+
+  it('负数被拒绝', () => {
+    expectOneError({ storage: { compactionLedgerMaxEntries: -1 } }, 'storage.compactionLedgerMaxEntries')
+  })
+
+  it('非整数被拒绝（条数不可解释）', () => {
+    expectOneError({ storage: { compactionLedgerMaxEntries: 12.5 } }, 'storage.compactionLedgerMaxEntries')
+  })
+
+  it('1 是合法下界', () => {
+    const result = validateConfig(mergeConfig(DEFAULT_CONFIG, { storage: { compactionLedgerMaxEntries: 1 } }))
+    assert.equal(result.ok, true, `1 应当合法，实际错误：${result.errors.join(' | ')}`)
+    // 诚实边界：1 意味着台账只记得住最近一次压缩。幂等仍然成立（同一次重投
+    // 紧跟着来就能认出），但「隔一次压缩之后再重投」认不出——这是配置选择，
+    // 不是缺陷，所以这里只钉「合法」不钉「够用」。
+  })
+
+  it('10000 是合法上界，10001 被拒绝', () => {
+    const atLimit = validateConfig(mergeConfig(DEFAULT_CONFIG, { storage: { compactionLedgerMaxEntries: 10000 } }))
+    assert.equal(atLimit.ok, true, `10000 应当合法，实际错误：${atLimit.errors.join(' | ')}`)
+    expectOneError({ storage: { compactionLedgerMaxEntries: 10001 } }, 'storage.compactionLedgerMaxEntries')
   })
 })

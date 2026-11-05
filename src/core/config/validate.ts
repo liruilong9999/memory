@@ -89,6 +89,18 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   if (!Number.isInteger(config.storage.configSnapshotMaxEntries) || config.storage.configSnapshotMaxEntries < 0) {
     errors.push('storage.configSnapshotMaxEntries 必须是非负整数')
   }
+  // 压缩台账上限（P1-6）**不接受 0**，与上面两个「0 表示不限制」的上限不同：
+  // 它们留 0 是「全留」，坏了只是文件变大；这里的 0 会被读成「一条都不留」，
+  // 于是同一个 `compactionId` 每次都认不出来，**幂等在数学上恒为假**——
+  // 一个不报错、不崩溃、只是每压缩一次就重复 flush 一遍的配置。
+  // 上界 10000 是防手滑（比如误写 128000 想图省事），不是真实用量：
+  // 默认 128 已经覆盖几十个会话。
+  if (!Number.isInteger(config.storage.compactionLedgerMaxEntries) || config.storage.compactionLedgerMaxEntries < 1) {
+    errors.push('storage.compactionLedgerMaxEntries 必须是 ≥ 1 的整数')
+  }
+  if (config.storage.compactionLedgerMaxEntries > 10000) {
+    errors.push('storage.compactionLedgerMaxEntries 不应大于 10000（上限本身不该成为内存与落盘负担）')
+  }
 
   if (config.consolidation.maxArchiveRatio > 1) errors.push('consolidation.maxArchiveRatio 必须 ≤ 1')
   if (config.consolidation.maxSummariesPerRun < 0) {

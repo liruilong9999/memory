@@ -272,6 +272,25 @@ export interface StoragePolicy {
    * 留个上限是廉价保险。
    */
   configSnapshotMaxEntries: number
+  /**
+   * 压缩台账最多保留多少条（P1-6 压缩回填的跨进程幂等记录）。
+   *
+   * **不接受 0**，与 `logMaxEntries` / `configSnapshotMaxEntries` 的
+   * 「0 表示不限制」不同：那两个 0 是「全留」，坏了只是文件变大；这里若把 0
+   * 读成「一条都不留」，同一个 `compactionId` 每次都认不出来，**幂等在数学上
+   * 恒为假**——不报错、不崩溃、只是每压缩一次就重复 flush 一遍。
+   * `validateConfig` 因此在加载期就把它挡掉。
+   *
+   * 这个台账只服务于两件事：
+   *
+   * 1. **跨进程幂等**：同一个 `compactionId` 再来一次时不再重复记账。
+   * 2. **可观测**：`engine.health()` 能报出「最近被吞掉了哪些 seq」。
+   *
+   * 两件事都只关心**最近**一段窗口，所以超出的旧记录可以丢。丢掉的代价
+   * 上限是「一次重复 flush」：flush 的产物是记忆卡，卡片经
+   * `deriveIdempotencyKey` 去重，重复 flush 不会产生重复卡。
+   */
+  compactionLedgerMaxEntries: number
 }
 
 /** 巩固（夜整理）参数。 */

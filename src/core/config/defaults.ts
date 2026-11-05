@@ -11,7 +11,7 @@ import type { MemoryConfig } from './types.ts'
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 16,
+  configVersion: 17,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -98,6 +98,13 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     // 配置快照（FR-F4）：每次启动时配置若与上一条不同就追加一条。
     // 200 条足够回溯一年多的改动，同时把旁路文件压在一百多 KB。
     configSnapshotMaxEntries: 200,
+    // 压缩台账（P1-6）：宿主**每次**压缩追加一条。
+    // 128 是「够用一段长时间、又不会无限涨」的折中：一次压缩要把上下文压到
+    // 阈值以下，长会话里也就能发生几次到十几次；128 条覆盖几十个会话，
+    // 而幂等只需要认得出「最近重复投递的那一个 compactionId」。
+    // 单条最大开销是 `shadowedSeqs` 数组，实测一次压缩吞掉的节点数是
+    // 几十到几百量级，128 条仍在几十 KB ~ 一两百 KB 之间。
+    compactionLedgerMaxEntries: 128,
   },
   consolidation: {
     enabled: true,
@@ -216,4 +223,4 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 16
+export const MEMORY_CONFIG_VERSION = 17

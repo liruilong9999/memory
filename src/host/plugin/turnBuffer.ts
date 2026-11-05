@@ -48,6 +48,29 @@ export function readTurnText(buffers: TurnBuffers, sessionId: string): { userTex
 }
 
 /**
+ * 读本轮已累积的用户文本、助手文本与轮次号。
+ *
+ * 与 {@link readTurnText} 只差一个 `turn`：压缩回填（P1-6）要把「这一轮」
+ * 写进库，而写入用的 `TurnInput.turn` 就来自缓冲里 `turn/start` 记下的值。
+ * 分成两个函数是因为渲染路径只关心文本，不该被逼着处理一个它用不到的字段。
+ *
+ * @param buffers - 各会话的累积器。
+ * @param sessionId - 会话 id。
+ * @returns 三项；没有缓冲时文本为空串、`turn` 为 `null`。
+ */
+export function readTurn(
+  buffers: TurnBuffers, sessionId: string,
+): { userText: string; assistantText: string; turn: number | null } {
+  const buffer = buffers.get(sessionId)
+  if (buffer === undefined) return { userText: '', assistantText: '', turn: null }
+  return {
+    userText: buffer.user.join(NL),
+    assistantText: buffer.assistant.join(NL),
+    turn: buffer.turn,
+  }
+}
+
+/**
  * 把一条 `session/event` 归并进累积器。
  *
  * 只关心三类事件：
