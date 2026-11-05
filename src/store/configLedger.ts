@@ -194,9 +194,8 @@ export interface RollbackRecord {
 /**
  * 读回回滚覆盖层的完整记录。
  *
- * 与 {@link readRollbackOverride} 的区别：这个返回目标快照 id 与时刻，
- * 供人读输出与事后追溯用。两者共用同一份解析逻辑
- * （{@link parseRollbackRecord}），不写两遍——**少一份实现就少一处漂移点**。
+ * 返回目标快照 id 与时刻，供人读输出与事后追溯用；解析逻辑集中在
+ * {@link parseRollbackRecord} 一处，不写两遍——**少一份实现就少一处漂移点**。
  *
  * @param dataDir - 数据目录。
  * @returns 记录；没有回滚、或文件损坏时返回 `null`。
@@ -237,16 +236,6 @@ function parseRollbackRecord(parsed: unknown): RollbackRecord | null {
     : '（未知）'
   const at = typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : 0
   return { targetId, at, override: override as DeepPartial<MemoryConfig> }
-}
-
-/**
- * 读回回滚覆盖层。
- *
- * @param dataDir - 数据目录。
- * @returns 覆盖层；没有回滚、或文件损坏时返回 `null`。
- */
-export function readRollbackOverride(dataDir: string): DeepPartial<MemoryConfig> | null {
-  return readRollbackRecord(dataDir)?.override ?? null
 }
 
 /**

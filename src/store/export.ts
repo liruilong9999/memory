@@ -17,9 +17,6 @@ import type { MemoryCard, MemoryEdge } from '../core/types.ts'
 /** 导出格式版本。字段结构变化时必须递增。 */
 export const EXPORT_FORMAT_VERSION = 1
 
-/** 导出文件里的行类型。 */
-export type ExportLineKind = 'header' | 'card' | 'edge'
-
 /** 导出文件头。 */
 export interface ExportHeader {
   /** 行类型。 */
@@ -33,12 +30,6 @@ export interface ExportHeader {
   /** 边条数。 */
   edges: number
 }
-
-/** 导出文件里的一行。 */
-export type ExportLine =
-  | ExportHeader
-  | { kind: 'card'; card: MemoryCard }
-  | { kind: 'edge'; edge: MemoryEdge }
 
 /** 导入结果。 */
 export interface ImportResult {
@@ -288,25 +279,6 @@ export function parseExportFile(text: string): ParsedExportFile {
     return { ok: false, message: '既不是导出文档（缺少 cards 数组），也不是逐行 JSONL' }
   }
   return { ok: true, format: 'jsonl', result: importJsonl(text) }
-}
-
-/**
- * 导出为可回放的日志记录文本（重建库的另一种口径）。
- *
- * 与 {@link exportJsonl} 的区别：那个导出的是**当前视图**，这个导出的是**历史**。
- * 需要「重建后连修正历史都一致」时用这个口径。
- *
- * @param records - 日志记录。
- * @param exportedAt - 导出时刻；省略时取 0。
- * @returns JSONL 文本。
- */
-export function exportRecordsJsonl(records: Iterable<{ seq: number }>, exportedAt = 0): string {
-  const list = [...records].sort((a, b) => a.seq - b.seq)
-  const lines: string[] = [JSON.stringify({
-    kind: 'header', v: EXPORT_FORMAT_VERSION, exportedAt, records: list.length,
-  })]
-  for (const record of list) lines.push(JSON.stringify(record))
-  return lines.join('\n') + '\n'
 }
 
 /**

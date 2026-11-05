@@ -15,8 +15,8 @@ import { resolve } from 'node:path'
 
 import type { MemoryConfig } from '../core/config.ts'
 import { DEFAULT_CONFIG } from '../core/config.ts'
-import { buildCardId, buildEdgeId } from '../core/types.ts'
-import type { JournalOp, JournalRecord, MemoryCard, MemoryEdge, SourcePointer, MemoryKind } from '../core/types.ts'
+import { buildEdgeId } from '../core/types.ts'
+import type { JournalOp, JournalRecord, MemoryCard, MemoryEdge } from '../core/types.ts'
 import { Journal, buildIdempotencyKey } from './journal.ts'
 import type { JournalMode } from './journal.ts'
 import type { MemoryState, MemoryFilter } from './state.ts'
@@ -530,17 +530,3 @@ export function deriveIdempotencyKey(op: JournalOp): string {
   }
 }
 
-/**
- * 派生一张卡的稳定 id（转发到 core，供调用方少 import 一个模块）。
- *
- * @param domain - 记忆域。
- * @param source - 来源指针。
- * @param kind - 卡片类型。
- * @param normalized - 归一化文本。
- * @returns 卡片 id。
- */
-export function cardIdFor(
-  domain: MemoryCard['domain'], source: SourcePointer, kind: MemoryKind, normalized: string,
-): string {
-  return buildCardId(domain, source, kind, normalized)
-}

@@ -26,14 +26,14 @@ export {
 export type { IndexHit, InvertedIndex } from './inverted.ts'
 
 export {
-  EXPORT_FORMAT_VERSION, exportJsonl, exportRecordsJsonl, importExportDocument, importJsonl,
+  EXPORT_FORMAT_VERSION, exportJsonl, importExportDocument, importJsonl,
   parseExportFile, validateImport,
 } from './export.ts'
 export type {
-  ExportFileFormat, ExportHeader, ExportLine, ExportLineKind, ImportResult, ParsedExportFile,
+  ExportFileFormat, ExportHeader, ImportResult, ParsedExportFile,
 } from './export.ts'
 
-export { MemoryStore, cardIdFor, deriveIdempotencyKey, openStore } from './store.ts'
+export { MemoryStore, deriveIdempotencyKey, openStore } from './store.ts'
 export type { StoreOptions, WriteResult } from './store.ts'
 
 // 元信息（`meta.json`）刻意只导出**最小必要接口**：读写「上次巩固时刻」的两个
