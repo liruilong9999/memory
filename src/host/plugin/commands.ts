@@ -8,8 +8,9 @@
  */
 
 import { renderCardHistory, renderFocusPackExplain } from '../../core/render.ts'
-import { lookupCard } from '../../core/scoring.ts'
-import type { MemoryCard } from '../../core/types.ts'
+import { fmt, formatCardRef, formatTime, kindLabel, lookupCard } from '../../core/scoring.ts'
+import { truncate } from '../../core/text.ts'
+import type { MemoryCard, MemoryEdge } from '../../core/types.ts'
 import type { MemoryEngine } from '../engine.ts'
 
 /**
@@ -86,6 +87,111 @@ function runPinInSession(engine: MemoryEngine, trimmed: string, target: boolean)
 }
 
 /**
+ * `/memory list` 的实现。
+ *
+ * ## 为什么会话里也需要它
+ *
+ * 用户想知道「你还记得什么」，此前唯一的办法是 `/memory explain <关键词>`——
+ * 而那是召回：它挑 7 张，挑不中就什么也不说，与「库是空的」同形。
+ * 想知道库里有什么必须能**看全局**。
+ *
+ * ## 与 CLI `list` 的关系
+ *
+ * 同一套规则（排序键、截断、空状态说明），但**不共用渲染函数**：
+ * CLI 的 `runList` 返回 `{code, stdout, stderr}`，会话命令返回 `string`。
+ * 共用需要把渲染拆成一个纯函数，那是对的；但它现在住在 `src/cli/` 下，
+ * 而 `host` 不能 import `cli`（依赖方向是 `core ← store ← consolidate ← host`；
+ * `cli` 是旁支而不是上游）。所以两边各写一份**同规则**的渲染，
+ * 靠测试（同一批卡、同一条规则）与注释守住一致性。
+ *
+ * @param engine - 记忆引擎。
+ * @param timeZone - 渲染时间用的时区。
+ * @returns 给人看的结果文本。
+ */
+function renderSessionList(engine: MemoryEngine, timeZone: string): string {
+  const limits = engine.outputLimits()
+  const cap = limits.listMaxCards
+  // 排序键与 CLI 一致：updatedAt 降序，同刻 id 升序破平。
+  // 破平不能省——同一轮写入的卡 updatedAt 完全相同，而输入顺序来自
+  // `Map` 的插入顺序，那与用户无关却会改变他两次看到的顺序。
+  const cards = [...engine.query({ status: 'active' })].sort((a, b) => {
+    if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt
+    if (a.id < b.id) return -1
+    if (a.id > b.id) return 1
+    return 0
+  })
+  if (cards.length === 0) return '记忆库里还没有活跃卡。'
+  const shown = cards.slice(0, cap)
+  const lines = shown.map((card) => {
+    const head = `- ${kindLabel(card.kind)}·${card.domain} ${truncate(card.text, limits.maxCardChars)}`
+    const traits = [
+      formatCardRef(card.id),
+      `强度 ${fmt(card.strength)}`,
+      card.pinned ? '★已钉住' : '未钉住',
+      `更新于 ${formatTime(card.updatedAt, timeZone)}`,
+    ]
+    return `${head}\n  ${traits.join('  ')}`
+  })
+  if (cards.length > shown.length) {
+    lines.push(`…只列出前 ${shown.length} 张（共 ${cards.length} 张）。`)
+  } else {
+    lines.push(`共 ${shown.length} 张活跃卡。`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * `/memory edges` 的实现。
+ *
+ * 关系名保持英文原值（`same-entity` / `same-topic` / …）：仓库里没有边关系的
+ * 中文标签，在这里现造一套会让终端与配置文件、诊断日志、导出 JSON 说两家话。
+ *
+ * @param engine - 记忆引擎。
+ * @param ref - 用户给的卡片引用（完整 id 或前缀）。
+ * @returns 给人看的结果文本。
+ */
+function renderSessionEdges(engine: MemoryEngine, ref: string): string {
+  const resolved = resolveCardInSession(engine, ref)
+  if (typeof resolved === 'string') return resolved
+  const cap = engine.outputLimits().listMaxEdges
+  // 与 CLI 同一条排序规则：权重降序 → 对端 id 升序 → 关系名升序 → 边 id 兜底。
+  const edges = [...engine.edges(resolved.id)].sort((a, b) => compareSessionEdges(a, b, resolved.id))
+  if (edges.length === 0) {
+    return `这张卡还没有连边。\n（图谱边由夜整理产出：等一次整理之后再看。）`
+  }
+  const shown = edges.slice(0, cap)
+  const lines = shown.map((edge) => {
+    const other = edge.from === resolved.id ? edge.to : edge.from
+    const arrow = edge.from === resolved.id ? '→' : '←'
+    return `- ${arrow} ${formatCardRef(other)}  ${edge.relation}  权重 ${fmt(edge.weight)}`
+  })
+  if (edges.length > shown.length) {
+    lines.push(`…只列出前 ${shown.length} 条（共 ${edges.length} 条）。`)
+  } else {
+    lines.push(`共 ${edges.length} 条边。`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 会话 `edges` 的比较器。
+ *
+ * @param a - 左边的边。
+ * @param b - 右边的边。
+ * @param selfId - 被查的那张卡。
+ * @returns 比较结果。
+ */
+function compareSessionEdges(a: MemoryEdge, b: MemoryEdge, selfId: string): number {
+  const peerA = a.from === selfId ? a.to : a.from
+  const peerB = b.from === selfId ? b.to : b.from
+  if (b.weight !== a.weight) return b.weight - a.weight
+  if (peerA !== peerB) return peerA < peerB ? -1 : 1
+  if (a.relation !== b.relation) return a.relation < b.relation ? -1 : 1
+  if (a.id !== b.id) return a.id < b.id ? -1 : 1
+  return 0
+}
+
+/**
  * `/memory` 命令实现。
  *
  * 只读为主：命令是给人看的，不应该顺带改变记忆状态。
@@ -151,6 +257,18 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     if (typeof resolved === 'string') return resolved
     return renderCardHistory(resolved, sessionTimeZone(engine))
   }
+  if (command === 'list') {
+    // FR-F1 的会话出口。此前想看库里有什么只能 `/memory explain <关键词>`，
+    // 那会挑 7 张、挑不中就说不出话——与「库是空的」同形。
+    return renderSessionList(engine, sessionTimeZone(engine))
+  }
+  if (command === 'edges') {
+    // FR-G1 的会话出口。`engine.edges` 早在，生产零调用方——
+    // 图算得出、存得下、影响打分，就是没人看得见（缺陷十七的同族形态）。
+    const ref = trimmed.slice('edges'.length).trim()
+    if (ref.length === 0) return '用法：/memory edges <卡片 id>'
+    return renderSessionEdges(engine, ref)
+  }
   if (command === 'pin') {
     // FR-C3 的人工豁免。`shouldArchive` 里 `if (card.pinned) return false` 早就在，
     // 但在本命令之前**没有任何入口能把 pinned 置成 true**：字段认了、判定写了、
@@ -184,5 +302,5 @@ export function runMemoryCommand(engine: MemoryEngine, args: string): string {
     const result = engine.recall(trimmed.slice('explain'.length).trim())
     return renderFocusPackExplain(result.pack, result.candidates)
   }
-  return `未知子命令「${command}」，可用：status / health / rebuild / explain / restore / revise / history / pin / unpin`
+  return `未知子命令「${command}」，可用：status / health / rebuild / explain / list / edges / restore / revise / history / pin / unpin`
 }

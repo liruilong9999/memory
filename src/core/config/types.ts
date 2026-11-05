@@ -428,6 +428,49 @@ export interface ReminderPolicy {
   cronSearchDays: number
 }
 
+/**
+ * 对外展示的出参上限（FR-F1 可观测）。
+ *
+ * ## 为什么需要它
+ *
+ * `list` / `edges` 是**往终端印东西**的命令，而 NFR-3 的目标规模是 10 万级
+ * 记忆卡。没有上限时，一次 `memoryctl list` 会把整库倒进终端——不是「慢」，
+ * 是滚屏几万行之后用户再也找不到刚才那一行。所以上限不是性能优化，
+ * 是这两个命令能不能用的前提。
+ *
+ * ## 为什么单开一个分区，而不是复用 `recall` / `storage` 的字段
+ *
+ * `recall.*` 约束的是**注入进上下文的焦点包**（FR-B2 的 token 预算），
+ * `storage.*` 约束的是**落盘**。这里的上限约束的是「人读输出」，三件事
+ * 互相独立：把 `recall.maxCards` 调大是为了多注入几张卡，不该顺带让
+ * `list` 一次印出 200 行；反过来为了看库而调大 `list` 上限，也不该
+ * 改变注入行为。混用会让「改一个数、两处行为一起变」——本仓库为此栽过
+ * （缺陷二十四：一个参数两个相反职责）。
+ *
+ * ## 与 `--limit` 的关系
+ *
+ * `--limit` 是**这一条命令**想要多少（人可以随手写 1000），配置上限是
+ * **硬上界**（写进 patch、可版本化、可回滚）。实际生效 = 两者取小：
+ * 请求值不能突破硬上界，否则「上限进配置」就只是句口号。
+ */
+export interface OutputPolicy {
+  /**
+   * `list` 单次最多印出多少张卡。
+   *
+   * 默认 200：一屏 50 行、一张卡占两行 ⇒ 200 张约 8 屏，够看清一个
+   * 小库的全貌，又不至于滚到看不见开头。它同时是 `--limit` 的硬上界。
+   */
+  listMaxCards: number
+  /**
+   * `edges <id>` 单次最多印出多少条边。
+   *
+   * 默认 100：单卡的边数受 `graph.entityNeighbors`（8）与
+   * `graph.topicNeighbors`（3）约束，正常远低于 100；这个值挡的是
+   * 「某张卡被反复 supersede / distills 之后长成一条长链」的情况。
+   */
+  listMaxEdges: number
+}
+
 /** 完整配置。 */
 export interface MemoryConfig {
   /** 配置版本号，改动默认值时必须递增（FR-F4）。 */
@@ -452,6 +495,8 @@ export interface MemoryConfig {
   graph: GraphPolicy
   /** 图谱扩散与突触可塑性策略（FR-G1）。 */
   spread: SpreadPolicy
+  /** 人读输出的出参上限（FR-F1：`list` / `edges` 不许把整库倒进终端）。 */
+  output: OutputPolicy
   /** 调试开关：把每张卡的 `explain` 行写进诊断日志（`detail.explain`）。 */
   debugExplain: boolean
 }

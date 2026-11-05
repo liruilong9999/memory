@@ -31,6 +31,7 @@ export type {
   ForgettingPolicy,
   GraphPolicy,
   MemoryConfig,
+  OutputPolicy,
   RecallPolicy,
   ReminderPolicy,
   ScoringWeights,

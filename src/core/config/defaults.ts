@@ -11,7 +11,7 @@ import type { MemoryConfig } from './types.ts'
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 18,
+  configVersion: 19,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -230,6 +230,16 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     maxPrunePerRun: 200,
     explainSourceChars: 24,
   },
+  output: {
+    // 出参上限（FR-F1）。为什么默认 200 / 100 的推导见 `OutputPolicy` 注释。
+    //
+    // 这两个数与 `--limit` 是「硬上界 / 请求值」的关系，实际生效取小；
+    // 所以把这里调小会让「我要一次看 500 张」直接失效——那是有意的，
+    // 上限若能被命令行绕过，
+    // 「上限进配置」就只是句口号（P7：参数可版本化可回滚）。
+    listMaxCards: 200,
+    listMaxEdges: 100,
+  },
   // 调试开关：召回时把每张卡的 `explain` 行写进诊断日志的 `detail.explain`。
   //
   // 这个字段曾经**零读取**（缺陷十七的原样形态：声明了、注释承诺了、合并写了、
@@ -240,4 +250,4 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 18
+export const MEMORY_CONFIG_VERSION = 19

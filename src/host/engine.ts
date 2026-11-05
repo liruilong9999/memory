@@ -827,6 +827,38 @@ export class MemoryEngine {
   }
 
   /**
+   * 人读出口（`list` / `edges`）的渲染参数：条数硬上界与正文截断长度。
+   *
+   * ## 为什么需要一个专门的方法
+   *
+   * 这些是**渲染参数**，不是引擎行为参数：`{@link query}` 与 `{@link edges}`
+   * 该返回多少就返回多少，截断发生在打印之前。
+   * 既然如此，为什么不让调用方自己读配置？
+   *
+   * 因为会话命令（`/memory list`）**拿不到 config**：插件接线只把 `engine`
+   * 传给 `runMemoryCommand`。而 config 在引擎里是 `private readonly`，
+   * 不打算开成公开 getter——那等于允许任何人从外部读到整份配置并当作
+   * 「当前真相」，而配置的可审计副本在 `configLedger` 里（FR-F4），
+   * 引擎持有的是**这一次进程解析出来的有效值**，两者不是一回事。
+   *
+   * 所以只放出出口真正需要的那几个数：**出口需要什么就暴露什么**，
+   * 不顺手把整份配置倒出来。
+   *
+   * `maxCardChars` 也从这里出，而不是让会话命令自带一个字面量：
+   * 用户在这一屏看到的长度必须与注入上下文时被截到的一样长，
+   * 两个数字同源才不会出现「列出来很长、注入时被砍一半」的意外。
+   *
+   * @returns 渲染参数（全部来自配置，见 `output` 与 `recall` 分区）。
+   */
+  outputLimits(): { listMaxCards: number; listMaxEdges: number; maxCardChars: number } {
+    return {
+      listMaxCards: this.config.output.listMaxCards,
+      listMaxEdges: this.config.output.listMaxEdges,
+      maxCardChars: this.config.recall.maxCardChars,
+    }
+  }
+
+  /**
    * 健康检查（FR-F5）。
    *
    * @returns 健康状态与统计（含压缩回填的观测视图）。

@@ -50,9 +50,11 @@ import { openStore } from '../store/store.ts'
 import type { MemoryStore } from '../store/store.ts'
 import { isValidTimeZone, parseArgs, resolveTimeZone } from './args.ts'
 import { runConfig } from './commands/config.ts'
+import { runEdges } from './commands/edges.ts'
 import { runExport } from './commands/export.ts'
 import { runHistory } from './commands/history.ts'
 import { runImport } from './commands/import.ts'
+import { runList } from './commands/list.ts'
 import { runRebuild, runConsolidate, runPin, runRestore, runRevise, runUnpin } from './commands/mutate.ts'
 import { runHealth, runLogs, runReport } from './commands/observe.ts'
 import { runQuery } from './commands/query.ts'
@@ -179,6 +181,12 @@ export function runCli(argv: readonly string[], io: CliIo = {}): CliResult {
     switch (options.command) {
       case 'query':
         result = runQuery(options, engine, timeZone)
+        break
+      case 'list':
+        result = runList(options, engine, resolved, timeZone)
+        break
+      case 'edges':
+        result = runEdges(options, engine, resolved)
         break
       case 'export':
         result = runExport(options, store, engine, clock())

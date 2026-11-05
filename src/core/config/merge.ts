@@ -89,6 +89,12 @@ export function mergeConfig(base: MemoryConfig, override: DeepPartial<MemoryConf
     reminder: { ...base.reminder, ...restOverride.reminder },
     graph: { ...base.graph, ...restOverride.graph },
     spread: spreadFields as unknown as SpreadPolicy,
+    // `output` 必须在这里显式列一行。浅合并的字面量**不会**自动接纳新分区：
+    // 漏了它，用户 patch 里写的 `output.listMaxCards` 会被整段丢弃，
+    // 而 `validateConfig` 看到的是默认值 ⇒ 校验通过、命令照跑、上限还是 200，
+    // 一句提示都没有。这类「配置写了但没人读」的形态本仓库记过两次
+    // （缺陷十七、缺陷三十三），所以新分区一律从这一行开始接。
+    output: { ...base.output, ...restOverride.output },
     debugExplain: override.debugExplain ?? base.debugExplain,
   }
   // 数组字段必须整体替换，浅合并会让用户的自定义关键词被默认值覆盖。

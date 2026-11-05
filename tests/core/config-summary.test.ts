@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=18',
+  'configVersion=19',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -176,6 +176,10 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'graph.entityNeighbors=8',
   'graph.topicFloor=0.08',
   'graph.topicNeighbors=3',
+  // 出参上限（版本 19）。字典序注意 `listMaxCards` < `listMaxEdges`
+  // （'C' < 'E'），写反了会直接红。
+  'output.listMaxCards=200',
+  'output.listMaxEdges=100',
   'recall.absoluteThreshold=0.06',
   'recall.candidateLimit=400',
   'recall.maxCardChars=160',
@@ -285,7 +289,15 @@ describe('摘要配置的默认值与版本', () => {
     //       `gateTurn` → `extractCards` → `draftToCard`）：fact 占产出卡 21.1%
     //       （4/19），远低于「遗忘机制恒为空」的 40% 失效线；加进去后仍有
     //       6/19 可归档，归档路径不是空集。
-    assert.equal(MEMORY_CONFIG_VERSION, 18, '核心事实加入永不归档类别后版本应为 18')
+    //  19 → **新增** output 分区（output.listMaxCards / output.listMaxEdges）：
+    //       `memoryctl list` / `memoryctl edges` 的出参上限。NFR-3 的目标规模是
+    //       10 万级记忆卡，没有上限时这两个命令会把整库倒进终端。
+    //       为什么单开分区而不是复用 recall：`recall.*` 约束的是注入上下文的
+    //       焦点包，这里的上限约束的是人读输出，两件事互相独立；混用会让
+    //       「调大 maxCards 为了多注入几张」顺带印出 200 行（缺陷二十四的形态）。
+    //       不递增版本的后果：旧快照里**没有** output 分区，回滚回来会得到
+    //       `undefined`，校验层会在加载期拒绝，库打不开（同 17 的理由）。
+    assert.equal(MEMORY_CONFIG_VERSION, 19, '人读出参上限（output 分区）落地后版本应为 19')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {
@@ -525,5 +537,68 @@ describe('压缩台账上限的配置层守门（P1-6）', () => {
     const atLimit = validateConfig(mergeConfig(DEFAULT_CONFIG, { storage: { compactionLedgerMaxEntries: 10000 } }))
     assert.equal(atLimit.ok, true, `10000 应当合法，实际错误：${atLimit.errors.join(' | ')}`)
     expectOneError({ storage: { compactionLedgerMaxEntries: 10001 } }, 'storage.compactionLedgerMaxEntries')
+  })
+})
+
+/**
+ * 出参上限的配置层守门（FR-F1 / 版本 19 的 output 分区）。
+ *
+ * 这一节守的**不是**「字段存在」，而是三件更容易错的事：
+ *
+ * ① **上限不能被命令行绕过**。`list` 实际生效的条数是
+ *    `min(--limit, output.listMaxCards)`；如果这里允许 0 或负数，
+ *    `Math.min` 会把它变成「印 0 张」，而命令仍然退出码 0 ——
+ *    用户看到空输出，会以为库坏了（FR-B6 同源）。
+ * ② **上限本身不能变成新的打爆源**。所以有 10000 这个上界：
+ *    它的作用不是限制真实用量（默认 200 够看清小库），而是让
+ *    「为了不看分页，把配置顶到 100 万」这件事在加载期失败。
+ * ③ **合并必须真的接住这个分区**。`mergeConfig` 是逐分区浅合并的
+ *    字面量，漏一行会让用户 patch 里的 `output` 被**整段丢弃**，
+ *    校验看到的是默认值 ⇒ 一切绿、上限却没变（缺陷十七的形态）。
+ *    所以下面有一条专门断言「patch 写了就真的生效」。
+ */
+describe('出参上限的配置层守门（FR-F1）', () => {
+  it('默认值 200 / 100 通过校验', () => {
+    const result = validateConfig(mergeConfig(DEFAULT_CONFIG))
+    assert.equal(result.ok, true, `默认配置必须合法，实际错误：${result.errors.join(' | ')}`)
+    assert.equal(DEFAULT_CONFIG.output.listMaxCards, 200)
+    assert.equal(DEFAULT_CONFIG.output.listMaxEdges, 100)
+  })
+
+  it('listMaxCards 的 0 被拒绝（0 会让 list 一行都不印，看起来像命令坏了）', () => {
+    expectOneError({ output: { listMaxCards: 0 } }, 'output.listMaxCards')
+  })
+
+  it('listMaxCards 的负数与非整数被拒绝', () => {
+    expectOneError({ output: { listMaxCards: -1 } }, 'output.listMaxCards')
+    expectOneError({ output: { listMaxCards: 2.5 } }, 'output.listMaxCards')
+  })
+
+  it('listMaxCards 的 1 合法，10000 合法，10001 被拒绝', () => {
+    const atMin = validateConfig(mergeConfig(DEFAULT_CONFIG, { output: { listMaxCards: 1 } }))
+    assert.equal(atMin.ok, true, `1 应当合法，实际错误：${atMin.errors.join(' | ')}`)
+    const atMax = validateConfig(mergeConfig(DEFAULT_CONFIG, { output: { listMaxCards: 10000 } }))
+    assert.equal(atMax.ok, true, `10000 应当合法，实际错误：${atMax.errors.join(' | ')}`)
+    expectOneError({ output: { listMaxCards: 10001 } }, 'output.listMaxCards')
+  })
+
+  it('listMaxEdges 同四条边界（0 / 负数 / 非整数被拒，1 与 10000 合法）', () => {
+    expectOneError({ output: { listMaxEdges: 0 } }, 'output.listMaxEdges')
+    expectOneError({ output: { listMaxEdges: -1 } }, 'output.listMaxEdges')
+    expectOneError({ output: { listMaxEdges: 2.5 } }, 'output.listMaxEdges')
+    expectOneError({ output: { listMaxEdges: 10001 } }, 'output.listMaxEdges')
+    for (const value of [1, 10000]) {
+      const result = validateConfig(mergeConfig(DEFAULT_CONFIG, { output: { listMaxEdges: value } }))
+      assert.equal(result.ok, true, `${value} 应当合法，实际错误：${result.errors.join(' | ')}`)
+    }
+  })
+
+  it('mergeConfig 真的接住了 output 分区（写进 patch 就生效，不是被静默丢弃）', () => {
+    // 正向断言：改一个、留一个默认。
+    const merged = mergeConfig(DEFAULT_CONFIG, { output: { listMaxCards: 2 } })
+    assert.equal(merged.output.listMaxCards, 2, 'patch 里写的 listMaxCards 必须生效')
+    assert.equal(merged.output.listMaxEdges, DEFAULT_CONFIG.output.listMaxEdges, '没写的字段必须沿用默认值')
+    // 反向对照：不传 patch 时必须还是默认值——否则上一行可能只是「全局常量」而非合并结果。
+    assert.equal(DEFAULT_CONFIG.output.listMaxCards, 200, '默认配置必须未被污染')
   })
 })

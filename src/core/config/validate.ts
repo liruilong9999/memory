@@ -151,6 +151,26 @@ export function validateConfig(config: MemoryConfig): ConfigValidation {
   // 轮询间隔太短会空转烧 CPU，太长则提醒延迟不可接受（FR-D3）。
   if (config.reminder.pollMs < 1000) errors.push('reminder.pollMs 必须 ≥ 1000（1 秒）')
 
+  // 出参上限（FR-F1）。两个都**不接受 0**：0 在 `storage` 的同类字段里表示
+  // 「不限制」，但在「我要印多少张」这里，一个 0 会让 `list` 一行都不印——
+  // 命令看起来坏了，而库里明明有卡。用户想「不印」应该用 `--limit 0` 之外
+  // 的语义表达（目前就是直接不调这个命令），不该由配置承担。
+  //
+  // 上界 10000 是防手滑，不是真实用量：默认 200 已经够看清一个小库，
+  // 而 NFR-3 的 10 万张卡靠 `--limit` 逐页取，不靠把配置顶到天上。
+  if (!Number.isInteger(config.output.listMaxCards) || config.output.listMaxCards < 1) {
+    errors.push('output.listMaxCards 必须是 ≥ 1 的整数')
+  }
+  if (config.output.listMaxCards > 10000) {
+    errors.push('output.listMaxCards 不应大于 10000（上限本身不该把终端打爆）')
+  }
+  if (!Number.isInteger(config.output.listMaxEdges) || config.output.listMaxEdges < 1) {
+    errors.push('output.listMaxEdges 必须是 ≥ 1 的整数')
+  }
+  if (config.output.listMaxEdges > 10000) {
+    errors.push('output.listMaxEdges 不应大于 10000（上限本身不该把终端打爆）')
+  }
+
   // 图谱扩散（FR-G1）。这里的每条约束都对应一种「扩散会把召回带坏」的具体方式，
   // 不是形式化的范围检查——写校验时逐条想清楚了它拦住的是哪种坏结果。
   const sp = config.spread
