@@ -53,11 +53,28 @@ describe('isNeverArchiveKind 永不归档类别（FR-C3）', () => {
     }
   })
 
-  it('事件、事实不受类别保护', () => {
+  it('核心事实受类别保护，事件不受（FR-C3）', () => {
+    // 这条用例**曾经叫「事件、事实不受类别保护」**，断言 `fact === false`。
+    // 它把「核心事实会被夜整理自动归档」这个缺陷**固化成了契约**：
+    // 规格 `docs/1-需求规格.md:149` 原话是「永不归档类别（承诺、**核心事实**、
+    // 长期偏好、感受）」，而默认配置里从来没有 `fact`。测试替实现打了掩护，
+    // 于是缺陷既不会报错也不会变红，只是悄悄把该留的决策与结论挪进 archived。
+    // 按 AGENTS.md「不写替实现打掩护的测试」——行为被判定为缺陷时，
+    // 测试必须跟着改，而不是把缺陷写成契约。现在改断言，是因为**改的是实现**。
+    //
+    // 为什么两边都要断言：只断言 `fact` 受保护，无法区分「类别豁免真的生效」
+    // 与「所有 kind 都被保护」。后者会让归档路径在数学上恒为空——
+    // 不报错、不崩溃、测试全绿，只是那条路径一行都没真正执行过
+    // （同源缺陷二十 / 二十六 / 三十二）。`event` 必须**不受**保护。
     const config = makeConfig()
-    for (const kind of ['event', 'fact'] as const) {
-      assert.equal(isNeverArchiveKind(makeCard({ id: kind, kind }), config), false, kind)
-    }
+    assert.equal(
+      isNeverArchiveKind(makeCard({ id: 'fact', kind: 'fact' }), config), true,
+      '核心事实必须受类别保护（FR-C3）',
+    )
+    assert.equal(
+      isNeverArchiveKind(makeCard({ id: 'event', kind: 'event' }), config), false,
+      '事件必须仍可归档，否则遗忘机制恒为空',
+    )
   })
 
   it('感受受类别保护（起源 L11：只会留下感受，不该被自动归档）', () => {
@@ -137,6 +154,33 @@ describe('shouldArchive 归档判定（FR-C3 / FR-C4）', () => {
 
   it('承诺类永不归档', () => {
     assert.equal(shouldArchive(lowStrength({ id: 'a', kind: 'promise' }), makeConfig()), false)
+  })
+
+  it('核心事实不被归档（FR-C3「永不归档类别」）', () => {
+    // 这条守的是 FR-C3 原话里「**核心事实**」那一项（docs/1-需求规格.md:149）。
+    // 修复前 `fact` 根本不在 `neverArchiveKinds` 里，于是「我决定数据库以后就用
+    // PostgreSQL」这种结论性内容，只要强度衰减到阈值以下就会被夜整理自动归档。
+    //
+    // **前提断言不能省**：如果这张卡的强度本来就在阈值之上，它不归档是因为
+    // 「不够弱」而不是因为「受类别保护」，测试就是假绿——它守的会是
+    // `shouldArchive` 里更靠前的那道强度断言，而不是类别豁免这一条。
+    const config = makeConfig()
+    const card = lowStrength({ id: 'fact', kind: 'fact' })
+    assert.ok(
+      card.strength < config.forgetting.archiveThreshold,
+      `前提：强度 ${card.strength} 必须严格低于阈值 ${config.forgetting.archiveThreshold}，`
+      + '否则这条测试绿在强度上而不是绿在类别豁免上',
+    )
+    assert.equal(
+      shouldArchive(card, config), false,
+      '核心事实必须免于自动归档（FR-C3）',
+    )
+    // 配对断言：只证明「受保护的没被归档」不够，还要证明「同类里不受保护的
+    // 确实会被归档」，否则把 shouldArchive 改成恒 false 这条也照样绿。
+    assert.equal(
+      shouldArchive(lowStrength({ id: 'event', kind: 'event' }), config), true,
+      '对照：同样强度的事件卡必须可归档，证明归档路径不是空集',
+    )
   })
 
   it('经验类永不归档', () => {

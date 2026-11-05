@@ -231,7 +231,16 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
   })
 
   it('pinned 的卡不被归档（FR-C3）', () => {
-    const config = makeConfig({ forgetting: { archiveThreshold: 0.5 } })
+    // `maxArchiveRatio: 1` 不能省——**省略它这条用例就是装饰**。
+    // 默认比例是 5%，库里只有 1 张卡时 `floor(1 × 0.05) = 0`，
+    // `applyArchiveRatio` 对任何候选都返回空数组，于是 `archived === 0`
+    // 在「pinned 豁免生效」和「pinned 豁免整个被删掉」两种情况下**都是绿的**。
+    // 反向验证时删掉 `if (card.pinned) return false` 这条**没有变红**，
+    // 才查出这一点（同 AGENTS.md 说的「本该红却没红」= 从来没在守任何东西）。
+    const config = makeConfig({
+      forgetting: { archiveThreshold: 0.5 },
+      consolidation: { maxArchiveRatio: 1 },
+    })
     const cards = [makeCard({
       id: 'a', text: '部署走 CI', kind: 'event', pinned: true,
       createdAt: T0, updatedAt: T0, lastAccessAt: null,
@@ -243,7 +252,15 @@ describe('runConsolidation 归档（FR-C2 / FR-C3 / ST-7）', () => {
   })
 
   it('承诺类不被归档（FR-C3）', () => {
-    const config = makeConfig({ forgetting: { archiveThreshold: 0.5 } })
+    // `maxArchiveRatio: 1` 同上面的 pinned 用例：不放开比例上限的话，
+    // 单张卡时 `floor(1 × 0.05) = 0`，归档候选永远被截断成空，
+    // 这条用例在「承诺类豁免生效」与「豁免整个失效」两种情况下都是绿的。
+    // 它是在反向验证 M3（`isNeverArchiveKind` 恒 false）时才被查出来的：
+    // 该变异下这条**没有变红**，说明它从来没在守承诺类的豁免。
+    const config = makeConfig({
+      forgetting: { archiveThreshold: 0.5 },
+      consolidation: { maxArchiveRatio: 1 },
+    })
     const cards = [makeCard({
       id: 'a', text: '答应明天交报告', kind: 'promise',
       createdAt: T0, updatedAt: T0, lastAccessAt: null,

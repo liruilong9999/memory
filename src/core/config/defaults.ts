@@ -11,7 +11,7 @@ import type { MemoryConfig } from './types.ts'
 
 /** 默认配置。改这里必须同时递增 {@link MEMORY_CONFIG_VERSION}。 */
 export const DEFAULT_CONFIG: MemoryConfig = {
-  configVersion: 17,
+  configVersion: 18,
   weights: {
     semantic: 0.42,
     importance: 0.18,
@@ -48,7 +48,24 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     emotionalHalfLifeBoost: 2.0,
     // `feeling` 在列的依据见 ForgettingPolicy.neverArchiveKinds 注释：
     // 起源 L11 要求「只留下感受」，感受不该被自动归档。
-    neverArchiveKinds: ['feeling', 'promise', 'concept', 'experience'],
+    //
+    // `fact` 在列的依据是 FR-C3（`docs/1-需求规格.md:149` 原话）：
+    // 「永不归档类别（承诺、**核心事实**、长期偏好、感受）」。补进来之前，
+    // 规格写着「核心事实」而实现里根本没有对应类别——**规格与实现不一致**，
+    // 而且被 `tests/consolidate/archive.test.ts` 里一条名叫「事件、事实不受
+    // 类别保护」的用例把相反行为固化成了契约（替实现打掩护的测试）。
+    //
+    // 为什么是「加类别」而不是「另设判据（例如 importance 高于阈值）」：
+    // 选之前必须先量 `fact` 到底有多宽。探针走真实链路
+    // （`gateTurn` → `extractCards` → `draftToCard`，42 句日常中文，覆盖闲聊 /
+    // 决策 / 偏好 / 承诺 / 情绪 / 事件 / 技术陈述各 6 句）实测：
+    // **fact 占产出卡的 21.1%（4/19）**，远低于 40% 那条失效线，且这 4 张
+    // 按真实意图全是决策 / 技术陈述，**没有一张是临时事件**。
+    // 而补进来之后样本里仍有 6/19（31.6%）可归档，**归档机制不是空集**。
+    // 这一点必须验：若大部分卡都受类别保护，遗忘机制就会在数学上恒为空，
+    // 不报错、不崩溃、测试全绿，只是那条路径一行都没执行过
+    // （同源缺陷二十 / 二十六 / 三十二）。
+    neverArchiveKinds: ['feeling', 'promise', 'fact', 'concept', 'experience'],
     autoArchive: true,
   },
   dedup: {
@@ -223,4 +240,4 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 }
 
 /** 当前配置版本号，与 {@link DEFAULT_CONFIG}.configVersion 保持一致。 */
-export const MEMORY_CONFIG_VERSION = 17
+export const MEMORY_CONFIG_VERSION = 18

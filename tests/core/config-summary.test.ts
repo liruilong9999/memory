@@ -47,7 +47,7 @@ function expectOneError(patch: Parameters<typeof mergeConfig>[1], field: string)
 
 /** 默认配置的全部叶子（路径=值，已排序）。见上面那条绊线的说明。 */
 const EXPECTED_CONFIG_LEAVES: readonly string[] = [
-  'configVersion=17',
+  'configVersion=18',
   'consolidation.dailyAt=03:30',
   'consolidation.dailySummaryMaxChars=180',
   'consolidation.distillEdgeWeight=0.6',
@@ -167,8 +167,9 @@ const EXPECTED_CONFIG_LEAVES: readonly string[] = [
   'forgetting.halfLifeMs=1209600000',
   'forgetting.neverArchiveKinds[0]=feeling',
   'forgetting.neverArchiveKinds[1]=promise',
-  'forgetting.neverArchiveKinds[2]=concept',
-  'forgetting.neverArchiveKinds[3]=experience',
+  'forgetting.neverArchiveKinds[2]=fact',
+  'forgetting.neverArchiveKinds[3]=concept',
+  'forgetting.neverArchiveKinds[4]=experience',
   // 注意：这个数组必须是**排序后**的（`leaves` 走了 `.sort()`）。
   // `graph.entityNeighbors` 按字典序排在 `graph.topicFloor` **之前**
   // （'e' < 't'），插在 topicNeighbors 之后会直接红。
@@ -273,7 +274,18 @@ describe('摘要配置的默认值与版本', () => {
     //       幂等台账上限）。不递增的后果与 16 相反但同源：旧快照里**没有**这个
     //       字段，回滚回来会得到一份「台账上限为 undefined」的配置，而校验层
     //       `!Number.isInteger(undefined)` 会在加载期直接拒绝——库打不开。
-    assert.equal(MEMORY_CONFIG_VERSION, 17, '新增压缩台账上限后版本应为 17')
+    //  18 → `forgetting.neverArchiveKinds` **加了 `fact`**（FR-C3 缺陷，
+    //       `docs/1-需求规格.md:149` 原文要求「永不归档类别（承诺、**核心事实**、
+    //       长期偏好、感受）」，而实现里从来没有 fact ⇒ 核心事实会被夜整理
+    //       自动归档）。这是**改默认值**，按 14 的理由必须递增版本：旧快照里
+    //       写着四元组的人回滚回来，会重新得到一个「核心事实会被归档」的配置，
+    //       而缺陷会静默复现——它不报错、不崩溃、不抛异常，只是把该留的
+    //       决策与结论悄悄挪进 archived。
+    //       定标依据（探针 `.tmp/probe-fact-share.ts`，42 句日常中文走真实链路
+    //       `gateTurn` → `extractCards` → `draftToCard`）：fact 占产出卡 21.1%
+    //       （4/19），远低于「遗忘机制恒为空」的 40% 失效线；加进去后仍有
+    //       6/19 可归档，归档路径不是空集。
+    assert.equal(MEMORY_CONFIG_VERSION, 18, '核心事实加入永不归档类别后版本应为 18')
   })
 
   it('默认配置的每个叶子都必须被版本号覆盖（新增字段会在这里变红）', () => {

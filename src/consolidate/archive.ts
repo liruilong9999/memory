@@ -20,8 +20,15 @@ import type { MemoryConfig } from '../core/config.ts'
 /**
  * 判断卡片类型是否属于「永不自动归档」类别。
  *
- * 默认配置把承诺（promise）、概念（concept）、经验（experience）列为永不归档：
- * 承诺是未兑现的义务，概念与经验是沉淀下来的长期资产，忘掉它们是净损失。
+ * 默认配置把承诺（promise）、核心事实（fact）、概念（concept）、
+ * 经验（experience）、感受（feeling）列为永不归档：
+ * 承诺是未兑现的义务，核心事实是决策与结论（FR-C3 原话「承诺、核心事实、
+ * 长期偏好、感受」），概念与经验是沉淀下来的长期资产，感受是起源 L11 要求
+ * 长期留下的东西——忘掉它们都是净损失。
+ *
+ * `fact` 曾长期缺席这一个列表，于是「决定用 PostgreSQL」这类结论会被夜整理
+ * 自动归档，而规格白纸黑字写着它不该被归档。详见
+ * `ForgettingPolicy.neverArchiveKinds` 的注释。
  *
  * @param card - 记忆卡。
  * @param config - 完整配置。
@@ -69,14 +76,20 @@ export function releaseExpiredDue(card: MemoryCard, now: number): MemoryCard {
 /**
  * 归档判定：这张卡现在可以被自动归档吗。
  *
- * 五个条件**全部**满足才返回 true（任一不满足即否决）：
+ * 七个条件**全部**满足才返回 true（任一不满足即否决）：
  * 1. `config.forgetting.autoArchive` 打开；
  * 2. `status` 是 `active`（已归档的不重复归档）；
  * 3. 未被 `pinned` 钉住（FR-C3 的人工豁免，优先级最高）；
  * 4. `kind` 不在 `neverArchiveKinds` 里（FR-C3 的类别豁免）；
- * 5. 强度严格低于 `config.forgetting.archiveThreshold`（FR-C4），且没有未到期事项。
+ * 5. 没有未到期事项（`dueAt` 为空）；
+ * 6. 强度严格低于 `config.forgetting.archiveThreshold`（FR-C4）；
+ * 7. 未被合并（`mergedInto` 未定义，作废视图交由合并流程处理）。
  *
  * 强度用严格小于而不是小于等于：阈值本身就是「低于它才算忘掉」。
+ *
+ * 条件 6 在最后几条里是唯一会「放行」的那一个，因此它的比较方向与严格性
+ * 决定了整个功能能不能被触发——修它时必须同时确认条件 1~5 里没有任何一条
+ * 在默认配置下恒为真而否决（那会让本函数恒返回 false，机制在数学上恒为空）。
  *
  * @param card - 记忆卡。
  * @param config - 完整配置。
