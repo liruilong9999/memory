@@ -434,6 +434,42 @@ export function openStore(options: StoreOptions = {}): MemoryStore {
 }
 
 /**
+ * 把幂等键里「本该是字符串数组、实际可能是任何东西」的字段压成一段文本。
+ *
+ * ## 为什么不能直接 `.join(',')`
+ *
+ * `deriveIdempotencyKey` 是**所有写路径共用的指纹入口**，且它在
+ * `journal.append` **之前**执行（见 {@link MemoryStore.append}）。只要有一张
+ * 结构不全的卡片流进来，`op.card.conflictOf.join(',')` 就把整个进程打成
+ * `TypeError: Cannot read properties of undefined (reading 'join')`。
+ *
+ * 这是缺陷 W8 的现场：`memoryctl import` 一个缺 `conflictOf` 的文件，
+ * 用户拿到的是退出码 1 加一段堆栈，而**前面已经写进去的那几张卡不会回滚**
+ * ⇒ 库变成「导入了一部分」，且没有任何一句话说明这件事。
+ *
+ * ## 这里的职责只有「不崩」，不包括「判定卡片合法」
+ *
+ * 合法性的唯一判据在导入入口 `validateImport`（`src/store/export.ts`）。
+ * 不把它复制到这里，是因为**同一件事有两套判据正是本缺陷的成因**：
+ * 重放层 `coerceCard` 认为缺 `conflictOf` 可以兜底成 `[]`（不崩），
+ * 键派生层却当场崩，两层对「这张卡能不能收」给出相反答案，而两边都没错——
+ * 错的是没人说过该由谁拍板。
+ *
+ * ## 为什么不改成缺省 `''`
+ *
+ * `String(undefined)` 得到字面量 `"undefined"`，看着脏，但它**忠实**：
+ * 缺字段的卡本来就该拿到一个与正常卡不同的指纹。换成 `''` 会让
+ * 「缺 `conflictOf`」与「`conflictOf` 为空数组」撞成同一个键——
+ * 那是把崩溃换成了静默覆盖，比崩溃更难发现。
+ *
+ * @param value - 日志操作里的字段值，类型上不可信。
+ * @returns 可直接参与拼键的文本。
+ */
+function fingerprintPart(value: unknown): string {
+  return Array.isArray(value) ? value.join(',') : String(value)
+}
+
+/**
  * 按操作内容派生幂等键。
  *
  * 为什么自动派生：调用方（抽取面、巩固面）不一定愿意自己拼键，
@@ -468,12 +504,15 @@ export function deriveIdempotencyKey(op: JournalOp): string {
       //
       // 现在把三个易变语义字段显式纳入：strength / status / accessCount。
       // 不纳入 `lastAccessAt`：它与 `accessCount` 同步变化，纳入只是冗余。
+      //
+      // 数组字段一律走 `fingerprintPart`：直接 `.join()` 会在卡片缺字段时
+      // 抛 TypeError 并把进程打死（缺陷 W8）。合法卡片的键**逐位不变**。
       return buildIdempotencyKey(
         'put',
         op.card.id,
         String(op.card.updatedAt),
         op.card.text,
-        op.card.conflictOf.join(','),
+        fingerprintPart(op.card.conflictOf),
         String(op.card.strength),
         op.card.status,
         String(op.card.accessCount),
@@ -506,7 +545,10 @@ export function deriveIdempotencyKey(op: JournalOp): string {
     case 'restore':
       return buildIdempotencyKey('restore', op.id, String(op.at))
     case 'merge':
-      return buildIdempotencyKey('merge', op.into.id, op.ids.join(','), String(op.at))
+      // `op.ids` 与 `conflictOf` 是同一类裸解引用：形状不全时 `.join` 直接抛错。
+      // 合并操作来自巩固面（内部产出，形状可控），但键派生是所有写路径共用的
+      // 入口，一个调用方写错不该让整个进程消失，所以同样走 `fingerprintPart`。
+      return buildIdempotencyKey('merge', op.into.id, fingerprintPart(op.ids), String(op.at))
     case 'edge':
       // 幂等键必须包含**边权**，否则「更新已有边的权重」会被当成重复写入丢弃。
       //

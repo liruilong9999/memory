@@ -12,6 +12,7 @@
  * @module dsh-memory/store/export
  */
 
+import { EDGE_RELATIONS } from '../core/types.ts'
 import type { MemoryCard, MemoryEdge } from '../core/types.ts'
 
 /** 导出格式版本。字段结构变化时必须递增。 */
@@ -281,10 +282,261 @@ export function parseExportFile(text: string): ParsedExportFile {
   return { ok: true, format: 'jsonl', result: importJsonl(text) }
 }
 
+/* ------------------------------------------------------------------ *
+ * 导入预检：卡片与边的**形状**判据
+ * ------------------------------------------------------------------ */
+
+/**
+ * `MemoryCard` 的全部必填字段。
+ *
+ * 与 `src/core/types.ts` 的 `MemoryCard` 一一对应；可选字段
+ * （`mergedInto` / `mergeOf` / `dueAt` / `dueRepeat` / `cronExpression`）
+ * 刻意不在其中——省略它们是**合法**的，程序自己导出的文件里也可能没有。
+ */
+const REQUIRED_CARD_FIELDS: readonly string[] = [
+  'id', 'domain', 'kind', 'text', 'normalized', 'createdAt', 'updatedAt', 'source',
+  'salience', 'confidence', 'emotional', 'strength', 'accessCount', 'lastAccessAt',
+  'tags', 'entities', 'revisions', 'status', 'conflictOf', 'pinned',
+]
+
+/** `MemoryCard` 里取值必须落在 0..1 的字段。 */
+const UNIT_CARD_FIELDS: readonly string[] = ['salience', 'confidence', 'emotional', 'strength']
+
+/** 判断值是否为有限数字（`NaN` / `Infinity` 一律不算）。 */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/** 判断值是否为字符串数组。 */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string')
+}
+
+/** 判断值是否为非空字符串。 */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+/**
+ * 把一个非法值渲染成短的、可 grep 的说明。
+ *
+ * 不直接 `JSON.stringify` 整个值：一条错误信息里塞进整张卡会让
+ * 「哪张卡坏了」这个结论被淹掉，而卡片正文最长可以是几 KB。
+ *
+ * @param value - 待描述的值。
+ * @returns 一行说明。
+ */
+function describeValue(value: unknown): string {
+  if (value === null) return 'null'
+  if (typeof value === 'string') {
+    return value.length > 40 ? `字符串「${value.slice(0, 40)}…」` : `字符串「${value}」`
+  }
+  if (typeof value === 'number') return `数字 ${String(value)}`
+  if (typeof value === 'boolean') return `布尔 ${String(value)}`
+  if (Array.isArray(value)) return `数组（${value.length} 项）`
+  if (typeof value === 'object') return '对象'
+  return String(value)
+}
+
+/**
+ * 判断一张导入卡片的形状是否合法。
+ *
+ * ## 这个函数解决的是哪个问题（缺陷 · `import` 对非法卡片抛 TypeError）
+ *
+ * 「一张卡片是否合法」在本仓库里曾经**有三套互不一致的判据**，三层各说各话：
+ *
+ * | 层 | 位置 | 同一张缺 `conflictOf` 的卡 |
+ * |---|---|---|
+ * | 解析层 | `importJsonl` / `importExportDocument` | **只查 `id` 非空**，然后 `as unknown as MemoryCard` 放行 |
+ * | 键派生层 | `deriveIdempotencyKey` 的 `put` 分支 | `op.card.conflictOf.join(',')` **裸解引用，直接抛 TypeError** |
+ * | 重放层 | `coerceCard` | `asStringArray` 兜底成 `[]`，**不崩** |
+ *
+ * 三层判据不一致的后果不是「有一层多余」，而是**两层之间的缝隙里能塞进残卡**：
+ * 解析层放行、键派生层崩溃 ⇒ 用户拿到一段堆栈；而缺 `strength` / `status`
+ * 这类不崩的字段，则被 `String(undefined)` 拼成字面量 `"undefined"` 进幂等键、
+ * 卡片**照写不误**，重放时再被 `coerceCard` 静默改写成 `strength: 0` /
+ * `status: 'active'`。用户看到「导入成功 N 张」，库里是残卡——**导入成功
+ * 但不等于文件里的内容落进了库**。
+ *
+ * ## 判据怎么来的：预检 ⊇ 重放层的「拒绝」与「静默改写」
+ *
+ * 判据不是逐字段凭直觉列的，而是从 `coerceCard`（`src/store/state.ts`）的
+ * 行为反推出来的，取并集：
+ *
+ * 1. **重放层会拒绝的**（返回 `null`，记录落盘但状态里没有这张卡）：
+ *    `id` 非空字符串、`source` 是对象。
+ * 2. **重放层会静默改写的**（不报错，但读回来的卡与文件里的不是同一张）：
+ *    缺 `strength` → 0、`salience: 1.5` → 截到 1、`status: 'bogus'` → `'active'`、
+ *    缺 `domain` → `'work'`、缺 `conflictOf` → `[]`……**这一类才是多数**，
+ *    也是这个缺陷真正的杀伤面：它不崩，所以没人报 bug。
+ *
+ * 换句话说：**重放层的宽容是历史数据的需要，不是新数据的许可证**。
+ * 两者必须分开——`coerceCard` 继续宽容（老日志必须能打开，见 `src/store/meta.ts`
+ * 的「判据一」），而**入口**必须严格，否则每宽容一次就等于默许写进一条残卡。
+ *
+ * ## 为什么判据只此一处
+ *
+ * 这项判据只写在预检层，**不在 `deriveIdempotencyKey` 里再抄一份**。抄一份就是
+ * 两个真相源，改了一处另一处照样漂移——这正是本缺陷的成因（三套判据）。
+ * 键派生层只负责「不崩、不拼出 `undefined` 字面量」，合法性的裁决留在这里。
+ *
+ * ## 为什么缺字段是**成组**报的
+ *
+ * 一张手写的卡可能一次缺七八个字段。逐条报会把「有 2 张坏卡」淹成「有 16 条错误」，
+ * 而 CLI 只显示前 5 条 ⇒ 用户看到的全是第一张卡的问题，根本不知道还有第二张。
+ * 所以缺字段合成一条、非法值合成一条，**一条错误 ≈ 一张坏卡**。
+ *
+ * @param raw - 从文件里读出的卡片对象（**未经类型系统保护**，可能是任何东西）。
+ * @returns 问题描述；形状合法时返回 `null`。
+ */
+function describeCardProblem(raw: unknown): string | null {
+  if (!isPlainObject(raw)) return `不是对象（实际是 ${describeValue(raw)}）`
+
+  const missing = REQUIRED_CARD_FIELDS.filter((field) => raw[field] === undefined)
+  if (missing.length > 0) return `缺少 ${missing.length} 个必填字段：${missing.join('、')}`
+
+  const invalid: string[] = []
+  const bad = (field: string, expected: string): void => {
+    invalid.push(`${field} 应为${expected}，实际是 ${describeValue(raw[field])}`)
+  }
+
+  if (!isNonEmptyString(raw['id'])) bad('id', '非空字符串')
+  // `kind` / `domain` 刻意**只查非空字符串、不查是否属于已知集合**：
+  // 重放层的 `coerceKind` / `coerceDomain` 会原样透传未知字符串（前向兼容，
+  // 见 `src/store/state.ts` 的长注释）。若这里按 `MEMORY_KINDS` 收窄，
+  // 就把「重放层愿意保留的值」判成非法——预检比重放层更严同样是两套判据。
+  if (!isNonEmptyString(raw['domain'])) bad('domain', '非空字符串')
+  if (!isNonEmptyString(raw['kind'])) bad('kind', '非空字符串')
+  if (typeof raw['text'] !== 'string') bad('text', '字符串')
+  if (typeof raw['normalized'] !== 'string') bad('normalized', '字符串')
+  if (!isFiniteNumber(raw['createdAt'])) bad('createdAt', '有限数字')
+  if (!isFiniteNumber(raw['updatedAt'])) bad('updatedAt', '有限数字')
+
+  const source = raw['source']
+  if (!isPlainObject(source)) {
+    bad('source', '对象')
+  } else {
+    if (typeof source['sessionId'] !== 'string') bad('source.sessionId', '字符串')
+    if (!isFiniteNumber(source['turn'])) bad('source.turn', '有限数字')
+    if (!isFiniteNumber(source['step'])) bad('source.step', '有限数字')
+    if (!isFiniteNumber(source['seq'])) bad('source.seq', '有限数字')
+    if (typeof source['eventType'] !== 'string') bad('source.eventType', '字符串')
+  }
+
+  for (const field of UNIT_CARD_FIELDS) {
+    const value = raw[field]
+    if (!isFiniteNumber(value) || value < 0 || value > 1) bad(field, ' 0..1 之间的数字')
+  }
+  const accessCount = raw['accessCount']
+  if (!isFiniteNumber(accessCount) || accessCount < 0 || !Number.isInteger(accessCount)) {
+    bad('accessCount', '非负整数')
+  }
+  const lastAccessAt = raw['lastAccessAt']
+  if (lastAccessAt !== null && !isFiniteNumber(lastAccessAt)) bad('lastAccessAt', 'null 或有限数字')
+  if (!isStringArray(raw['tags'])) bad('tags', '字符串数组')
+  if (!isStringArray(raw['entities'])) bad('entities', '字符串数组')
+  if (
+    !Array.isArray(raw['revisions'])
+    || !raw['revisions'].every((item) => isPlainObject(item)
+      && isFiniteNumber(item['at'])
+      && typeof item['reason'] === 'string'
+      && typeof item['previousText'] === 'string'
+      && (item['actor'] === 'system' || item['actor'] === 'consolidation' || item['actor'] === 'manual'))
+  ) {
+    bad('revisions', '由 {at:数字, reason:字符串, previousText:字符串, actor:“system”/“consolidation”/“manual”} 组成的数组')
+  }
+  // `status` 必须精确落在两值上：`coerceCard` 只有 `'archived'` 例外，其余一律
+  // 归到 `'active'`。放过 `'bogus'` 就等于静默把一张归档卡改成活跃卡。
+  if (raw['status'] !== 'active' && raw['status'] !== 'archived') bad('status', '“active” 或 “archived”')
+  if (!isStringArray(raw['conflictOf'])) bad('conflictOf', '字符串数组')
+  if (typeof raw['pinned'] !== 'boolean') bad('pinned', '布尔')
+
+  // 可选字段：可以不出现，但**出现了就必须合法**——`coerceCard` 对
+  // `mergeOf: []` / 未知 `dueRepeat` / 空 `cronExpression` 都是静默丢弃。
+  const mergedInto = raw['mergedInto']
+  if (mergedInto !== undefined && !isNonEmptyString(mergedInto)) bad('mergedInto', '非空字符串')
+  const mergeOf = raw['mergeOf']
+  if (mergeOf !== undefined && (!isStringArray(mergeOf) || mergeOf.length === 0)) {
+    bad('mergeOf', '非空字符串数组')
+  }
+  const dueAt = raw['dueAt']
+  if (dueAt !== undefined && dueAt !== null && !isFiniteNumber(dueAt)) bad('dueAt', 'null 或有限数字')
+  const dueRepeat = raw['dueRepeat']
+  if (
+    dueRepeat !== undefined && dueRepeat !== 'once' && dueRepeat !== 'daily'
+    && dueRepeat !== 'weekly' && dueRepeat !== 'cron'
+  ) {
+    bad('dueRepeat', '“once” / “daily” / “weekly” / “cron”')
+  }
+  const cronExpression = raw['cronExpression']
+  if (cronExpression !== undefined && !isNonEmptyString(cronExpression)) bad('cronExpression', '非空字符串')
+
+  return invalid.length === 0 ? null : invalid.join('；')
+}
+
+/**
+ * 判断一条导入边的形状是否合法。
+ *
+ * ## 边这一半比卡片更糟，只是没人报过
+ *
+ * 重放层对边**完全不校验**：`applyRecord` 的 `edge` 分支只判 `edge.id` 非空，
+ * 然后 `state.edges.set(edge.id, { ...edge })` **原样**放进状态。所以 `weight`
+ * 缺失时不是像卡片那样被兜底成 0，而是变成 `undefined` 参与打分——
+ * `a.weight * b.weight` 得到 `NaN`，扩散加分整段污染，且**不报错**。
+ *
+ * 判据同样来自「重放层不管 ⇒ 入口必须管」，与卡片一一对应。
+ *
+ * @param raw - 从文件里读出的边对象。
+ * @returns 问题描述；形状合法时返回 `null`。
+ */
+function describeEdgeProblem(raw: unknown): string | null {
+  if (!isPlainObject(raw)) return `不是对象（实际是 ${describeValue(raw)}）`
+
+  const missing = ['id', 'from', 'to', 'relation', 'weight', 'createdAt']
+    .filter((field) => raw[field] === undefined)
+  if (missing.length > 0) return `缺少 ${missing.length} 个必填字段：${missing.join('、')}`
+
+  const invalid: string[] = []
+  const bad = (field: string, expected: string): void => {
+    invalid.push(`${field} 应为${expected}，实际是 ${describeValue(raw[field])}`)
+  }
+  if (!isNonEmptyString(raw['id'])) bad('id', '非空字符串')
+  if (!isNonEmptyString(raw['from'])) bad('from', '非空字符串')
+  if (!isNonEmptyString(raw['to'])) bad('to', '非空字符串')
+  // `relation` 必须是已知七值之一：它决定渲染与图谱语义，重放层不判，
+  // 未知值会原样进状态，然后所有 `switch (relation)` 静默走 `default`。
+  if (!isNonEmptyString(raw['relation']) || !(EDGE_RELATIONS as readonly string[]).includes(raw['relation'])) {
+    bad('relation', `七种边类型之一（${EDGE_RELATIONS.join(' / ')}）`)
+  }
+  const weight = raw['weight']
+  if (!isFiniteNumber(weight) || weight < 0 || weight > 1) bad('weight', ' 0..1 之间的数字')
+  if (!isFiniteNumber(raw['createdAt'])) bad('createdAt', '有限数字')
+
+  return invalid.length === 0 ? null : invalid.join('；')
+}
+
 /**
  * 校验导入结果是否自洽。
  *
- * 检查项：卡片 id 在文件内不重复、边两端都存在。用于 CLI 的导入前预检（FR-F5）。
+ * 检查项：**卡片与边的形状合法**、卡片 id 在文件内不重复、边两端都存在。
+ * 用于 CLI 的导入前预检（FR-F5）。
+ *
+ * ## 为什么形状校验必须放在预检层（而不是修 `deriveIdempotencyKey`）
+ *
+ * 这是本缺陷选层的**决定性理由**，与「哪一层崩的」无关：
+ *
+ * - 预检是**唯一一处能在写第一条之前看到整个批次**的地方。缺陷的观测形态是
+ *   「第一张合法、第二张缺字段 ⇒ 第一张已落盘、然后抛 TypeError」，用户面对
+ *   一个半导入的库加一段堆栈。把校验放在 `deriveIdempotencyKey`（逐卡、写时）
+ *   或 `coerceCard`（逐记录、重放时）**在结构上都不可能**给出「要么全进、
+ *   要么一条不进」：它们看到的是已经轮到自己那张卡，前面的卡早就写进日志了。
+ * - 预检同时覆盖两个面：崩（缺 `conflictOf`）与静默写残卡（缺 `strength` 等）。
+ *   只修 `deriveIdempotencyKey` 只能让前者变成「不崩」，残卡照样进库。
+ *
+ * 剩下两个位置各留一道**不同职责**的防线，不是重复校验：
+ * - `deriveIdempotencyKey` 的兜底：保证它**不抛 TypeError、不拼出 `"undefined"`
+ *   字面量**（那里是写前最后一站，抛错会留下半截状态）；
+ * - `coerceCard` 的宽容：保证**老日志仍然能打开**（判据一）。
  *
  * ## 为什么多一个 `knownCardIds`
  *
@@ -304,12 +556,37 @@ export function parseExportFile(text: string): ParsedExportFile {
 export function validateImport(result: ImportResult, knownCardIds?: Iterable<string>): string[] {
   const errors: string[] = []
   const inFile = new Set<string>()
-  for (const card of result.cards) {
-    if (inFile.has(card.id)) errors.push(`重复的卡片 id：${card.id}`)
-    inFile.add(card.id)
+  // 用下标而不是 `for...of`：非法卡片的 `id` 可能根本不是字符串，
+  // 拿它拼提示会得到 `[object Object]`，「哪一张坏了」就无从定位。
+  // 序号是**文件内位置**，用户能直接对着文件数到那一行。
+  for (const [index, card] of result.cards.entries()) {
+    const id = (card as { id?: unknown }).id
+    const usableId = isNonEmptyString(id) ? id : null
+    // 即使形状非法也要把可用的 id 记进 `inFile`：否则同一批里的边会被报成
+    // 「端点不存在」——而端点其实是存在的，只是那张卡自己坏了。
+    // **错误信息指错地方比少报一条更糟**：用户会去修一条没问题的边。
+    if (usableId !== null && inFile.has(usableId)) {
+      errors.push(`重复的卡片 id：${usableId}`)
+    }
+    if (usableId !== null) inFile.add(usableId)
+
+    const problem = describeCardProblem(card)
+    if (problem === null) continue
+    const which = usableId === null ? `第 ${index + 1} 张卡片` : `卡片 ${usableId}`
+    errors.push(`${which} 结构非法：${problem}`)
   }
   const known = knownCardIds === undefined ? inFile : new Set<string>([...knownCardIds, ...inFile])
-  for (const edge of result.edges) {
+  for (const [index, edge] of result.edges.entries()) {
+    const id = (edge as { id?: unknown }).id
+    const usableId = isNonEmptyString(id) ? id : null
+    const problem = describeEdgeProblem(edge)
+    if (problem !== null) {
+      const which = usableId === null ? `第 ${index + 1} 条边` : `边 ${usableId}`
+      errors.push(`${which} 结构非法：${problem}`)
+      // 形状非法时**不再**逐端点判存在性：这条边的 `from`/`to` 可能压根不是
+      // 字符串，再报两句「起点 undefined 不存在」只会把真正的结论埋掉。
+      continue
+    }
     if (!known.has(edge.from)) errors.push(`边 ${edge.id} 的起点 ${edge.from} 不存在`)
     if (!known.has(edge.to)) errors.push(`边 ${edge.id} 的终点 ${edge.to} 不存在`)
   }

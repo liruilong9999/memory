@@ -44,6 +44,7 @@ import type { MemoryStore } from '../../store/store.ts'
 import { byId, describeError, jsonText, storeFailure, usageFailure } from '../output.ts'
 import { EXIT_OK } from '../types.ts'
 import type { CliOptions, CliResult } from '../types.ts'
+import type { WriteResult } from '../../store/store.ts'
 
 /**
  * 决定从哪个文件读。
@@ -69,6 +70,41 @@ function resolveInputPath(options: CliOptions): { ok: true; path: string } | { o
     return { ok: false, message: 'import 需要一个文件，例如：memoryctl import backup.json' }
   }
   return { ok: true, path }
+}
+
+/**
+ * 把「写到一半抛错」翻译成用户能据以行动的一段话。
+ *
+ * ## 为什么这里不能只报 `describeError(error)`
+ *
+ * 数据面没有事务：`putCard` 逐条 `append` 到事件日志，一条落盘就是一条，
+ * **前面写进去的不会因为后面抛错而撤销**。所以异常冒泡时，库处于
+ * 「导入了一部分」的状态，而用户从一段堆栈里读不出这件事——他会以为
+ * 要么全进了、要么一条没进，两种猜测都是错的。
+ *
+ * 这一段的作用是**把不可回滚的半截状态说清楚**，而不是假装能回滚：
+ * 告诉他写到第几条、已经进了多少、重跑是否安全。
+ *
+ * @param path - 导入文件路径。
+ * @param position - 出错时正在写的那一条。
+ * @param counts - 各计数（已写入 / 已跳过）。
+ * @param error - 捕获到的异常。
+ * @returns 人可读的错误说明。
+ */
+function describePartialWrite(
+  path: string,
+  position: { kind: string; id: string },
+  counts: { cardsWritten: number; cardsSkipped: number; edgesWritten: number; edgesSkipped: number },
+  error: unknown,
+): string {
+  return `导入 ${path} 时写入失败：${position.kind} ${position.id}\n`
+    + `  原因：${describeError(error)}\n`
+    + `  已写入：卡片 ${counts.cardsWritten} 张 / 图谱边 ${counts.edgesWritten} 条`
+    + `（另有卡片 ${counts.cardsSkipped} 张、图谱边 ${counts.edgesSkipped} 条按幂等跳过）\n`
+    // 说「重跑安全」是因为幂等键：同样的内容再导一次会被判为重复而跳过，
+    // 不会产生第二份。这句必须写，否则用户不知道下一步该做什么。
+    + '注意：库现在是「导入了一部分」的状态。修好文件后重跑本命令即可补齐，'
+    + '重复写入会按幂等跳过，不会写重。'
 }
 
 /**
@@ -135,7 +171,21 @@ export function runImport(options: CliOptions, store: MemoryStore): CliResult {
   let cardsSkipped = 0
   const unreadable: string[] = []
   for (const card of [...result.cards].sort(byId)) {
-    const written = store.putCard(card)
+    // 写入这一步也要包住：预检已经把「结构非法」挡在外面，但预检是**判据**，
+    // 不是**隔离**——数据面在写入路径上还可能因为别的原因抛（并发写者、
+    // 磁盘错误、日志损坏）。此时前面的卡已经落盘且不可回滚，异常若直接冒泡，
+    // 用户拿到的是堆栈而不是「已经写进去多少」（缺陷 W8 的形态）。
+    let written: WriteResult
+    try {
+      written = store.putCard(card)
+    } catch (error) {
+      return storeFailure(describePartialWrite(
+        path,
+        { kind: '卡片', id: card.id },
+        { cardsWritten, cardsSkipped, edgesWritten: 0, edgesSkipped: 0 },
+        error,
+      ))
+    }
     if (written.written) cardsWritten += 1
     else cardsSkipped += 1
     // 写完之后**回读**一次，确认它真的在库里。
@@ -151,7 +201,17 @@ export function runImport(options: CliOptions, store: MemoryStore): CliResult {
   let edgesWritten = 0
   let edgesSkipped = 0
   for (const edge of [...result.edges].sort(byId)) {
-    const written = store.putEdge(edge)
+    let written: WriteResult
+    try {
+      written = store.putEdge(edge)
+    } catch (error) {
+      return storeFailure(describePartialWrite(
+        path,
+        { kind: '图谱边', id: edge.id },
+        { cardsWritten, cardsSkipped, edgesWritten, edgesSkipped },
+        error,
+      ))
+    }
     if (written.written) edgesWritten += 1
     else edgesSkipped += 1
   }
